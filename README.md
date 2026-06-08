@@ -19,6 +19,24 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 </div>
 
+## 本仓库说明（PreNet 自用二改）
+
+本仓库基于原作者 [eooce/Sing-box](https://github.com/eooce/Sing-box) 二次修改，保留原作者信息、原项目说明和免责声明。感谢 eooce 及原项目贡献者提供的脚本基础。
+
+本仓库主要用于个人 VPS 节点部署与 Cloudflare Tunnel/优选入口链路测试，不代表上游项目。二改重点集中在 VPS 一键脚本 `sing-box.sh`：
+
+* 默认订阅改为输出 `VLESS-Reality` 与 `VLESS-WS-TLS-Argo`，不再默认依赖旧 `VMess-WS-TLS-Argo`。
+* 适配 Xray-core 新版本移除旧 TLS `allowInsecure` 后，部分客户端导入/连接 VMess 节点报错的问题。
+* Argo 本地入口改为 VLESS + WebSocket，并限制监听 `127.0.0.1:${ARGO_PORT}`，由 `cloudflared` 本机转发。
+* `cloudflared` quick tunnel 与固定隧道配置统一使用 `${ARGO_PORT}`，避免端口变量和实际转发端口不一致。
+* 默认订阅不输出 HY2/TUIC 等 UDP 系节点；如需输出，可设置 `INCLUDE_UDP_LINKS=1`。
+
+自用一键命令：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
+```
+
 
 # 1：vps一键命令，已集成到ssh工具箱中
 * 注意nat小鸡安装完一键脚本之后需手动更改订阅端口和节点端口在允许范围内的端口，否则节点不通
@@ -28,12 +46,12 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 ## VPS一键四协议安装脚本
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
 ## vps带端口变量运行示列(NAT机)
 PORT=开放的端口 确保后面有3个端口可用
 ```
-PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh)
+PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
 
 
