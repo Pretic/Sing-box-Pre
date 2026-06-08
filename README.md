@@ -19,7 +19,7 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 </div>
 
-## 本仓库说明（PreNet 自用二改）
+## 本仓库说明（Pretic 自用二改）
 
 本仓库基于原作者 [eooce/Sing-box](https://github.com/eooce/Sing-box) 二次修改，保留原作者信息、原项目说明和免责声明。感谢 eooce 及原项目贡献者提供的脚本基础。
 
