@@ -49,11 +49,36 @@ bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
+
+## VPS无交互新装命令
+```
+bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
+```
+
+## VPS更新命令（仅更新 sb 快捷命令）
+```
+bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
+```
+* 更新命令只刷新 `/usr/bin/sb` 指向本仓库脚本，不修改已有节点、订阅、端口、sing-box 服务或 Argo 配置。
+
 ## vps带端口变量运行示列(NAT机)
 PORT=开放的端口 确保后面有3个端口可用
 ```
 PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
+
+## NAT机无交互新装命令
+```
+PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
+```
+* NAT 机新装仍需带 `PORT`，并确保后续 3 个端口也在服务商开放范围内。
+
+## NAT机更新命令
+```
+bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
+```
+* NAT 机更新不需要带 `PORT`，因为更新命令不会修改现有端口和节点。
+
 ## vps完全覆盖节点名前缀运行示列
 ```
 NODE_NAME=US-PreNet bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
@@ -70,6 +95,7 @@ bash <(curl -Ls ssh_tool.eooce.com)
 用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)
 
   -i  --install     无交互安装sing-box
+      --update      仅更新 sb 快捷命令，不修改已有节点
   -c  --check       查看节点信息和订阅链接
   -r  --restart     重新获取argo临时隧道并更新到订阅
   -u  --uninstall   无交互卸载sing-box（含 nginx)
