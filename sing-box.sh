@@ -165,6 +165,12 @@ get_realip() {
     fi
 }
 
+sanitize_node_name() {
+    local name="$1"
+    name=$(printf '%s' "$name" | sed -E 's/[[:space:]]+/_/g; s/[^A-Za-z0-9._-]+/_/g; s/_+/_/g; s/^_//; s/_$//')
+    printf '%s\n' "$name"
+}
+
 # 处理防火墙
 allow_port() {
     has_ufw=0
@@ -529,7 +535,7 @@ get_info() {
     server_ip=$(get_realip)
     clear
     if [ -n "$NODE_NAME" ]; then
-        isp=$(printf '%s' "$NODE_NAME" | sed 's/ /_/g')
+        isp=$(sanitize_node_name "$NODE_NAME")
     else
         isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
             awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
@@ -538,6 +544,17 @@ get_info() {
             awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
             sed 's/ /_/g' || echo "$hostname")
         [ -z "$isp" ] && isp="$hostname"
+
+        if [ -z "$SKIP_NODE_NAME_PROMPT" ] && [ -t 0 ]; then
+            local vps_name_input country_code
+            reading "\n请输入VPS名称用于节点备注（回车保留当前名称：${isp}）: " vps_name_input
+            vps_name_input=$(sanitize_node_name "$vps_name_input")
+            if [ -n "$vps_name_input" ]; then
+                country_code="${isp%%-*}"
+                [ -z "$country_code" ] || [ "$country_code" = "$isp" ] && country_code="UN"
+                isp="${country_code}-${vps_name_input}"
+            fi
+        fi
     fi
 
     if [ -f "${work_dir}/argo.log" ]; then
@@ -775,6 +792,7 @@ uninstall_singbox() {
 
 # 创建快捷指令
 create_shortcut() {
+    [ ! -d "$work_dir" ] && mkdir -p "$work_dir"
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
 exec bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) "$@"
@@ -816,7 +834,9 @@ auto_install() {
     fi
 
     sleep 5
+    SKIP_NODE_NAME_PROMPT=1
     get_info
+    unset SKIP_NODE_NAME_PROMPT
     add_nginx_conf
     create_shortcut
     green "\nsing-box 安装完成\n"
