@@ -31,6 +31,7 @@ export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
 export INCLUDE_UDP_LINKS=${INCLUDE_UDP_LINKS:-'0'}
+export NODE_NAME=${NODE_NAME:-''}
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
@@ -527,12 +528,17 @@ get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
     clear
-    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
-        awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
-        sed 's/ /_/g' || \
-        curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" | tr -d '\n' | \
-        awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
-        sed 's/ /_/g' || echo "$hostname")
+    if [ -n "$NODE_NAME" ]; then
+        isp=$(printf '%s' "$NODE_NAME" | sed 's/ /_/g')
+    else
+        isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
+            awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
+            sed 's/ /_/g' || \
+            curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" | tr -d '\n' | \
+            awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
+            sed 's/ /_/g' || echo "$hostname")
+        [ -z "$isp" ] && isp="$hostname"
+    fi
 
     if [ -f "${work_dir}/argo.log" ]; then
         for i in {1..5}; do
@@ -771,7 +777,7 @@ uninstall_singbox() {
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) $1
+exec bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) "$@"
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
