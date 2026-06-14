@@ -19,7 +19,7 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 </div>
 
-## 本仓库说明（Pretic 自用二改）
+## 本仓库说明（PreNet 自用二改）
 
 本仓库基于原作者 [eooce/Sing-box](https://github.com/eooce/Sing-box) 二次修改，保留原作者信息、原项目说明和免责声明。感谢 eooce 及原项目贡献者提供的脚本基础。
 
@@ -43,6 +43,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-
 * 可在脚本前添加PORT变量，随脚本一起运行，即可定义端口，需确保PORT端口后面的3个端口可用，否则节点不通
 * 可选环境变量PORT ARGO_PORT CFIP CFPORT INCLUDE_UDP_LINKS
 * 默认订阅只输出 TCP 系节点（VLESS-Reality、VLESS-WS-TLS-Argo），避免 v2rayN/v2rayNG/Happ 等客户端因 UDP 协议兼容性产生导入或连接问题；如需同时输出 HY2/TUIC，可在运行脚本前添加 `INCLUDE_UDP_LINKS=1`
+* 可通过 `NODE_NAME=自定义名称` 修改默认节点名前缀；安装后快捷命令为 `sb`，例如 `sb -c` 查看节点、`sb -r` 重新获取临时隧道。
 
 ## VPS一键四协议安装脚本
 ```
@@ -52,6 +53,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-
 PORT=开放的端口 确保后面有3个端口可用
 ```
 PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
+```
+## vps带自定义节点名运行示列
+```
+NODE_NAME=PreNet bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
 
 
