@@ -802,6 +802,11 @@ EOF
     [ -s /usr/bin/sb ] && green "\n快捷指令 sb 创建成功\n" || red "\n快捷指令创建失败\n"
 }
 
+update_shortcut() {
+    create_shortcut
+    green "已更新 sb 快捷命令；不会修改已有节点、订阅、端口或服务配置。\n"
+}
+
 # 适配alpine
 change_hosts() {
     sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
@@ -2318,6 +2323,10 @@ case "$1" in
         auto_install
         exit 0
         ;;
+    --update | --upgrade)
+        update_shortcut
+        exit 0
+        ;;
     -u | --uninstall)
         auto_uninstall
         exit 0
@@ -2336,6 +2345,7 @@ case "$1" in
         green "用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)"
         echo ""
         green "  -i, --install     无交互安装sing-box"
+        green "      --update      仅更新 sb 快捷命令，不修改已有节点"
         green "  -c, --check       查看节点信息和订阅链接"
         green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
         green "  -u, --uninstall   无交互卸载sing-box（含 nginx)"
