@@ -41,9 +41,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-
 # 1：vps一键命令，已集成到ssh工具箱中
 * 注意nat小鸡安装完一键脚本之后需手动更改订阅端口和节点端口在允许范围内的端口，否则节点不通
 * 可在脚本前添加PORT变量，随脚本一起运行，即可定义端口，需确保PORT端口后面的3个端口可用，否则节点不通
-* 可选环境变量PORT ARGO_PORT CFIP CFPORT INCLUDE_UDP_LINKS
+* 可选环境变量PORT ARGO_PORT CFIP CFPORT INCLUDE_UDP_LINKS NODE_NAME
 * 默认订阅只输出 TCP 系节点（VLESS-Reality、VLESS-WS-TLS-Argo），避免 v2rayN/v2rayNG/Happ 等客户端因 UDP 协议兼容性产生导入或连接问题；如需同时输出 HY2/TUIC，可在运行脚本前添加 `INCLUDE_UDP_LINKS=1`
-* 可通过 `NODE_NAME=自定义名称` 修改默认节点名前缀；安装后快捷命令为 `sb`，例如 `sb -c` 查看节点、`sb -r` 重新获取临时隧道。
+* 默认节点名前缀保持原来的 `国家代码-ISP`，例如 `US-HostPapa`；交互生成节点时可手动输入 VPS 名，将中间 ISP 部分替换为自定义 VPS 名，例如 `US-MyVPS`。无交互安装如需固定完整节点名，可设置 `NODE_NAME=完整名称`。安装后快捷命令为 `sb`，例如 `sb -c` 查看节点、`sb -r` 重新获取临时隧道。
 
 ## VPS一键四协议安装脚本
 ```
@@ -54,9 +54,9 @@ PORT=开放的端口 确保后面有3个端口可用
 ```
 PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
-## vps带自定义节点名运行示列
+## vps完全覆盖节点名前缀运行示列
 ```
-NODE_NAME=PreNet bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
+NODE_NAME=US-PreNet bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
 
 
