@@ -37,22 +37,22 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 ### Sing-box 新装（交互式）
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
 
 ### Sing-box 新装（无交互）
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
+bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
 ### NAT 机新装（无交互）
 ```bash
-PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
+PORT=你的端口 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
 ### 已安装环境更新（普通 VPS 和 NAT 机通用）
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
+bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
 ```
 
 ## 命令说明
@@ -60,12 +60,13 @@ bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-
 * NAT 机只有新装/重装生成节点时需要带 `PORT=你的端口`，并确保后续 3 个端口也在服务商开放范围内。
 * README 保留更新命令，是给已经安装过、只想刷新本机 `sb` 快捷命令的环境使用；新装/重装仍使用上面的新装命令。
 * 更新命令只刷新 `/usr/bin/sb` 指向本仓库脚本，不修改已有节点、订阅、端口、sing-box 服务或 Argo 配置，普通 VPS 和 NAT 机通用，不需要单独的 NAT 更新命令。
+* 本仓库命令统一使用 `curl -fsSL`，下载失败时会显示错误，避免 `curl -Ls` 失败后 Bash 静默执行空脚本。
 * 可选环境变量：`PORT`、`ARGO_PORT`、`CFIP`、`CFPORT`、`INCLUDE_UDP_LINKS`、`NODE_NAME`。
 * 默认订阅只输出 TCP 系节点（VLESS-Reality、VLESS-WS-TLS-Argo）；如需同时输出 HY2/TUIC，可在运行脚本前添加 `INCLUDE_UDP_LINKS=1`。
 * 默认节点名前缀保持原来的 `国家代码-ISP`，例如 `US-HostPapa`；交互生成节点时可手动输入 VPS 名，将中间 ISP 部分替换为自定义 VPS 名，例如 `US-MyVPS`。
 * 无交互安装如需固定完整节点名，可设置 `NODE_NAME=完整名称`，例如：
 ```bash
-NODE_NAME=US-PreNet bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
+NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
 
