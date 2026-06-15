@@ -31,57 +31,41 @@ Telegram交流反馈群组：https://t.me/eooceu
 * `cloudflared` quick tunnel 与固定隧道配置统一使用 `${ARGO_PORT}`，避免端口变量和实际转发端口不一致。
 * 默认订阅不输出 HY2/TUIC 等 UDP 系节点；如需输出，可设置 `INCLUDE_UDP_LINKS=1`。
 
-自用一键命令：
+# 1：VPS 一键命令
 
+## 命令速查
+
+### Sing-box 新装（交互式）
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
 
-
-# 1：vps一键命令，已集成到ssh工具箱中
-* 注意nat小鸡安装完一键脚本之后需手动更改订阅端口和节点端口在允许范围内的端口，否则节点不通
-* 可在脚本前添加PORT变量，随脚本一起运行，即可定义端口，需确保PORT端口后面的3个端口可用，否则节点不通
-* 可选环境变量PORT ARGO_PORT CFIP CFPORT INCLUDE_UDP_LINKS NODE_NAME
-* 默认订阅只输出 TCP 系节点（VLESS-Reality、VLESS-WS-TLS-Argo），避免 v2rayN/v2rayNG/Happ 等客户端因 UDP 协议兼容性产生导入或连接问题；如需同时输出 HY2/TUIC，可在运行脚本前添加 `INCLUDE_UDP_LINKS=1`
-* 默认节点名前缀保持原来的 `国家代码-ISP`，例如 `US-HostPapa`；交互生成节点时可手动输入 VPS 名，将中间 ISP 部分替换为自定义 VPS 名，例如 `US-MyVPS`。无交互安装如需固定完整节点名，可设置 `NODE_NAME=完整名称`。安装后快捷命令为 `sb`，例如 `sb -c` 查看节点、`sb -r` 重新获取临时隧道。
-
-## VPS一键四协议安装脚本
-```
-bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
-```
-
-## VPS无交互新装命令
-```
+### Sing-box 新装（无交互）
+```bash
 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
-## VPS更新命令（仅更新 sb 快捷命令）
-```
-bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
-```
-* 更新命令只刷新 `/usr/bin/sb` 指向本仓库脚本，不修改已有节点、订阅、端口、sing-box 服务或 Argo 配置。
-
-## vps带端口变量运行示列(NAT机)
-PORT=开放的端口 确保后面有3个端口可用
-```
-PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
-```
-
-## NAT机无交互新装命令
-```
+### NAT 机新装（无交互）
+```bash
 PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
-* NAT 机新装仍需带 `PORT`，并确保后续 3 个端口也在服务商开放范围内。
 
-## NAT机更新命令
-```
+### 已安装环境更新（普通 VPS 和 NAT 机通用）
+```bash
 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
 ```
-* NAT 机更新不需要带 `PORT`，因为更新命令不会修改现有端口和节点。
 
-## vps完全覆盖节点名前缀运行示列
-```
-NODE_NAME=US-PreNet bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
+## 命令说明
+
+* NAT 机只有新装/重装生成节点时需要带 `PORT=你的端口`，并确保后续 3 个端口也在服务商开放范围内。
+* README 保留更新命令，是给已经安装过、只想刷新本机 `sb` 快捷命令的环境使用；新装/重装仍使用上面的新装命令。
+* 更新命令只刷新 `/usr/bin/sb` 指向本仓库脚本，不修改已有节点、订阅、端口、sing-box 服务或 Argo 配置，普通 VPS 和 NAT 机通用，不需要单独的 NAT 更新命令。
+* 可选环境变量：`PORT`、`ARGO_PORT`、`CFIP`、`CFPORT`、`INCLUDE_UDP_LINKS`、`NODE_NAME`。
+* 默认订阅只输出 TCP 系节点（VLESS-Reality、VLESS-WS-TLS-Argo）；如需同时输出 HY2/TUIC，可在运行脚本前添加 `INCLUDE_UDP_LINKS=1`。
+* 默认节点名前缀保持原来的 `国家代码-ISP`，例如 `US-HostPapa`；交互生成节点时可手动输入 VPS 名，将中间 ISP 部分替换为自定义 VPS 名，例如 `US-MyVPS`。
+* 无交互安装如需固定完整节点名，可设置 `NODE_NAME=完整名称`，例如：
+```bash
+NODE_NAME=US-PreNet bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
 
