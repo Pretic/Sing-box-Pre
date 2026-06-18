@@ -32,6 +32,7 @@ export ARGO_PORT=${ARGO_PORT:-'8001'}
 export CFPORT=${CFPORT:-'443'} 
 export INCLUDE_UDP_LINKS=${INCLUDE_UDP_LINKS:-'0'}
 export NODE_NAME=${NODE_NAME:-''}
+export PROMPT_NODE_NAME=${PROMPT_NODE_NAME:-'0'}
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
@@ -169,6 +170,13 @@ sanitize_node_name() {
     local name="$1"
     name=$(printf '%s' "$name" | sed -E 's/[[:space:]]+/_/g; s/[^A-Za-z0-9._-]+/_/g; s/_+/_/g; s/^_//; s/_$//')
     printf '%s\n' "$name"
+}
+
+prompt_node_name_enabled() {
+    case "${PROMPT_NODE_NAME}" in
+        1|true|TRUE|yes|YES|y|Y) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # 处理防火墙
@@ -839,9 +847,13 @@ auto_install() {
     fi
 
     sleep 5
-    SKIP_NODE_NAME_PROMPT=1
-    get_info
-    unset SKIP_NODE_NAME_PROMPT
+    if prompt_node_name_enabled; then
+        get_info
+    else
+        SKIP_NODE_NAME_PROMPT=1
+        get_info
+        unset SKIP_NODE_NAME_PROMPT
+    fi
     add_nginx_conf
     create_shortcut
     green "\nsing-box 安装完成\n"
@@ -1408,7 +1420,8 @@ check_nodes() {
     fi
 
     server_ip=$(get_realip)
-    local lujing sub_port base64_url
+    local lujing sub_port base64_url cfy_result_file
+    cfy_result_file="${work_dir}/cfy-url.txt"
 
     if [ -f "/etc/nginx/conf.d/sing-box.conf" ]; then
         lujing=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
@@ -1423,6 +1436,16 @@ check_nodes() {
         [ -z "$line" ] && continue
         echo -e "${purple}${line}${re}\n"
     done < "${work_dir}/url.txt"
+
+    if [ -s "$cfy_result_file" ]; then
+        green "\n=== 最近一次 cfy 优选节点 ===\n"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo -e "${purple}${line}${re}\n"
+        done < "$cfy_result_file"
+    else
+        yellow "\n未找到 cfy 优选结果文件：${cfy_result_file}\n"
+    fi
 
     yellow "\n温馨提醒: 如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
     green "\n=== 订阅链接 ===\n"
