@@ -50,6 +50,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sin
 PORT=你的端口 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
+### NAT 机新装（自动安装并询问 VPS 名称）
+```bash
+PORT=你的端口 PROMPT_NODE_NAME=1 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
+```
+
 ### 已安装环境更新（普通 VPS 和 NAT 机通用）
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
@@ -58,10 +63,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sin
 ## 命令说明
 
 * NAT 机只有新装/重装生成节点时需要带 `PORT=你的端口`，并确保后续 3 个端口也在服务商开放范围内。
+* NAT 机如果想在 `-i` 自动安装流程中手动输入 VPS 名称，可加 `PROMPT_NODE_NAME=1`；如果想完全无交互固定名称，可加 `NODE_NAME=完整名称`。
 * README 保留更新命令，是给已经安装过、只想刷新本机 `sb` 快捷命令的环境使用；新装/重装仍使用上面的新装命令。
 * 更新命令只刷新 `/usr/bin/sb` 指向本仓库脚本，不修改已有节点、订阅、端口、sing-box 服务或 Argo 配置，普通 VPS 和 NAT 机通用，不需要单独的 NAT 更新命令。
 * 本仓库命令统一使用 `curl -fsSL`，下载失败时会显示错误，避免 `curl -Ls` 失败后 Bash 静默执行空脚本。
-* 可选环境变量：`PORT`、`ARGO_PORT`、`CFIP`、`CFPORT`、`INCLUDE_UDP_LINKS`、`NODE_NAME`。
+* 可选环境变量：`PORT`、`ARGO_PORT`、`CFIP`、`CFPORT`、`INCLUDE_UDP_LINKS`、`NODE_NAME`、`PROMPT_NODE_NAME`。
 * 默认订阅只输出 TCP 系节点（VLESS-Reality、VLESS-WS-TLS-Argo）；如需同时输出 HY2/TUIC，可在运行脚本前添加 `INCLUDE_UDP_LINKS=1`。
 * 默认节点名前缀保持原来的 `国家代码-ISP`，例如 `US-HostPapa`；交互生成节点时可手动输入 VPS 名，将中间 ISP 部分替换为自定义 VPS 名，例如 `US-MyVPS`。
 * 无交互安装如需固定完整节点名，可设置 `NODE_NAME=完整名称`，例如：
@@ -86,6 +92,8 @@ bash <(curl -Ls ssh_tool.eooce.com)
   -u  --uninstall   无交互卸载sing-box（含 nginx)
   -h  --help        显示此帮助信息
 ```
+
+`sb -c` 会显示 `/etc/sing-box/url.txt` 中的基础节点；如果已经运行过 cfy 并生成过优选节点，也会显示 `/etc/sing-box/cfy-url.txt` 中最近一次优选结果。
 
 # 2：Serv00|CT8一键安装脚本,集成哪吒探针,全自动安装
 * 官方更新的[ToS](https://forum.serv00.com/d/2787-april-cleaning-and-new-tos),自行斟酌是否安装
