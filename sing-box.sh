@@ -2,7 +2,7 @@
 
 # =========================
 # 老王sing-box四合一安装脚本
-# vless-version-reality|vless-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
+# vless-version-reality|vless-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议]
 # 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
 # =========================
 
@@ -26,13 +26,19 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
+combined_client_dir="${work_dir}/all-url.txt"
 export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
-export CFIP=${CFIP:-'cdns.doon.eu.org'} 
-export ARGO_PORT=${ARGO_PORT:-'8001'} 
-export CFPORT=${CFPORT:-'443'} 
+export CFIP=${CFIP:-'cdns.doon.eu.org'}
+export ARGO_PORT=${ARGO_PORT:-'8001'}
+export ARGO_DOMAIN=${ARGO_DOMAIN:-''}
+export ARGO_AUTH=${ARGO_AUTH:-''}
+export CFPORT=${CFPORT:-'443'}
 export INCLUDE_UDP_LINKS=${INCLUDE_UDP_LINKS:-'0'}
 export NODE_NAME=${NODE_NAME:-''}
 export PROMPT_NODE_NAME=${PROMPT_NODE_NAME:-'0'}
+export SUB_HOST=${SUB_HOST:-''}
+export SUB_ADDR_FAMILY=${SUB_ADDR_FAMILY:-'ipv4'}
+ARGO_FIXED_READY=0
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
@@ -46,9 +52,9 @@ command_exists() {
 check_service() {
     local service_name=$1
     local service_file=$2
-    
+
     [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
-        
+
     if command_exists apk; then
         rc-service "${service_name}" status | grep -q "started" && green "running" || yellow "not running"
     else
@@ -152,7 +158,7 @@ get_realip() {
     ipv6() { curl -6 -sm 2 ip.sb; }
     if [ -z "$ip" ]; then
         echo "[$(ipv6)]"
-    else 
+    else
         if curl -4 -sm 2 http://ipinfo.io/org | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
             echo "[$(ipv6)]"
         else
@@ -166,6 +172,62 @@ get_realip() {
     fi
 }
 
+format_url_host() {
+    local host="$1"
+
+    if [[ "$host" == \[*\] ]]; then
+        echo "$host"
+    elif [[ "$host" == *:* ]]; then
+        echo "[$host]"
+    else
+        echo "$host"
+    fi
+}
+
+get_public_ipv4() {
+    local ip
+
+    ip=$(curl -4 -sm 2 ip.sb | tr -d '\r\n') || true
+    [ -z "$ip" ] && ip=$(curl -4 -sm 2 https://api.ipify.org | tr -d '\r\n') || true
+    [ -n "$ip" ] || return 1
+    echo "$ip"
+}
+
+get_public_ipv6() {
+    local ip
+
+    ip=$(curl -6 -sm 2 ip.sb | tr -d '\r\n') || true
+    [ -z "$ip" ] && ip=$(curl -6 -sm 2 https://api64.ipify.org | tr -d '\r\n') || true
+    [ -n "$ip" ] || return 1
+    format_url_host "$ip"
+}
+
+get_subscription_host() {
+    local host=""
+
+    if [ -n "$SUB_HOST" ]; then
+        format_url_host "$SUB_HOST"
+        return 0
+    fi
+
+    case "$SUB_ADDR_FAMILY" in
+        ipv6|IPv6|6)
+            host=$(get_public_ipv6 2>/dev/null || true)
+            [ -z "$host" ] && host=$(get_public_ipv4 2>/dev/null || true)
+            ;;
+        auto|AUTO|Auto)
+            host=$(get_public_ipv4 2>/dev/null || true)
+            [ -z "$host" ] && host=$(get_public_ipv6 2>/dev/null || true)
+            ;;
+        *)
+            host=$(get_public_ipv4 2>/dev/null || true)
+            [ -z "$host" ] && host=$(get_public_ipv6 2>/dev/null || true)
+            ;;
+    esac
+
+    [ -n "$host" ] && echo "$host" || get_realip
+}
+
 sanitize_node_name() {
     local name="$1"
     name=$(printf '%s' "$name" | sed -E 's/[[:space:]]+/_/g; s/[^A-Za-z0-9._-]+/_/g; s/_+/_/g; s/^_//; s/_$//')
@@ -177,6 +239,38 @@ prompt_node_name_enabled() {
         1|true|TRUE|yes|YES|y|Y) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+extract_argo_tunnel_id() {
+    local auth="$1"
+    local tunnel_id=""
+
+    if command_exists jq; then
+        tunnel_id=$(printf '%s' "$auth" | jq -r '.TunnelID // empty' 2>/dev/null || true)
+    fi
+    if [ -z "$tunnel_id" ]; then
+        tunnel_id=$(printf '%s' "$auth" | sed -n 's/.*"TunnelID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    fi
+
+    printf '%s\n' "$tunnel_id"
+}
+
+is_argo_hostname() {
+    local hostname="$1"
+
+    [[ "$hostname" =~ ^[A-Za-z0-9.-]+$ ]] && [[ "$hostname" == *.* ]] && [[ "$hostname" != .* ]] && [[ "$hostname" != *..* ]]
+}
+
+is_argo_tunnel_token() {
+    local token="$1"
+
+    [[ "$token" =~ ^[A-Za-z0-9._=-]{80,4096}$ ]]
+}
+
+use_quick_argo_fallback() {
+    ARGO_FIXED_READY=0
+    ARGO_DOMAIN=""
+    ARGO_AUTH=""
 }
 
 # 处理防火墙
@@ -270,12 +364,12 @@ install_singbox() {
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-    
+
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-    
+
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
-    
+
     cat > "${conf_dir}/log.json" << EOF
 {
   "log": {
@@ -480,6 +574,48 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
 
+    local argo_exec=""
+    local tunnel_id=""
+    local fixed_argo_requested=0
+    ARGO_FIXED_READY=0
+    if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
+        fixed_argo_requested=1
+        if ! is_argo_hostname "$ARGO_DOMAIN"; then
+            yellow "ARGO_DOMAIN 格式不匹配，改用临时 Argo 隧道"
+        elif [[ "$ARGO_AUTH" =~ TunnelSecret ]]; then
+            tunnel_id=$(extract_argo_tunnel_id "$ARGO_AUTH")
+            if [ -n "$tunnel_id" ]; then
+                echo "$ARGO_AUTH" > "${work_dir}/tunnel.json"
+                cat > "${work_dir}/tunnel.yml" << EOF
+tunnel: ${tunnel_id}
+credentials-file: ${work_dir}/tunnel.json
+protocol: http2
+
+ingress:
+  - hostname: $ARGO_DOMAIN
+    service: http://127.0.0.1:${ARGO_PORT}
+  - service: http_status:404
+EOF
+                argo_exec="ExecStart=/bin/sh -c \"/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run > /etc/sing-box/argo.log 2>&1\""
+                ARGO_FIXED_READY=1
+            else
+                yellow "ARGO_AUTH 未解析到 TunnelID，改用临时 Argo 隧道"
+            fi
+        elif is_argo_tunnel_token "$ARGO_AUTH"; then
+            argo_exec="ExecStart=/bin/sh -c \"/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH} > /etc/sing-box/argo.log 2>&1\""
+            ARGO_FIXED_READY=1
+        else
+            yellow "ARGO_AUTH 格式不匹配，改用临时 Argo 隧道"
+        fi
+    fi
+    if [ -z "$argo_exec" ]; then
+        if [ "$fixed_argo_requested" -eq 1 ]; then
+            use_quick_argo_fallback
+            yellow "固定 Argo 隧道配置未生效，已改用临时 Argo 隧道"
+        fi
+        argo_exec="ExecStart=/bin/sh -c \"/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1\""
+    fi
+
     cat > /etc/systemd/system/argo.service << EOF
 [Unit]
 Description=Cloudflare Tunnel
@@ -489,7 +625,7 @@ After=network.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
+${argo_exec}
 Restart=on-failure
 RestartSec=5s
 
@@ -522,15 +658,56 @@ command_background=true
 pidfile="/var/run/sing-box.pid"
 EOF
 
+    local argo_command_args=""
+    local tunnel_id=""
+    local fixed_argo_requested=0
+    ARGO_FIXED_READY=0
+    if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
+        fixed_argo_requested=1
+        if ! is_argo_hostname "$ARGO_DOMAIN"; then
+            yellow "ARGO_DOMAIN 格式不匹配，改用临时 Argo 隧道"
+        elif [[ "$ARGO_AUTH" =~ TunnelSecret ]]; then
+            tunnel_id=$(extract_argo_tunnel_id "$ARGO_AUTH")
+            if [ -n "$tunnel_id" ]; then
+                echo "$ARGO_AUTH" > "${work_dir}/tunnel.json"
+                cat > "${work_dir}/tunnel.yml" << EOF
+tunnel: ${tunnel_id}
+credentials-file: ${work_dir}/tunnel.json
+protocol: http2
+
+ingress:
+  - hostname: $ARGO_DOMAIN
+    service: http://127.0.0.1:${ARGO_PORT}
+  - service: http_status:404
+EOF
+                argo_command_args="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run > /etc/sing-box/argo.log 2>&1'"
+                ARGO_FIXED_READY=1
+            else
+                yellow "ARGO_AUTH 未解析到 TunnelID，改用临时 Argo 隧道"
+            fi
+        elif is_argo_tunnel_token "$ARGO_AUTH"; then
+            argo_command_args="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH} > /etc/sing-box/argo.log 2>&1'"
+            ARGO_FIXED_READY=1
+        else
+            yellow "ARGO_AUTH 格式不匹配，改用临时 Argo 隧道"
+        fi
+    fi
+    if [ -z "$argo_command_args" ]; then
+        if [ "$fixed_argo_requested" -eq 1 ]; then
+            use_quick_argo_fallback
+            yellow "固定 Argo 隧道配置未生效，已改用临时 Argo 隧道"
+        fi
+        argo_command_args="-c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+    fi
+
     cat > /etc/init.d/argo << EOF
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
 command="/bin/sh"
-command_args="-c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+command_args="${argo_command_args}"
 command_background=true
 pidfile="/var/run/argo.pid"
 EOF
-
     chmod +x /etc/init.d/sing-box
     chmod +x /etc/init.d/argo
     rc-update add sing-box default > /dev/null 2>&1
@@ -541,6 +718,7 @@ EOF
 get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
+    sub_host=$(get_subscription_host)
     clear
     if [ -n "$NODE_NAME" ]; then
         isp=$(sanitize_node_name "$NODE_NAME")
@@ -565,20 +743,26 @@ get_info() {
         fi
     fi
 
-    if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..5}; do
-            purple "第 $i 次尝试获取ArgoDoamin中..."
-            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+    if [ "$ARGO_FIXED_READY" = "1" ] && [ -n "$ARGO_DOMAIN" ]; then
+        argodomain="$ARGO_DOMAIN"
+    else
+        for i in {1..8}; do
+            purple "第 $i 次尝试获取ArgoDomain中..."
+            argodomain=$(get_latest_argo_domain)
             [ -n "$argodomain" ] && break
             sleep 2
         done
-    else
-        restart_argo
-        sleep 6
-        argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+        if [ -z "$argodomain" ]; then
+            restart_argo
+            sleep 6
+            argodomain=$(get_latest_argo_domain)
+        fi
     fi
-
-    green "\nArgoDomain：${purple}$argodomain${re}\n"
+    if [ -n "$argodomain" ]; then
+        green "\nArgoDomain：${purple}$argodomain${re}\n"
+    else
+        yellow "\n未获取到 ArgoDomain，跳过 VLESS-WS-TLS-Argo 节点，仅输出 Reality 节点\n"
+    fi
 
     extra_lines=""
     if [ -f "${client_dir}" ]; then
@@ -587,9 +771,14 @@ get_info() {
 
     cat > ${work_dir}/url.txt << EOF
 vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}
+EOF
+
+    if [ -n "$argodomain" ]; then
+        cat >> ${work_dir}/url.txt << EOF
 
 vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo#${isp}-vless-ws-tls-argo
 EOF
+    fi
 
     if [ "${INCLUDE_UDP_LINKS}" = "1" ]; then
         cat >> ${work_dir}/url.txt << EOF
@@ -607,22 +796,22 @@ EOF
 
     echo ""
     while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
-    base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
+    update_sub
     chmod 644 ${work_dir}/sub.txt
     yellow "\n温馨提醒:"
     yellow "如果节点里的ip是ipv6的，可在 修改节点配置 菜单切换ipv4后重新订阅节点\n"
     red "如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
-    green "V2rayN,Shadowrocket,Nekobox,Loon,Karing,Sterisand订阅链接：${purple}http://${server_ip}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "http://${server_ip}:${nginx_port}/${password}"
+    green "V2rayN,Shadowrocket,Nekobox,Loon,Karing,Sterisand订阅链接：${purple}http://${sub_host}:${nginx_port}/${password}${re}\n"
+    $work_dir/qrencode "http://${sub_host}:${nginx_port}/${password}"
     yellow "\n=========================================================================================="
-    green "\n\nClash,Mihomo系列订阅链接：${purple}https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}"
+    green "\n\nClash,Mihomo系列订阅链接：${purple}https://sublink.eooce.com/clash?config=http://${sub_host}:${nginx_port}/${password}${re}\n"
+    $work_dir/qrencode "https://sublink.eooce.com/clash?config=http://${sub_host}:${nginx_port}/${password}"
     yellow "\n=========================================================================================="
-    green "\n\nSing-box订阅链接：${purple}https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}"
+    green "\n\nSing-box订阅链接：${purple}https://sublink.eooce.com/singbox?config=http://${sub_host}:${nginx_port}/${password}${re}\n"
+    $work_dir/qrencode "https://sublink.eooce.com/singbox?config=http://${sub_host}:${nginx_port}/${password}"
     yellow "\n=========================================================================================="
-    green "\n\nSurge订阅链接：${purple}https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}"
+    green "\n\nSurge订阅链接：${purple}https://sublink.eooce.com/surge?config=http://${sub_host}:${nginx_port}/${password}${re}\n"
+    $work_dir/qrencode "https://sublink.eooce.com/surge?config=http://${sub_host}:${nginx_port}/${password}"
     yellow "\n==========================================================================================\n"
 }
 
@@ -957,7 +1146,7 @@ change_config() {
                     restart_singbox
                     allow_port $new_port/tcp > /dev/null 2>&1
                     sed -i '/flow=xtls-rprx-vision/ s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 /etc/sing-box/url.txt > /etc/sing-box/sub.txt
+                    update_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
                     ;;
@@ -970,7 +1159,7 @@ change_config() {
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i 's/\(hysteria2:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 $client_dir > /etc/sing-box/sub.txt
+                    update_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
                     ;;
@@ -983,7 +1172,7 @@ change_config() {
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i 's/\(tuic:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 $client_dir > /etc/sing-box/sub.txt
+                    update_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
                     ;;
@@ -1020,7 +1209,8 @@ change_config() {
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
+            update_uuid_file "${work_dir}/cfy-url.txt" "$new_uuid"
+            update_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
             ;;
@@ -1041,7 +1231,7 @@ change_config() {
                "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
             restart_singbox
             sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
+            update_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nReality sni已修改为：${purple}${new_sni}${re}\n"
             ;;
@@ -1086,7 +1276,7 @@ IEOF
                 awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
             sed -i.bak "/hysteria2:/d" $client_dir
             sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
+            update_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
             ;;
@@ -1102,11 +1292,11 @@ IEOF
                 command -v ip6tables &> /dev/null && service ip6tables save > /dev/null 2>&1
             fi
             sed -i '/hysteria2/s/&mport=[^#&]*//g' /etc/sing-box/url.txt
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
+            update_sub
             green "\n端口跳跃已删除\n"
             ;;
         6) change_cfip ;;
-        7)  
+        7)
             local new_ipv4
             [ -f "$client_dir" ] || {
                 red "\n错误: $client_dir 不存在\n"
@@ -1128,9 +1318,9 @@ IEOF
             else
                 yellow "\n当前已是ipv4, 无需切换\n" && return 0
             fi
-            base64 -w 0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
+            update_sub
            ;;
-        8) 
+        8)
             local new_ipv6
             [ -f "$client_dir" ] || {
                 red "\n错误: $client_dir 不存在\n"
@@ -1152,7 +1342,7 @@ IEOF
             else
                 yellow "\n当前已是ipv6, 无需切换\n" && return 0
             fi
-            base64 -w 0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
+            update_sub
            ;;
         0) menu ;;
         *) red "无效的选项！\n" ;;
@@ -1194,7 +1384,7 @@ disable_open_sub() {
             green "\n已关闭节点订阅\n"
             ;;
         2)
-            server_ip=$(get_realip)
+            server_ip=$(get_subscription_host)
             password=$(tr -dc A-Za-z < /dev/urandom | head -c 32)
             sed -i "s|\(location = /\)[^ ]*|\1$password|" /etc/nginx/conf.d/sing-box.conf
             sub_port=$(grep -E 'listen [0-9]+;' "/etc/nginx/conf.d/sing-box.conf" | awk '{print $2}' | sed 's/;//' | head -1)
@@ -1217,7 +1407,7 @@ disable_open_sub() {
             sed -i 's/listen [0-9]\+;/listen '$sub_port';/g' "/etc/nginx/conf.d/sing-box.conf"
             sed -i 's/listen \[::\]:[0-9]\+;/listen [::]:'$sub_port';/g' "/etc/nginx/conf.d/sing-box.conf"
             path=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
-            server_ip=$(get_realip)
+            server_ip=$(get_subscription_host)
             allow_port $sub_port/tcp > /dev/null 2>&1
             if nginx -t > /dev/null 2>&1; then
                 nginx -s reload > /dev/null 2>&1 || restart_nginx
@@ -1299,12 +1489,21 @@ manage_argo() {
             clear
             yellow "\n固定隧道可为json或token，固定隧道本地端口为${ARGO_PORT}, 使用token请在cloudflare里设置一致\njson获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
             reading "\n请输入你的argo域名: " argo_domain
+            if ! is_argo_hostname "$argo_domain"; then
+                yellow "argo 域名格式不匹配，请重新输入"
+                manage_argo; return
+            fi
             ArgoDomain=$argo_domain
+            ARGO_DOMAIN="$argo_domain"
             reading "\n请输入你的argo密钥(token或json): " argo_auth
             if [[ $argo_auth =~ TunnelSecret ]]; then
-                echo $argo_auth > ${work_dir}/tunnel.json
+                tunnel_id=$(extract_argo_tunnel_id "$argo_auth")
+                [ -z "$tunnel_id" ] && { yellow "ARGO_AUTH 未解析到 TunnelID，请重新输入"; manage_argo; return; }
+                ARGO_AUTH="$argo_auth"
+                ARGO_FIXED_READY=1
+                echo "$argo_auth" > "${work_dir}/tunnel.json"
                 cat > ${work_dir}/tunnel.yml << EOF
-tunnel: $(cut -d\" -f12 <<< "$argo_auth")
+tunnel: ${tunnel_id}
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
 
@@ -1316,16 +1515,18 @@ ingress:
   - service: http_status:404
 EOF
                 if command_exists rc-service 2>/dev/null; then
-                    sed -i '/^command_args=/c\command_args="-c '\''/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'\''"' /etc/init.d/argo
+                    sed -i '/^command_args=/c\command_args="-c '\''/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run > /etc/sing-box/argo.log 2>&1'\''"' /etc/init.d/argo
                 else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1"' /etc/systemd/system/argo.service
+                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run > /etc/sing-box/argo.log 2>&1"' /etc/systemd/system/argo.service
                 fi
                 restart_argo; sleep 1; change_argo_domain
-            elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
+            elif is_argo_tunnel_token "$argo_auth"; then
+                ARGO_AUTH="$argo_auth"
+                ARGO_FIXED_READY=1
                 if command_exists rc-service 2>/dev/null; then
-                    sed -i "/^command_args=/c\command_args=\"-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/argo
+                    sed -i "/^command_args=/c\command_args=\"-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth > /etc/sing-box/argo.log 2>&1'\"" /etc/init.d/argo
                 else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/argo.service
+                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' > /etc/sing-box/argo.log 2>&1"' /etc/systemd/system/argo.service
                 fi
                 restart_argo; sleep 1; change_argo_domain
             else
@@ -1334,6 +1535,7 @@ EOF
             ;;
         5)
             clear
+            use_quick_argo_fallback
             if command_exists rc-service 2>/dev/null; then alpine_openrc_services
             else main_systemd_services; fi
             get_quick_tunnel; change_argo_domain
@@ -1352,44 +1554,83 @@ EOF
     esac
 }
 
+# 获取最新的临时 Argo 域名
+get_latest_argo_domain() {
+    local log_file="${1:-${work_dir}/argo.log}"
+    [ -f "$log_file" ] || return 1
+    sed -n 's|.*https://\([^/[:space:]]*trycloudflare\.com\).*|\1|p' "$log_file" | tail -n 1
+}
+
 # 获取argo临时隧道
 get_quick_tunnel() {
+    : > "${work_dir}/argo.log" 2>/dev/null || true
     restart_argo
     yellow "获取临时argo域名中，请稍等...\n"
     sleep 3
-    if [ -f /etc/sing-box/argo.log ]; then
-        for i in {1..5}; do
-            purple "第 $i 次尝试获取ArgoDoamin中..."
-            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "/etc/sing-box/argo.log")
-            [ -n "$get_argodomain" ] && break
-            sleep 2
-        done
-    else
-        restart_argo; sleep 6
-        get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "/etc/sing-box/argo.log")
-    fi
+    for i in {1..8}; do
+        purple "第 $i 次尝试获取ArgoDomain中..."
+        get_argodomain=$(get_latest_argo_domain)
+        [ -n "$get_argodomain" ] && break
+        sleep 2
+    done
+    [ -z "$get_argodomain" ] && { red "未获取到临时Argo域名，请检查 argo 服务日志"; return 1; }
     green "ArgoDomain：${purple}$get_argodomain${re}\n"
     ArgoDomain=$get_argodomain
 }
 
-# 更新VLESS Argo域名到订阅
-update_vless_argo_domain() {
-    local new_domain="$1"
+update_vless_argo_domain_file() {
+    local target_file="$1"
+    local new_domain="$2"
     local tmp_file
-    tmp_file=$(mktemp)
 
-    while IFS= read -r line; do
+    [ -n "$new_domain" ] || return 1
+    [ -s "$target_file" ] || return 0
+
+    tmp_file=$(mktemp)
+    while IFS= read -r line || [ -n "$line" ]; do
         if [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* ]]; then
             line=$(printf '%s\n' "$line" | sed -E "s#([?&]sni=)[^&#]*#\1${new_domain}#g; s#([?&]host=)[^&#]*#\1${new_domain}#g")
         fi
         printf '%s\n' "$line"
-    done < "$client_dir" > "$tmp_file" && mv "$tmp_file" "$client_dir"
+    done < "$target_file" > "$tmp_file" && mv "$tmp_file" "$target_file"
+}
+update_uuid_file() {
+    local target_file="$1"
+    local new_uuid="$2"
+    local tmp_file line encoded_vmess decoded_vmess updated_vmess encoded_updated_vmess
+
+    [ -n "$new_uuid" ] || return 1
+    [ -s "$target_file" ] || return 0
+
+    tmp_file=$(mktemp)
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == vless://* ]]; then
+            line=$(printf '%s\n' "$line" | sed -E "s#^vless://[^@]+@#vless://${new_uuid}@#")
+        elif [[ "$line" == vmess://* ]] && command_exists jq; then
+            encoded_vmess="${line#vmess://}"
+            decoded_vmess=$(printf '%s' "$encoded_vmess" | base64 --decode 2>/dev/null || printf '%s' "$encoded_vmess" | base64 -d 2>/dev/null || true)
+            if [ -n "$decoded_vmess" ]; then
+                updated_vmess=$(printf '%s' "$decoded_vmess" | jq --arg uuid "$new_uuid" '.id = $uuid' 2>/dev/null || true)
+                if [ -n "$updated_vmess" ]; then
+                    encoded_updated_vmess=$(printf '%s' "$updated_vmess" | base64 -w0 2>/dev/null || printf '%s' "$updated_vmess" | base64 | tr -d '\n\r')
+                    line="vmess://${encoded_updated_vmess}"
+                fi
+            fi
+        fi
+        printf '%s\n' "$line"
+    done < "$target_file" > "$tmp_file" && mv "$tmp_file" "$target_file"
+}
+
+# 更新VLESS Argo域名到订阅
+update_vless_argo_domain() {
+    update_vless_argo_domain_file "$client_dir" "$1"
 }
 
 change_argo_domain() {
     [ -z "$ArgoDomain" ] && { red "未获取到Argo域名，无法更新节点"; return 1; }
 
     update_vless_argo_domain "$ArgoDomain"
+    update_vless_argo_domain_file "${work_dir}/cfy-url.txt" "$ArgoDomain"
 
     # 兼容用户手动保留的旧 VMess 模板；默认新安装不再生成 VMess。
     local vmess_url
@@ -1408,18 +1649,25 @@ change_argo_domain() {
         fi
     fi
 
-    base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
+    update_sub
+
     green "vless-ws-tls-argo节点已更新\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
+    [ -s "${work_dir}/cfy-url.txt" ] && grep 'path=%2Fvless-argo' "${work_dir}/cfy-url.txt" | while IFS= read -r line; do purple "$line\n"; done
 }
-
-# 查看节点信息和订阅链接
 check_nodes() {
     if [ ! -f "${work_dir}/url.txt" ]; then
         red "节点信息文件不存在，请先安装 sing-box"; return 1
     fi
 
-    server_ip=$(get_realip)
+    local latest_argodomain
+    latest_argodomain=$(get_latest_argo_domain 2>/dev/null || true)
+    if [ -n "$latest_argodomain" ]; then
+        ArgoDomain="$latest_argodomain"
+        change_argo_domain >/dev/null 2>&1 || true
+    fi
+
+    server_ip=$(get_subscription_host)
     local lujing sub_port base64_url cfy_result_file
     cfy_result_file="${work_dir}/cfy-url.txt"
 
@@ -1499,7 +1747,7 @@ change_cfip() {
         printf '%s\n' "$line"
     done < "$client_dir" > "$tmp_file" && mv "$tmp_file" "$client_dir"
 
-    base64 -w0 "${work_dir}/url.txt" > "${work_dir}/sub.txt"
+    update_sub
     green "\nvless-ws-tls-argo节点优选域名已更新为：${purple}${cfip}:${cfport}${re}\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
 }
@@ -1908,10 +2156,45 @@ remove_url_by_tag() {
     sed -i '/^$/{N; /\n$/D}' "$client_dir"
 }
 
+write_base64_subscription() {
+    local source_file="$1"
+    local sub_file="$2"
+
+    [ -s "$source_file" ] || { : > "$sub_file"; return 0; }
+    base64 -w0 "$source_file" > "$sub_file" 2>/dev/null || base64 "$source_file" | tr -d '\n\r' > "$sub_file"
+    chmod 644 "$sub_file" 2>/dev/null || true
+}
+
+sync_combined_subscription() {
+    local tmp_file cfy_file cfy_sub_file combined_sub_file
+    tmp_file=$(mktemp)
+    cfy_file="${work_dir}/cfy-url.txt"
+    cfy_sub_file="${work_dir}/cfy-sub.txt"
+    combined_sub_file="${work_dir}/all-sub.txt"
+
+    [ -s "$client_dir" ] && sed '/^[[:space:]]*$/d' "$client_dir" > "$tmp_file"
+    if [ -s "$cfy_file" ]; then
+        [ -s "$tmp_file" ] && printf '\n' >> "$tmp_file"
+        sed '/^[[:space:]]*$/d' "$cfy_file" >> "$tmp_file"
+        write_base64_subscription "$cfy_file" "$cfy_sub_file"
+    fi
+
+    if [ -s "$tmp_file" ]; then
+        mv "$tmp_file" "$combined_client_dir"
+        write_base64_subscription "$combined_client_dir" "$combined_sub_file"
+        cp "$combined_sub_file" "${work_dir}/sub.txt"
+        chmod 644 "${work_dir}/sub.txt" 2>/dev/null || true
+    else
+        rm -f "$tmp_file"
+        : > "$combined_client_dir"
+        : > "$combined_sub_file"
+        : > "${work_dir}/sub.txt"
+    fi
+}
+
 update_sub() {
-    local sub_file="${work_dir}/sub.txt"
-    base64_content=$(cat "$client_dir" | base64 | tr -d '\n\r')
-    echo "$base64_content" > "$sub_file"
+    write_base64_subscription "$client_dir" "${work_dir}/base-sub.txt"
+    sync_combined_subscription
 }
 
 # ---- Socks5 入站 ----
@@ -1935,13 +2218,13 @@ add_socks5_inbound() {
             green "socks5监听端口：${purple}${sk_port}${re}"
             break
         fi
-        
+
         # 统一验证端口格式和范围
         if [[ ! "$sk_port" =~ ^[0-9]+$ ]] || [ "$sk_port" -gt 65535 ] || [ "$sk_port" -lt 1 ]; then
             yellow "错误：端口必须是1-65535之间的数字！"
             continue
         fi
-        
+
         green "socks5监听端口：${purple}${sk_port}${re}"
         break
     done
@@ -2046,18 +2329,18 @@ add_anytls() {
     # 端口输入验证循环
     while true; do
         reading "请输入 AnyTLS 监听端口 (回车随机生成): " at_port
-        
+
         if [ -z "$at_port" ]; then
             at_port=$(shuf -i 10000-65000 -n 1)
             green "Anytls监听端口：${purple}${at_port}${re}"
             break
         fi
-        
+
         if [[ ! "$at_port" =~ ^[0-9]+$ ]] || [ "$at_port" -gt 65535 ] || [ "$at_port" -lt 1 ]; then
             yellow "错误：端口必须是1-65535之间的数字！"
             continue
         fi
-        
+
         green "Anytls监听端口：${purple}${at_port}${re}"
         break
     done
@@ -2133,18 +2416,18 @@ add_ss2022() {
     # 端口输入验证循环
     while true; do
         reading "请输入 Shadowsocks-2022 监听端口 (回车随机生成): " ss_port
-        
+
         if [ -z "$ss_port" ]; then
             ss_port=$(shuf -i 10000-65000 -n 1)
             green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
             break
         fi
-        
+
         if [[ ! "$ss_port" =~ ^[0-9]+$ ]] || [ "$ss_port" -gt 65535 ] || [ "$ss_port" -lt 1 ]; then
             yellow "错误：端口必须是1-65535之间的数字！"
             continue
         fi
-        
+
         green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
         break
     done
@@ -2164,7 +2447,7 @@ add_ss2022() {
     green "加密方式为：${purple}${ss_method}${re}"
     local ss_key
     ss_key=$(dd if=/dev/urandom bs=1 count=${key_len} 2>/dev/null | base64 -w0)
-    
+
     jq --arg tag "$tag" \
        --argjson port "$ss_port" \
        --arg method "$ss_method" \
@@ -2382,9 +2665,9 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-10): " choice 
+            reading "请输入选择(0-10): " choice
             echo ""
-            need_pause=true  
+            need_pause=true
             case "${choice}" in
                 1)
                     check_singbox &>/dev/null; singbox_check=$?
@@ -2422,7 +2705,7 @@ case "$1" in
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
-                0)  exit 0 ;;       
+                0)  exit 0 ;;
                 *)
                     red "无效的选项，请输入 0-10"
                     need_pause=true

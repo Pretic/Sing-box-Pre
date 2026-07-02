@@ -31,6 +31,14 @@ Telegram交流反馈群组：https://t.me/eooceu
 * `cloudflared` quick tunnel 与固定隧道配置统一使用 `${ARGO_PORT}`，避免端口变量和实际转发端口不一致。
 * 默认订阅不输出 HY2/TUIC 等 UDP 系节点；如需输出，可设置 `INCLUDE_UDP_LINKS=1`。
 
+
+## PreNet 订阅与 cfy 同步说明
+
+* 对外订阅地址默认使用 IPv4 公网地址生成，避免 VPS 没有 IPv6 时订阅 URL 不可访问；默认等同 `SUB_ADDR_FAMILY=ipv4`。
+* 如需指定订阅地址主机名或 IP，可在安装前设置 `SUB_HOST=你的域名或IP`；如需优先 IPv6，可设置 `SUB_ADDR_FAMILY=ipv6`，如需自动探测可设置 `SUB_ADDR_FAMILY=auto`。
+* `/etc/sing-box/url.txt` 保留基础节点明文，`/etc/sing-box/base-sub.txt` 保留基础节点 Base64 订阅。
+* `/etc/sing-box/cfy-url.txt` 保存 cfy 最近一次优选结果；`/etc/sing-box/all-url.txt` 合并基础节点和 cfy 优选节点。
+* Nginx 对外仍服务 `/etc/sing-box/sub.txt`，该文件会由 `/etc/sing-box/all-sub.txt` 同步而来；未运行 cfy 时等同基础订阅，运行 cfy 后会包含优选节点。
 # 1：VPS 一键命令
 
 ## 命令速查
@@ -44,6 +52,31 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sin
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
+
+### Sing-box 新装（固定 Argo 隧道，推荐长期使用）
+```bash
+ARGO_DOMAIN=example.yourdomain.com ARGO_AUTH='你的token或json' bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
+```
+
+## 固定 Argo 隧道设置说明
+
+固定隧道适合长期使用，能避免临时 `trycloudflare.com` 域名变化后 `VLESS-WS-TLS-Argo` 和 cfy 优选节点失效。默认安装仍使用临时隧道；只有设置 `ARGO_DOMAIN` 和 `ARGO_AUTH`，或在菜单中手动添加时，才启用固定隧道。
+
+准备内容：
+* `ARGO_DOMAIN`：已经接入 Cloudflare 的固定隧道域名，例如 `node.example.com`。
+* `ARGO_AUTH`：Cloudflare Tunnel 的 token，或包含 `TunnelID`、`TunnelSecret` 的 JSON。JSON 建议用英文单引号包裹，避免 shell 解析出错。
+* `ARGO_PORT`：脚本本地 Argo 入口端口，默认 `8001`。如果你改了 `ARGO_PORT`，Cloudflare 隧道的服务地址也要对应改成 `http://127.0.0.1:你的端口`。
+
+Cloudflare 侧建议这样设：创建 Tunnel 后添加 Public Hostname，`Hostname` 填你的 `ARGO_DOMAIN`，`Service` 选择 `HTTP`，URL 填 `127.0.0.1:8001`。如果使用 token 安装，请确认 Cloudflare 后台服务端口和脚本里的 `ARGO_PORT` 一致。
+
+新装时直接运行：
+```bash
+ARGO_DOMAIN=node.example.com ARGO_AUTH='你的token或json' bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
+```
+
+已经安装过的机器，可以运行 `sb`，进入 `Argo 隧道管理` -> `添加Argo固定隧道`，按提示输入域名和 token/json。需要恢复便捷的临时隧道时，进入同一菜单选择 `切换回Argo临时隧道`。
+
+设置完成后运行 `sb -c` 查看节点信息。`vless-ws-tls-argo` 节点里的 `host` 和 `sni` 应该是你的固定域名；如果固定隧道参数格式不匹配，脚本会提示并回退临时隧道，避免写出不可用的固定域名节点。
 
 ### NAT 机新装（无交互）
 ```bash
@@ -115,7 +148,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sb_serv00.
 * 可选环境变量：CHAT_ID BOT_TOKEN UUID NEZHA_SERVER NEZHA_PORT NEZHA_KEY ARGO_DOMAIN ARGO_AUTH CFIP CFPORT SUB_TOKEN
 * v0哪吒变量形式:NEZHA_SERVER=nezha.abc.com  v1哪吒变量形式:NEZHA_SERVER=nezha.abc.com:8008,v1不需要NEZHA_PORT变量
 * 需要订阅自动上传到汇聚订阅器，需先部署Merge-sub项目，部署时填写UPLOAD_URL环境变量为部署的首页地址,例如：UPLOAD_URL=https://merge.serv00.net
-* ARGO_AUTH变量使用json时，ARGO_AUTH=‘json’  需用英文输入状态下的单引号包裹，例如：ARGO_AUTH='{"AccountTag":"123","TunnelSecret":"123","TunnelID":"123"}' 
+* ARGO_AUTH变量使用json时，ARGO_AUTH=‘json’  需用英文输入状态下的单引号包裹，例如：ARGO_AUTH='{"AccountTag":"123","TunnelSecret":"123","TunnelID":"123"}'
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sb4.sh)
 ```
@@ -154,7 +187,7 @@ bash <(curl -Ls https://github.com/eooce/Sing-box/releases/download/00/tu.sh)
 * 复制脚本回车全自动安装节点+全自动保活
 * 默认不安装哪吒和TG提醒，如需要，在脚本前添加环境变量随脚本一起运行即可,v1不需要NEZHA_PORT变量
 * v0哪吒变量形式:NEZHA_SERVER=nezha.abc.com  v1哪吒变量形式:NEZHA_SERVER=nezha.abc.com:8008
-* 可选变量：CHAT_ID BOT_TOKEN UUID ARGO_DOMAIN ARGO_AUTH NEZHA_SERVER NEZHA_PORT NEZHA_KEY CFIP CFPORT SUB_TOKEN 
+* 可选变量：CHAT_ID BOT_TOKEN UUID ARGO_DOMAIN ARGO_AUTH NEZHA_SERVER NEZHA_PORT NEZHA_KEY CFIP CFPORT SUB_TOKEN
 
 ```
 bash <(curl -Ls https://github.com/eooce/Sing-box/releases/download/00/00_vm.sh)
@@ -200,7 +233,7 @@ bash <(curl -Ls https://github.com/eooce/Sing-box/releases/download/00/00_vm.sh)
 ## 赞助
 * 感谢[YXVM](https://yxvm.com/aff.php?aff=764)提供赞助 [NodeSupport](https://github.com/NodeSeekDev/NodeSupport)
 ---
-### 🚀 Sponsored by SharonNetworks 
+### 🚀 Sponsored by SharonNetworks
 
 <img src="https://framerusercontent.com/assets/3bMljdaUFNDFvMzdG9S0NjYmhSY.png" width="30%" alt="sharon.io">
 
