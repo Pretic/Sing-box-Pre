@@ -28,7 +28,6 @@ Telegram交流反馈群组：https://t.me/eooceu
 * 默认订阅改为输出 `VLESS-Reality` 与 `VLESS-WS-TLS-Argo`，不再默认依赖旧 `VMess-WS-TLS-Argo`。
 * 适配 Xray-core 新版本移除旧 TLS `allowInsecure` 后，部分客户端导入/连接 VMess 节点报错的问题。
 * Argo 本地入口改为 VLESS + WebSocket，并限制监听 `127.0.0.1:${ARGO_PORT}`，由 `cloudflared` 本机转发。
-* `cloudflared` quick tunnel 与固定隧道配置统一使用 `${ARGO_PORT}`，避免端口变量和实际转发端口不一致。
 * 默认订阅不输出 HY2/TUIC 等 UDP 系节点；如需输出，可设置 `INCLUDE_UDP_LINKS=1`。
 
 
@@ -52,31 +51,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sin
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
-
-### Sing-box 新装（固定 Argo 隧道，推荐长期使用）
-```bash
-ARGO_DOMAIN=example.yourdomain.com ARGO_AUTH='你的token或json' bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
-```
-
-## 固定 Argo 隧道设置说明
-
-固定隧道适合长期使用，能避免临时 `trycloudflare.com` 域名变化后 `VLESS-WS-TLS-Argo` 和 cfy 优选节点失效。默认安装仍使用临时隧道；只有设置 `ARGO_DOMAIN` 和 `ARGO_AUTH`，或在菜单中手动添加时，才启用固定隧道。
-
-准备内容：
-* `ARGO_DOMAIN`：已经接入 Cloudflare 的固定隧道域名，例如 `node.example.com`。
-* `ARGO_AUTH`：Cloudflare Tunnel 的 token，或包含 `TunnelID`、`TunnelSecret` 的 JSON。JSON 建议用英文单引号包裹，避免 shell 解析出错。
-* `ARGO_PORT`：脚本本地 Argo 入口端口，默认 `8001`。如果你改了 `ARGO_PORT`，Cloudflare 隧道的服务地址也要对应改成 `http://127.0.0.1:你的端口`。
-
-Cloudflare 侧建议这样设：创建 Tunnel 后添加 Public Hostname，`Hostname` 填你的 `ARGO_DOMAIN`，`Service` 选择 `HTTP`，URL 填 `127.0.0.1:8001`。如果使用 token 安装，请确认 Cloudflare 后台服务端口和脚本里的 `ARGO_PORT` 一致。
-
-新装时直接运行：
-```bash
-ARGO_DOMAIN=node.example.com ARGO_AUTH='你的token或json' bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
-```
-
-已经安装过的机器，可以运行 `sb`，进入 `Argo 隧道管理` -> `添加Argo固定隧道`，按提示输入域名和 token/json。需要恢复便捷的临时隧道时，进入同一菜单选择 `切换回Argo临时隧道`。
-
-设置完成后运行 `sb -c` 查看节点信息。`vless-ws-tls-argo` 节点里的 `host` 和 `sni` 应该是你的固定域名；如果固定隧道参数格式不匹配，脚本会提示并回退临时隧道，避免写出不可用的固定域名节点。
 
 ### NAT 机新装（无交互）
 ```bash
@@ -109,10 +83,6 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 ```
 
 
-## ssh综合工具箱一键脚本
-```
-bash <(curl -Ls ssh_tool.eooce.com)
-```
 ## 快捷指令和命令行参数
 快捷指令：sb
 ```
@@ -229,29 +199,3 @@ bash <(curl -Ls https://github.com/eooce/Sing-box/releases/download/00/00_vm.sh)
 ## ⚠️ 免责声明
 * 本程序仅供学习了解, 非盈利目的，请于下载后 24 小时内删除, 不得用作任何商业用途, 文字、数据及图片均有所属版权, 如转载须注明来源。
 * 使用本程序必循遵守部署免责声明，使用本程序必循遵守部署服务器所在地、所在国家和用户所在国家的法律法规, 程序作者不对使用者任何不当行为负责。
-
-## 赞助
-* 感谢[YXVM](https://yxvm.com/aff.php?aff=764)提供赞助 [NodeSupport](https://github.com/NodeSeekDev/NodeSupport)
----
-### 🚀 Sponsored by SharonNetworks
-
-<img src="https://framerusercontent.com/assets/3bMljdaUFNDFvMzdG9S0NjYmhSY.png" width="30%" alt="sharon.io">
-
-本项目的构建与发布环境由 SharonNetworks 提供支持 —— 专注亚太顶级回国优化线路，高带宽、低延迟直连中国大陆，内置强大高防 DDoS 清洗能力。
-
-SharonNetworks 为您的业务起飞保驾护航！
-
-#### ✨ 服务优势
-
-* 亚太三网回程优化直连中国大陆，下载快到飞起
-* 超大带宽 + 抗攻击清洗服务，保障业务安全稳定
-* 多节点覆盖（香港、新加坡、日本、台湾、韩国）
-* 高防护力、高速网络；港/日/新 CDN 即将上线
-
-想体验同款构建环境？欢迎 [访问 Sharon 官网](https://sharon.io) 或 [加入 Telegram 群组](https://t.me/SharonNetwork) 了解更多并申请赞助。
-
-## ⭐ Star History
-
-感谢所有为本项目点亮 Star 的朋友们！🌟
-
-[![Star History Chart](https://api.star-history.com/svg?repos=eooce/Sing-box&type=Date)](https://star-history.com/#eooce/Sing-box&Date)
