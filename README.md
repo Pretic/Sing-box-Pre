@@ -51,13 +51,15 @@ PORT=你的端口 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sin
 PORT=你的端口 PROMPT_NODE_NAME=1 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
-### 已安装环境仅更新 `sb` 快捷命令
+## 已安装后如何更新
+
+以前已经安装过本脚本时，只想同步最新 `sb` 菜单和脚本逻辑，执行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
 ```
 
-更新命令只刷新 `/usr/bin/sb` 指向本仓库脚本，不修改已有节点、订阅、端口、sing-box 服务或 Argo 配置。
+更新命令只刷新 `/usr/bin/sb` 指向本仓库脚本，不会重装 sing-box，不修改已有节点、订阅、端口、sing-box 服务或 Argo 配置。更新后继续使用 `sb` 打开菜单，或使用 `sb -c` 查看当前节点和订阅信息。
 
 ## 常用变量
 
