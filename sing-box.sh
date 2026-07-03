@@ -998,6 +998,7 @@ EOF
     mkdir -p /usr/local/bin /usr/bin
     ln -sf "$work_dir/sb.sh" /usr/local/bin/sb
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
+    [ ! -e /usr/local/bin/sing-box ] && ln -sf "$work_dir/sb.sh" /usr/local/bin/sing-box
     if [ -s /usr/local/bin/sb ] || [ -s /usr/bin/sb ]; then
         green "\n快捷指令 sb 创建成功\n"
     else
