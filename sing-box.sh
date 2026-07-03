@@ -995,8 +995,14 @@ create_shortcut() {
 exec bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) "$@"
 EOF
     chmod +x "$work_dir/sb.sh"
+    mkdir -p /usr/local/bin /usr/bin
+    ln -sf "$work_dir/sb.sh" /usr/local/bin/sb
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
-    [ -s /usr/bin/sb ] && green "\n快捷指令 sb 创建成功\n" || red "\n快捷指令创建失败\n"
+    if [ -s /usr/local/bin/sb ] || [ -s /usr/bin/sb ]; then
+        green "\n快捷指令 sb 创建成功\n"
+    else
+        red "\n快捷指令创建失败\n"
+    fi
 }
 
 update_shortcut() {
