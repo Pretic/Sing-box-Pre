@@ -51,6 +51,17 @@ PORT=你的端口 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sin
 PORT=你的端口 PROMPT_NODE_NAME=1 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
+### NAT 机端口说明
+
+脚本安装时会把 `PORT` 当作起始端口使用：
+
+- `PORT`：VLESS-Reality TCP 入口。
+- `PORT+1`：Nginx 订阅 TCP 端口。
+- `PORT+2`：TUIC UDP 端口。
+- `PORT+3`：Hysteria2 UDP 端口。
+
+端口受限 NAT 机如果只有一个公网映射端口，建议优先使用 `VLESS-WS-TLS-Argo` 和 cfy 生成的优选节点。这条链路走 Cloudflare Tunnel，VPS 侧只监听 `127.0.0.1:${ARGO_PORT}`，不要求服务商额外开放 `ARGO_PORT`。Reality、TUIC、Hysteria2 和 Nginx 订阅只有在对应公网映射端口开放时才可靠。
+
 ## 已安装后如何更新
 
 以前已经安装过本脚本时，只想同步最新 `sb` 菜单和脚本逻辑，执行：
@@ -65,12 +76,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sin
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PORT` | 随机 | Reality 入口端口；NAT 机新装时建议显式指定。 |
-| `ARGO_PORT` | `8001` | 本机 Argo WebSocket 入口端口。 |
+| `PORT` | 随机 | Reality 入口端口；安装时还会派生 `PORT+1`、`PORT+2`、`PORT+3`。NAT 机新装时建议显式指定。 |
+| `ARGO_PORT` | `8001` | 本机 Argo WebSocket 入口端口，仅监听本机回环地址。 |
 | `CFIP` | `cdns.doon.eu.org` | VLESS-WS-TLS-Argo 的 Cloudflare 入口地址。 |
 | `CFPORT` | `443` | VLESS-WS-TLS-Argo 的入口端口。 |
 | `INCLUDE_UDP_LINKS` | `0` | 是否在默认订阅中输出 HY2/TUIC；设为 `1` 时输出。 |
-| `NODE_NAME` | 空 | 无交互安装时固定完整节点名，例如 `NODE_NAME=US-PreNet`。 |
+| `NODE_NAME` | 空 | 高级用法：固定完整节点名前缀，例如 `NODE_NAME=US-PreNet`。未设置时使用“国家码-VPS主机名”，交互输入时使用“国家码-输入名”。 |
 | `PROMPT_NODE_NAME` | `0` | 无交互安装时是否提示输入 VPS 名称；设为 `1` 时提示。 |
 | `SUB_HOST` | 空 | 指定订阅地址使用的主机名或 IP。 |
 | `SUB_ADDR_FAMILY` | `ipv4` | 订阅地址主机选择：`ipv4`、`ipv6` 或 `auto`。 |
@@ -88,6 +99,7 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 - 对外订阅地址默认使用 IPv4 公网地址生成，避免 VPS 没有 IPv6 时订阅 URL 不可访问；默认等同 `SUB_ADDR_FAMILY=ipv4`。
 - 如需指定订阅地址主机名或 IP，可在安装前设置 `SUB_HOST=你的域名或IP`；如需优先 IPv6，可设置 `SUB_ADDR_FAMILY=ipv6`；如需自动探测可设置 `SUB_ADDR_FAMILY=auto`。
 - `/etc/sing-box/url.txt` 保留基础节点明文，`/etc/sing-box/base-sub.txt` 保留基础节点 Base64 订阅。
+- 基础节点默认包含 `vless-reality-ipv4`；如果 VPS 检测到 IPv6，会额外输出 `vless-reality-ipv6`；Argo 模板节点保留为 `vless-ws-tls-argo`。
 - `/etc/sing-box/cfy-url.txt` 保存 cfy 最近一次优选结果；`/etc/sing-box/all-url.txt` 合并基础节点和 cfy 优选节点。
 - Nginx 对外仍服务 `/etc/sing-box/sub.txt`，该文件由 `/etc/sing-box/all-sub.txt` 同步而来；未运行 cfy 时等同基础订阅，运行 cfy 后会包含优选节点。
 
@@ -108,7 +120,8 @@ sb -c
       --update      仅更新 sb 快捷命令，不修改已有节点
   -c, --check       查看节点信息和订阅链接
   -r, --restart     重新获取 Argo 临时隧道并更新到订阅
-  -u, --uninstall   无交互卸载 sing-box（含 nginx）
+  -u, --uninstall   无交互卸载 sing-box（保留 nginx）
+      --purge-nginx  卸载 sing-box 并同时卸载 nginx
   -h, --help        显示帮助信息
 ```
 
@@ -118,8 +131,8 @@ sb -c
 
 - 本仓库命令统一使用 `curl -fsSL`，下载失败时会显示错误，避免 Bash 静默执行空脚本。
 - 新装或重装使用上方安装命令；已安装环境只想刷新 `sb` 快捷命令时再使用 `--update`。
-- NAT 机只有新装或重装生成节点时需要带 `PORT=你的端口`，并确认后续端口也在服务商开放范围内。
-- 默认节点名前缀保持原来的 `国家代码-ISP`，例如 `US-HostPapa`；交互生成节点时可手动输入 VPS 名称替换中间 ISP 部分。
+- NAT 机只有新装或重装生成节点时需要带 `PORT=你的端口`，并确认 `PORT+1`、`PORT+2`、`PORT+3` 是否也在服务商开放范围内；如果只有单个端口，优先使用 Argo/cfy 节点。
+- 默认节点名前缀使用 `国家代码-VPS名称`，未手动输入时取 VPS 主机名；交互生成节点时可手动输入 VPS 名称替换主机名部分。
 
 ## 原作者信息
 

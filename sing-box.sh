@@ -38,6 +38,7 @@ export NODE_NAME=${NODE_NAME:-''}
 export PROMPT_NODE_NAME=${PROMPT_NODE_NAME:-'0'}
 export SUB_HOST=${SUB_HOST:-''}
 export SUB_ADDR_FAMILY=${SUB_ADDR_FAMILY:-'ipv4'}
+export PURGE_NGINX=${PURGE_NGINX:-'0'}
 ARGO_FIXED_READY=0
 
 # 检查是否为root下运行
@@ -46,6 +47,56 @@ ARGO_FIXED_READY=0
 # 检查命令是否存在函数
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+atomic_write_file() {
+    local target_file="$1"
+    local mode="${2:-644}"
+    local target_dir target_name tmp_file
+
+    target_dir=$(dirname "$target_file")
+    target_name=$(basename "$target_file")
+    mkdir -p "$target_dir" || return 1
+    tmp_file=$(mktemp "${target_dir}/.tmp.${target_name}.XXXXXX") || return 1
+
+    if ! cat > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    chmod "$mode" "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$target_file"
+}
+
+download_binary() {
+    local url="$1"
+    local target_file="$2"
+    local target_dir tmp_dir tmp_file
+
+    target_dir=$(dirname "$target_file")
+    mkdir -p "$target_dir" || return 1
+    tmp_dir=$(mktemp -d "${work_dir}/.download.XXXXXX") || return 1
+    tmp_file="${tmp_dir}/$(basename "$target_file")"
+
+    if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 -o "$tmp_file" "$url"; then
+        rm -rf "$tmp_dir"
+        red "download failed: $url"
+        return 1
+    fi
+    if [ ! -s "$tmp_file" ]; then
+        rm -rf "$tmp_dir"
+        red "downloaded file is empty: $url"
+        return 1
+    fi
+
+    chmod +x "$tmp_file"
+    if command_exists install; then
+        install -m 755 "$tmp_file" "$target_file"
+    else
+        cp "$tmp_file" "$target_file" && chmod 755 "$target_file"
+    fi
+    local rc=$?
+    rm -rf "$tmp_dir"
+    return $rc
 }
 
 # 检查服务状态通用函数
@@ -154,24 +205,30 @@ manage_packages() {
 
 # 获取ip
 get_realip() {
-    ip=$(curl -4 -sm 2 ip.sb)
-    ipv6() { curl -6 -sm 2 ip.sb; }
-    if [ -z "$ip" ]; then
-        echo "[$(ipv6)]"
-    else
+    local ip v6
+
+    ip=$(curl -4 -sm 2 ip.sb | tr -d '\r\n') || true
+    ipv6() { curl -6 -sm 2 ip.sb | tr -d '\r\n'; }
+
+    if [ -n "$ip" ]; then
         if curl -4 -sm 2 http://ipinfo.io/org | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
-            echo "[$(ipv6)]"
-        else
-            if grep -qE '^\s*precedence\s+::ffff:0:0/96\s+100' "/etc/gai.conf" 2>/dev/null; then
-                echo "$ip"
-            else
-                v6=$(ipv6)
-                [ -n "$v6" ] && echo "[$v6]" || echo "$ip"
-            fi
+            v6=$(ipv6 || true)
+            [ -n "$v6" ] && echo "[$v6]" && return 0
+            echo "$ip"
+            return 0
+        fi
+
+        if grep -qE '^\s*precedence\s+::ffff:0:0/96\s+100' "/etc/gai.conf" 2>/dev/null; then
+            echo "$ip"
+            return 0
         fi
     fi
-}
 
+    v6=$(ipv6 || true)
+    [ -n "$v6" ] && echo "[$v6]" && return 0
+    [ -n "$ip" ] && echo "$ip" && return 0
+    return 1
+}
 format_url_host() {
     local host="$1"
 
@@ -232,6 +289,38 @@ sanitize_node_name() {
     local name="$1"
     name=$(printf '%s' "$name" | sed -E 's/[[:space:]]+/_/g; s/[^A-Za-z0-9._-]+/_/g; s/_+/_/g; s/^_//; s/_$//')
     printf '%s\n' "$name"
+}
+
+get_country_code() {
+    local code
+
+    code=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
+        awk -F\" '{for(x=1;x<=NF;x++){if($x=="country_code"){print $(x+2); exit}}}' 2>/dev/null || true)
+    [ -z "$code" ] && code=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" | tr -d '\n' | \
+        awk -F\" '{for(x=1;x<=NF;x++){if($x=="country_code"){print $(x+2); exit}}}' 2>/dev/null || true)
+    code=$(printf '%s' "$code" | tr '[:lower:]' '[:upper:]' | sed -E 's/[^A-Z0-9]//g')
+    [ -n "$code" ] || code="UN"
+    printf '%s\n' "$code"
+}
+
+get_default_node_name() {
+    local node_name
+
+    node_name=$(hostname 2>/dev/null || true)
+    node_name=$(sanitize_node_name "$node_name")
+    [ -n "$node_name" ] || node_name="VPS"
+    printf '%s\n' "$node_name"
+}
+
+format_node_name_prefix() {
+    local country_code="$1"
+    local node_name="$2"
+
+    country_code=$(printf '%s' "$country_code" | tr '[:lower:]' '[:upper:]' | sed -E 's/[^A-Z0-9]//g')
+    node_name=$(sanitize_node_name "$node_name")
+    [ -n "$country_code" ] || country_code="UN"
+    [ -n "$node_name" ] || node_name="VPS"
+    printf '%s-%s\n' "$country_code" "$node_name"
 }
 
 prompt_node_name_enabled() {
@@ -340,17 +429,17 @@ install_singbox() {
     esac
 
     mkdir -p "${work_dir}" "${conf_dir}"
-    chmod 777 "${work_dir}"
+    chmod 755 "${work_dir}"
     # latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
     # curl -sLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"
     # curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
-    curl -sLo "${work_dir}/qrencode" "https://$ARCH.ssss.nyc.mn/qrencode"
-    curl -sLo "${work_dir}/sing-box" "https://$ARCH.ssss.nyc.mn/sbx-1.13.13"
-    curl -sLo "${work_dir}/argo" "https://$ARCH.ssss.nyc.mn/bot"
+    download_binary "https://$ARCH.ssss.nyc.mn/qrencode" "${work_dir}/qrencode" || exit 1
+    download_binary "https://$ARCH.ssss.nyc.mn/sbx-1.13.13" "${work_dir}/sing-box" || exit 1
+    download_binary "https://$ARCH.ssss.nyc.mn/bot" "${work_dir}/argo" || exit 1
     # tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
     # mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/" && \
     # rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
-    chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
+    chown root:root "${work_dir}"
 
     nginx_port=$(($vless_port + 1))
     tuic_port=$(($vless_port + 2))
@@ -365,6 +454,7 @@ install_singbox() {
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+    chmod 600 "${work_dir}/private.key" 2>/dev/null || true
 
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
 
@@ -718,30 +808,32 @@ EOF
 # 生成节点和订阅链接
 get_info() {
     yellow "\nip检测中,请稍等...\n"
-    server_ip=$(get_realip)
+    server_ipv4=$(get_public_ipv4 2>/dev/null || true)
+    server_ipv6=$(get_public_ipv6 2>/dev/null || true)
+    server_ip="${server_ipv4:-$server_ipv6}"
+    if [ -z "$server_ip" ]; then
+        server_ip=$(get_realip 2>/dev/null || true)
+        if [[ "$server_ip" == \[*\] ]]; then
+            server_ipv6="$server_ip"
+        else
+            server_ipv4="$server_ip"
+        fi
+    fi
     sub_host=$(get_subscription_host)
     clear
+
+    country_code=$(get_country_code)
     if [ -n "$NODE_NAME" ]; then
         isp=$(sanitize_node_name "$NODE_NAME")
     else
-        isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
-            awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
-            sed 's/ /_/g' || \
-            curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" | tr -d '\n' | \
-            awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
-            sed 's/ /_/g' || echo "$hostname")
-        [ -z "$isp" ] && isp="$hostname"
-
+        node_name=$(get_default_node_name)
         if [ -z "$SKIP_NODE_NAME_PROMPT" ] && [ -t 0 ]; then
-            local vps_name_input country_code
-            reading "\n请输入VPS名称用于节点备注（回车保留当前名称：${isp}）: " vps_name_input
+            local vps_name_input
+            reading "\n请输入VPS名称用于节点备注（回车保留当前名称：$(format_node_name_prefix "$country_code" "$node_name")）: " vps_name_input
             vps_name_input=$(sanitize_node_name "$vps_name_input")
-            if [ -n "$vps_name_input" ]; then
-                country_code="${isp%%-*}"
-                [ -z "$country_code" ] || [ "$country_code" = "$isp" ] && country_code="UN"
-                isp="${country_code}-${vps_name_input}"
-            fi
+            [ -n "$vps_name_input" ] && node_name="$vps_name_input"
         fi
+        isp=$(format_node_name_prefix "$country_code" "$node_name")
     fi
 
     if [ "$ARGO_FIXED_READY" = "1" ] && [ -n "$ARGO_DOMAIN" ]; then
@@ -770,14 +862,28 @@ get_info() {
         extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://)' "${client_dir}" || true)
     fi
 
-    cat > ${work_dir}/url.txt << EOF
-vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}
+    reality_v4_name="${isp}-vless-reality-ipv4"
+    reality_v6_name="${isp}-vless-reality-ipv6"
+    argo_name="${isp}-vless-ws-tls-argo"
+
+    : > ${work_dir}/url.txt
+    if [ -n "$server_ipv4" ]; then
+        cat >> ${work_dir}/url.txt << EOF
+vless://${uuid}@${server_ipv4}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${reality_v4_name}
 EOF
+    fi
+
+    if [ -n "$server_ipv6" ]; then
+        [ -s "${work_dir}/url.txt" ] && echo "" >> "${work_dir}/url.txt"
+        cat >> ${work_dir}/url.txt << EOF
+vless://${uuid}@${server_ipv6}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${reality_v6_name}
+EOF
+    fi
 
     if [ -n "$argodomain" ]; then
+        [ -s "${work_dir}/url.txt" ] && echo "" >> "${work_dir}/url.txt"
         cat >> ${work_dir}/url.txt << EOF
-
-vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo#${isp}-vless-ws-tls-argo
+vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo#${argo_name}
 EOF
     fi
 
@@ -888,7 +994,7 @@ EOF
         nginx -s reload > /dev/null 2>&1 || start_nginx > /dev/null 2>&1
         green "nginx订阅配置已加载"
     else
-        yellow "nginx配置检测失败，尝试重启..."
+            yellow "nginx is not installed; skipping nginx purge."
         restart_nginx > /dev/null 2>&1
         if [ $? -ne 0 ]; then
             [[ -f "/etc/nginx/nginx.conf.bak.sb" ]] && cp "/etc/nginx/nginx.conf.bak.sb" /etc/nginx/nginx.conf > /dev/null 2>&1
@@ -948,7 +1054,6 @@ manage_service() {
             red "无效的操作: $action\n"; return 1 ;;
     esac
 }
-
 start_singbox()  { manage_service "sing-box" "start"; }
 stop_singbox()   { manage_service "sing-box" "stop"; }
 restart_singbox(){ manage_service "sing-box" "restart"; }
@@ -957,6 +1062,52 @@ stop_argo()      { manage_service "argo" "stop"; }
 restart_argo()   { manage_service "argo" "restart"; }
 start_nginx()    { manage_service "nginx" "start"; }
 restart_nginx()  { manage_service "nginx" "restart"; }
+
+validate_singbox_config() {
+    [ -x "${work_dir}/${server_name}" ] || return 0
+    [ -d "${conf_dir}" ] || return 0
+    "${work_dir}/${server_name}" check -C "${conf_dir}" >/dev/null 2>&1
+}
+
+apply_jq_config() {
+    local target_file="$1"
+    shift
+    local target_dir target_name tmp_file backup_file
+
+    target_dir=$(dirname "$target_file")
+    target_name=$(basename "$target_file")
+    tmp_file=$(mktemp "${target_dir}/.tmp.${target_name}.XXXXXX") || return 1
+    backup_file=$(mktemp "${target_dir}/.bak.${target_name}.XXXXXX") || { rm -f "$tmp_file"; return 1; }
+
+    if ! jq "$@" "$target_file" > "$tmp_file"; then
+        rm -f "$tmp_file" "$backup_file"
+        red "failed to generate updated config: $target_file"
+        return 1
+    fi
+    if ! jq empty "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file" "$backup_file"
+        red "generated config is not valid JSON: $target_file"
+        return 1
+    fi
+
+    cp -p "$target_file" "$backup_file" 2>/dev/null || cp "$target_file" "$backup_file" || { rm -f "$tmp_file" "$backup_file"; return 1; }
+    if ! mv -f "$tmp_file" "$target_file"; then
+        rm -f "$tmp_file" "$backup_file"
+        return 1
+    fi
+    if ! validate_singbox_config; then
+        mv -f "$backup_file" "$target_file" >/dev/null 2>&1 || true
+        red "sing-box config check failed; rolled back $target_file"
+        return 1
+    fi
+
+    rm -f "$backup_file"
+}
+
+purge_nginx_package() {
+    local package="nginx"
+    manage_packages uninstall "$package"
+}
 
 # 卸载 sing-box（交互式）
 uninstall_singbox() {
@@ -979,7 +1130,7 @@ uninstall_singbox() {
 
             reading "\n是否卸载 Nginx？${green}(卸载请输入 ${yellow}y${re} ${green}回车将跳过卸载Nginx) (y/n): ${re}" choice
             case "${choice}" in
-                y|Y) manage_packages uninstall nginx ;;
+                y|Y) purge_nginx_package ;;
                 *)   yellow "取消卸载Nginx\n\n" ;;
             esac
             green "\nsing-box 卸载成功\n\n" && exit 0
@@ -1027,7 +1178,7 @@ auto_install() {
         exit 0
     fi
 
-    green "开始无交互式安装 sing-box..."
+    green "Starting non-interactive sing-box install..."
     manage_packages install nginx jq tar openssl lsof coreutils
     install_singbox
 
@@ -1044,21 +1195,15 @@ auto_install() {
     fi
 
     sleep 5
-    if prompt_node_name_enabled; then
-        get_info
-    else
-        SKIP_NODE_NAME_PROMPT=1
-        get_info
-        unset SKIP_NODE_NAME_PROMPT
-    fi
+    get_info
     add_nginx_conf
     create_shortcut
     green "\nsing-box 安装完成\n"
 }
 
-# 无交互静默卸载（-u 参数），含 nginx
+# Non-interactive uninstall (-u); keeps nginx unless PURGE_NGINX=1 or --purge-nginx is used.
 auto_uninstall() {
-    green "开始无交互式卸载sing-box..."
+    green "Starting non-interactive sing-box uninstall..."
 
     if command_exists rc-service; then
         rc-service sing-box stop  > /dev/null 2>&1
@@ -1077,28 +1222,34 @@ auto_uninstall() {
     fi
 
     rm -rf "${work_dir}"
-    rm -f /usr/bin/sb
-
-    if command_exists nginx; then
-        if command_exists rc-service; then
-            rc-service nginx stop   > /dev/null 2>&1
-            rc-update del nginx default > /dev/null 2>&1
-        elif command_exists systemctl; then
-            systemctl stop    nginx > /dev/null 2>&1
-            systemctl disable nginx > /dev/null 2>&1
-        fi
-        rm -f /etc/nginx/conf.d/sing-box.conf
-        manage_packages uninstall nginx
-        [ -f /etc/nginx/nginx.conf.bak.sb ] && \
-            mv /etc/nginx/nginx.conf.bak.sb /etc/nginx/nginx.conf > /dev/null 2>&1
-    else
-        yellow "nginx 未安装，跳过卸载 nginx。"
+    rm -f /usr/bin/sb /usr/local/bin/sb
+    if [ -L /usr/local/bin/sing-box ] && [ "$(readlink /usr/local/bin/sing-box 2>/dev/null)" = "${work_dir}/sb.sh" ]; then
+        rm -f /usr/local/bin/sing-box
     fi
 
-    green "\nsing-box 及 nginx 已完全卸载!\n"
-}
+    rm -f /etc/nginx/conf.d/sing-box.conf
+    [ -f /etc/nginx/nginx.conf.bak.sb ] && \
+        mv /etc/nginx/nginx.conf.bak.sb /etc/nginx/nginx.conf > /dev/null 2>&1
 
-# 变更配置
+    if [ "${PURGE_NGINX}" = "1" ]; then
+        if command_exists nginx; then
+            if command_exists rc-service; then
+                rc-service nginx stop   > /dev/null 2>&1
+                rc-update del nginx default > /dev/null 2>&1
+            elif command_exists systemctl; then
+                systemctl stop    nginx > /dev/null 2>&1
+                systemctl disable nginx > /dev/null 2>&1
+            fi
+            purge_nginx_package
+        else
+            yellow "nginx is not installed; skipping nginx purge."
+        fi
+        green "\nsing-box and nginx have been purged.\n"
+    else
+        command_exists nginx && restart_nginx > /dev/null 2>&1 || true
+        green "\nsing-box uninstalled; nginx retained. Use --purge-nginx to remove nginx too.\n"
+    fi
+}
 change_config() {
     local singbox_status=$(check_singbox 2>/dev/null)
     local singbox_installed=$?
@@ -1148,9 +1299,8 @@ change_config() {
                 1)
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.tag == "vless-reality").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+                    apply_jq_config "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.tag == "vless-reality").listen_port) = ($port | tonumber)' || return
                     restart_singbox
                     allow_port $new_port/tcp > /dev/null 2>&1
                     sed -i '/flow=xtls-rprx-vision/ s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
@@ -1161,9 +1311,8 @@ change_config() {
                 2)
                     reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+                    apply_jq_config "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)' || return
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i 's/\(hysteria2:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
@@ -1174,9 +1323,8 @@ change_config() {
                 3)
                     reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+                    apply_jq_config "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)' || return
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i 's/\(tuic:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
@@ -1187,9 +1335,8 @@ change_config() {
                 4)
                     reading "\n请输入vless-ws-tls-argo端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.tag == "vless-ws-argo").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+                    apply_jq_config "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.tag == "vless-ws-argo").listen_port) = ($port | tonumber)' || return
                     if command_exists rc-service; then
                         grep -Eq "127\.0\.0\.1:|localhost:" /etc/init.d/argo && \
                             sed -i -E 's#(127\.0\.0\.1|localhost):[0-9]+#127.0.0.1:'"$new_port"'#g' /etc/init.d/argo && \
@@ -1210,10 +1357,9 @@ change_config() {
         2)
             reading "\n请输入新的UUID(直接回车随机生成UUID): " new_uuid
             [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
-            jq --arg uuid "$new_uuid" \
+            apply_jq_config "${conf_dir}/inbounds.json" --arg uuid "$new_uuid" \
                '(.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
-                (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid' \
-               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+                (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid' || return
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
@@ -1233,10 +1379,9 @@ change_config() {
                 "4") new_sni="www.cerebrium.ai" ;;
                 "5") new_sni="www.nazhumi.com" ;;
             esac
-            jq --arg sni "$new_sni" \
+            apply_jq_config "${conf_dir}/inbounds.json" --arg sni "$new_sni" \
                '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
-                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni' \
-               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni' || return
             restart_singbox
             sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
             update_sub
@@ -1387,7 +1532,7 @@ disable_open_sub() {
                     [ "$(systemctl is-active nginx)" = "active" ] && systemctl stop nginx || red "nginx not running"
                 fi
             else
-                yellow "Nginx is not installed"
+            yellow "nginx is not installed; skipping nginx purge."
             fi
             green "\n已关闭节点订阅\n"
             ;;
@@ -1887,7 +2032,6 @@ add_rule_menu() {
     green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     sleep 1; warp_manage
 }
-
 # 设置全局代理出站
 set_global_outbound() {
     # 检查是否存在 socks5/http 代理出站（排除 direct 和 wireguard-out）
@@ -1897,7 +2041,7 @@ set_global_outbound() {
 
     if [ ${#proxy_tags[@]} -eq 0 ]; then
         yellow "\n当前没有可用的 socks5/http 代理出站。"
-        yellow "请先返回 → 设置分流服务 → 添加 Socks5/HTTP 出站，再设置全局代理。\n"
+        yellow "请先返回 → 添加 Socks5/HTTP 出站，再设置全局代理。\n"
         sleep 3; add_rule_menu; return
     fi
 
@@ -1924,7 +2068,6 @@ set_global_outbound() {
     yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
     sleep 2; warp_manage
 }
-
 # 恢复服务器原IP出站（恢复默认 route.json）
 restore_direct_outbound() {
     yellow "\n正在恢复默认路由配置...\n"
@@ -1986,7 +2129,6 @@ EOF
     green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
     sleep 2; warp_manage
 }
-
 delete_rule_menu() {
     clear
     green "当前已启用的分流规则集:"
@@ -2167,39 +2309,53 @@ remove_url_by_tag() {
 write_base64_subscription() {
     local source_file="$1"
     local sub_file="$2"
+    local sub_dir sub_name tmp_file
 
-    [ -s "$source_file" ] || { : > "$sub_file"; return 0; }
-    base64 -w0 "$source_file" > "$sub_file" 2>/dev/null || base64 "$source_file" | tr -d '\n\r' > "$sub_file"
-    chmod 644 "$sub_file" 2>/dev/null || true
+    sub_dir=$(dirname "$sub_file")
+    sub_name=$(basename "$sub_file")
+    mkdir -p "$sub_dir" || return 1
+    tmp_file=$(mktemp "${sub_dir}/.tmp.${sub_name}.XXXXXX") || return 1
+
+    if [ ! -s "$source_file" ]; then
+        : > "$tmp_file"
+    elif ! base64 -w0 "$source_file" > "$tmp_file" 2>/dev/null; then
+        if ! base64 "$source_file" | tr -d '\n\r' > "$tmp_file"; then
+            rm -f "$tmp_file"
+            return 1
+        fi
+    fi
+
+    chmod 644 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$sub_file"
 }
-
 sync_combined_subscription() {
     local tmp_file cfy_file cfy_sub_file combined_sub_file
-    tmp_file=$(mktemp)
     cfy_file="${work_dir}/cfy-url.txt"
     cfy_sub_file="${work_dir}/cfy-sub.txt"
     combined_sub_file="${work_dir}/all-sub.txt"
+
+    mkdir -p "${work_dir}" || return 1
+    tmp_file=$(mktemp "${work_dir}/.tmp.all-url.XXXXXX") || return 1
 
     [ -s "$client_dir" ] && sed '/^[[:space:]]*$/d' "$client_dir" > "$tmp_file"
     if [ -s "$cfy_file" ]; then
         [ -s "$tmp_file" ] && printf '\n' >> "$tmp_file"
         sed '/^[[:space:]]*$/d' "$cfy_file" >> "$tmp_file"
-        write_base64_subscription "$cfy_file" "$cfy_sub_file"
+        write_base64_subscription "$cfy_file" "$cfy_sub_file" || { rm -f "$tmp_file"; return 1; }
     fi
 
     if [ -s "$tmp_file" ]; then
-        mv "$tmp_file" "$combined_client_dir"
-        write_base64_subscription "$combined_client_dir" "$combined_sub_file"
-        cp "$combined_sub_file" "${work_dir}/sub.txt"
-        chmod 644 "${work_dir}/sub.txt" 2>/dev/null || true
+        chmod 644 "$tmp_file" 2>/dev/null || true
+        mv -f "$tmp_file" "$combined_client_dir" || { rm -f "$tmp_file"; return 1; }
+        write_base64_subscription "$combined_client_dir" "$combined_sub_file" || return 1
+        write_base64_subscription "$combined_client_dir" "${work_dir}/sub.txt" || return 1
     else
         rm -f "$tmp_file"
-        : > "$combined_client_dir"
-        : > "$combined_sub_file"
-        : > "${work_dir}/sub.txt"
+        printf '' | atomic_write_file "$combined_client_dir" 644
+        printf '' | atomic_write_file "$combined_sub_file" 644
+        printf '' | atomic_write_file "${work_dir}/sub.txt" 644
     fi
 }
-
 update_sub() {
     write_base64_subscription "$client_dir" "${work_dir}/base-sub.txt"
     sync_combined_subscription
@@ -2265,7 +2421,8 @@ add_socks5_inbound() {
         fi
     fi
 
-    jq --arg tag "$tag" \
+    apply_jq_config "$inbounds_file" \
+       --arg tag "$tag" \
        --argjson port "$sk_port" \
        --arg user "$sk_user" \
        --arg pass "$sk_pass" \
@@ -2275,7 +2432,7 @@ add_socks5_inbound() {
            "listen": "::",
            "listen_port": $port,
            "users": [{"username": $user, "password": $pass}]
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]' || return
 
     allow_port ${sk_port}/tcp ${sk_port}/udp > /dev/null 2>&1
 
@@ -2309,8 +2466,7 @@ remove_socks5_inbound() {
         yellow "Socks5 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+    apply_jq_config "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' || return
 
     remove_url_by_tag "socks"
     update_sub
@@ -2353,7 +2509,8 @@ add_anytls() {
         break
     done
 
-    jq --arg tag "$tag" \
+    apply_jq_config "$inbounds_file" \
+       --arg tag "$tag" \
        --argjson port "$at_port" \
        --arg pass "$current_uuid" \
        --arg cert "${work_dir}/cert.pem" \
@@ -2369,7 +2526,7 @@ add_anytls() {
                "certificate_path": $cert,
                "key_path": $key
            }
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]' || return
 
     allow_port ${at_port}/tcp > /dev/null 2>&1
 
@@ -2403,8 +2560,7 @@ remove_anytls() {
         yellow "AnyTLS 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+    apply_jq_config "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' || return
 
     remove_url_by_tag "anytls"
     update_sub
@@ -2456,7 +2612,8 @@ add_ss2022() {
     local ss_key
     ss_key=$(dd if=/dev/urandom bs=1 count=${key_len} 2>/dev/null | base64 -w0)
 
-    jq --arg tag "$tag" \
+    apply_jq_config "$inbounds_file" \
+       --arg tag "$tag" \
        --argjson port "$ss_port" \
        --arg method "$ss_method" \
        --arg key "$ss_key" \
@@ -2468,7 +2625,7 @@ add_ss2022() {
            "method": $method,
            "password": $key,
            "multiplex": {"enabled": true}
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]' || return
 
     allow_port ${ss_port}/tcp ${ss_port}/udp > /dev/null 2>&1
 
@@ -2505,8 +2662,7 @@ remove_ss2022() {
         yellow "Shadowsocks-2022 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+    apply_jq_config "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' || return
 
     remove_url_by_tag "ss"
     update_sub
@@ -2645,6 +2801,11 @@ case "$1" in
         auto_uninstall
         exit 0
         ;;
+    --purge-nginx)
+        PURGE_NGINX=1
+        auto_uninstall
+        exit 0
+        ;;
     -c | --check)
         check_nodes
         exit 0
@@ -2662,7 +2823,8 @@ case "$1" in
         green "      --update      仅更新 sb 快捷命令，不修改已有节点"
         green "  -c, --check       查看节点信息和订阅链接"
         green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
-        green "  -u, --uninstall   无交互卸载sing-box（含 nginx)"
+        green "  -u, --uninstall   uninstall sing-box and keep nginx"
+        green "      --purge-nginx  uninstall sing-box and remove nginx"
         green "  -h, --help        显示此帮助信息"
         echo ""
         green "  不带参数          进入交互式主菜单"
@@ -2729,3 +2891,7 @@ case "$1" in
         exit 1
         ;;
 esac
+
+
+
+
