@@ -1,0 +1,8 @@
+* text=auto
+*.sh text eol=lf
+*.go text eol=lf
+*.js text eol=lf
+*.py text eol=lf
+*.php text eol=lf
+*.env text eol=lf
+*.md text eol=lf
