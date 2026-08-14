@@ -78,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sin
 | --- | --- | --- |
 | `PORT` | 随机 | Reality 入口端口；安装时还会派生 `PORT+1`、`PORT+2`、`PORT+3`。NAT 机新装时建议显式指定。 |
 | `ARGO_PORT` | `8001` | 本机 Argo WebSocket 入口端口，仅监听本机回环地址。 |
-| `CFIP` | `cdns.doon.eu.org` | VLESS-WS-TLS-Argo 的 Cloudflare 入口地址。 |
+| `CFIP` | `cdns.doon.eu.org` | VLESS-WS-TLS-Argo 的优选 Cloudflare 入口地址。固定隧道会同时输出 `ARGO_DOMAIN` 稳定入口和该优选入口；临时隧道只输出该入口。 |
 | `CFPORT` | `443` | VLESS-WS-TLS-Argo 的入口端口。 |
 | `INCLUDE_UDP_LINKS` | `0` | 是否在默认订阅中输出 HY2/TUIC；设为 `1` 时输出。 |
 | `NODE_NAME` | 空 | 高级用法：固定完整节点名前缀，例如 `NODE_NAME=US-PreNet`。未设置时使用“国家码-VPS主机名”，交互输入时使用“国家码-输入名”。 |
@@ -99,7 +99,7 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 - 对外订阅地址默认使用 IPv4 公网地址生成，避免 VPS 没有 IPv6 时订阅 URL 不可访问；默认等同 `SUB_ADDR_FAMILY=ipv4`。
 - 如需指定订阅地址主机名或 IP，可在安装前设置 `SUB_HOST=你的域名或IP`；如需优先 IPv6，可设置 `SUB_ADDR_FAMILY=ipv6`；如需自动探测可设置 `SUB_ADDR_FAMILY=auto`。
 - `/etc/sing-box/url.txt` 保留基础节点明文，`/etc/sing-box/base-sub.txt` 保留基础节点 Base64 订阅。
-- 基础节点默认包含 `vless-reality-ipv4`；如果 VPS 检测到 IPv6，会额外输出 `vless-reality-ipv6`；Argo 模板节点保留为 `vless-ws-tls-argo`。
+- 基础节点默认包含 `vless-reality-ipv4`；如果 VPS 检测到 IPv6，会额外输出 `vless-reality-ipv6`。固定隧道同时输出以 `ARGO_DOMAIN` 连接的稳定 Argo 节点，以及以 `CFIP` 连接、后缀为 `argo-preferred` 的优选 Argo 节点；两者地址相同时自动去重。临时隧道仍只输出一个 Argo 节点。
 - `/etc/sing-box/cfy-url.txt` 保存 cfy 最近一次优选结果；`/etc/sing-box/all-url.txt` 合并基础节点和 cfy 优选节点。
 - Nginx 对外仍服务 `/etc/sing-box/sub.txt`，该文件由 `/etc/sing-box/all-sub.txt` 同步而来；未运行 cfy 时等同基础订阅，运行 cfy 后会包含优选节点。
 

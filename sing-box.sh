@@ -28,6 +28,11 @@ conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
 combined_client_dir="${work_dir}/all-url.txt"
 export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
+if [ -n "${CFIP:-}" ]; then
+    export CFIP_EXPLICIT=1
+else
+    export CFIP_EXPLICIT=0
+fi
 export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export ARGO_PORT=${ARGO_PORT:-'8001'}
 export ARGO_DOMAIN=${ARGO_DOMAIN:-''}
@@ -354,6 +359,34 @@ is_argo_tunnel_token() {
     local token="$1"
 
     [[ "$token" =~ ^[A-Za-z0-9._=-]{80,4096}$ ]]
+}
+
+select_argo_client_address() {
+    local fallback_cfip="$1"
+    local argo_domain="$2"
+    local fixed_ready="$3"
+    local cfip_explicit="${4:-0}"
+
+    if [ "$fixed_ready" = "1" ] && [ -n "$argo_domain" ] && [ "$cfip_explicit" != "1" ]; then
+        printf '%s\n' "$argo_domain"
+    else
+        printf '%s\n' "$fallback_cfip"
+    fi
+}
+
+list_argo_client_addresses() {
+    local fallback_cfip="$1"
+    local argo_domain="$2"
+    local fixed_ready="$3"
+
+    if [ "$fixed_ready" = "1" ] && [ -n "$argo_domain" ]; then
+        printf '%s\tstable\n' "$argo_domain"
+        if [ -n "$fallback_cfip" ] && [ "$fallback_cfip" != "$argo_domain" ]; then
+            printf '%s\tpreferred\n' "$fallback_cfip"
+        fi
+    elif [ -n "$fallback_cfip" ]; then
+        printf '%s\tstable\n' "$fallback_cfip"
+    fi
 }
 
 use_quick_argo_fallback() {
@@ -881,10 +914,17 @@ EOF
     fi
 
     if [ -n "$argodomain" ]; then
-        [ -s "${work_dir}/url.txt" ] && echo "" >> "${work_dir}/url.txt"
-        cat >> ${work_dir}/url.txt << EOF
-vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo#${argo_name}
+        while IFS=$'\t' read -r argo_client_address argo_address_role; do
+            [ -n "$argo_client_address" ] || continue
+            argo_client_name="$argo_name"
+            if [ "$argo_address_role" = "preferred" ]; then
+                argo_client_name="${argo_name}-preferred"
+            fi
+            [ -s "${work_dir}/url.txt" ] && echo "" >> "${work_dir}/url.txt"
+            cat >> ${work_dir}/url.txt << EOF
+vless://${uuid}@${argo_client_address}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo#${argo_client_name}
 EOF
+        done < <(list_argo_client_addresses "$CFIP" "$argodomain" "$ARGO_FIXED_READY")
     fi
 
     if [ "${INCLUDE_UDP_LINKS}" = "1" ]; then
@@ -2891,7 +2931,5 @@ case "$1" in
         exit 1
         ;;
 esac
-
-
 
 

@@ -35,3 +35,12 @@ jobs:
           fi
 
           echo "Verified ${checked} shell scripts"
+
+      - name: Run behavior tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_script in tests/*.sh; do
+            echo "Running ${test_script}"
+            bash "${test_script}"
+          done
