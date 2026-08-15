@@ -21,13 +21,88 @@ purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue() { echo -e "\e[1;36m$1\033[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
 
+validate_port_value() {
+    local value="${1:-}"
+    local label="${2:-port}"
+
+    [[ "$value" =~ ^[0-9]+$ ]] && \
+        [ "$value" -ge 1 ] 2>/dev/null && [ "$value" -le 65535 ] 2>/dev/null || {
+        echo "${label} 必须是 1-65535 的整数。" >&2
+        return 1
+    }
+}
+
+resolve_service_ports() {
+    local base_port="${PORT:-}"
+    local label value seen=' '
+
+    validate_port_value "$base_port" PORT || return 1
+    vless_port="${REALITY_PORT:-$base_port}"
+    nginx_port="${NGINX_PORT:-$((10#$base_port + 1))}"
+    tuic_port="${TUIC_PORT:-$((10#$base_port + 2))}"
+    hy2_port="${HY2_PORT:-$((10#$base_port + 3))}"
+    argo_port="${ARGO_PORT:-8001}"
+
+    for label in vless nginx tuic hy2 argo; do
+        eval "value=\${${label}_port}"
+        validate_port_value "$value" "${label}_port" || return 1
+        case "$seen" in
+            *" $value "*) echo "端口重复: $value" >&2; return 1 ;;
+        esac
+        seen="${seen}${value} "
+    done
+
+    export vless_port nginx_port tuic_port hy2_port argo_port
+    export ARGO_PORT="$argo_port"
+}
+
+get_listener_address() {
+    local has_v4="${1:-0}"
+    local has_v6="${2:-0}"
+    local bindv6only="${3:-0}"
+
+    [[ "$has_v4" =~ ^[01]$ && "$has_v6" =~ ^[01]$ && "$bindv6only" =~ ^[01]$ ]] || return 1
+    if [ "$has_v6" = 1 ] && { [ "$has_v4" = 0 ] || [ "$bindv6only" = 0 ]; }; then
+        printf '%s\n' '::'
+    elif [ "$has_v4" = 1 ]; then
+        printf '%s\n' '0.0.0.0'
+    else
+        return 1
+    fi
+}
+
+load_install_settings() {
+    local settings_file="${1:-${INSTALL_ENV_FILE:-/etc/sing-box/install.env}}"
+    local key value
+
+    [ -r "$settings_file" ] || return 0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            PORT|REALITY_PORT|NGINX_PORT|TUIC_PORT|HY2_PORT|ARGO_PORT) ;;
+            ''|'#'*) continue ;;
+            *) continue ;;
+        esac
+        validate_port_value "$value" "$key" || return 1
+        if [ -z "${!key:-}" ]; then
+            printf -v "$key" '%s' "$value"
+            export "$key"
+        fi
+    done < "$settings_file"
+}
+
 # 定义常量
 server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
 combined_client_dir="${work_dir}/all-url.txt"
-export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
+install_env_file="${INSTALL_ENV_FILE:-${work_dir}/install.env}"
+load_install_settings "$install_env_file" || {
+    red "install.env 中存在无效端口设置，请修正后重试。"
+    exit 1
+}
+export PORT=${PORT:-$(shuf -i 1000-65000 -n 1)}
+export vless_port=${REALITY_PORT:-$PORT}
 if [ -n "${CFIP:-}" ]; then
     export CFIP_EXPLICIT=1
 else
@@ -56,6 +131,92 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+port_is_listening() {
+    local port="${1:-}"
+    local proto="${2:-}"
+
+    validate_port_value "$port" port || return 1
+    case "$proto" in
+        tcp|udp) ;;
+        *) return 1 ;;
+    esac
+
+    if command_exists ss; then
+        if [ "$proto" = tcp ]; then
+            ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
+        else
+            ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
+        fi
+    elif command_exists lsof; then
+        if [ "$proto" = tcp ]; then
+            lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -q .
+        else
+            lsof -nP -iUDP:"$port" 2>/dev/null | grep -q .
+        fi
+    else
+        return 1
+    fi
+}
+
+check_service_ports_available() {
+    local rule port proto
+
+    for rule in \
+        "$vless_port/tcp" \
+        "$nginx_port/tcp" \
+        "$tuic_port/udp" \
+        "$hy2_port/udp" \
+        "$argo_port/tcp"; do
+        port="${rule%/*}"
+        proto="${rule#*/}"
+        if port_is_listening "$port" "$proto"; then
+            echo "端口已被占用: ${port}/${proto}" >&2
+            return 1
+        fi
+    done
+}
+
+ipv4_stack_available() {
+    if command_exists ip; then
+        {
+            ip -4 route show default 2>/dev/null || true
+            ip -4 addr show scope global 2>/dev/null || true
+        } | grep -q .
+        return $?
+    fi
+    [ -r /proc/net/route ] && awk 'NR > 1 && ($2 == "00000000" || $8 != "FFFFFFFF") { found=1 } END { exit !found }' /proc/net/route
+}
+
+ipv6_socket_available() {
+    if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] && \
+        [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = 1 ]; then
+        return 1
+    fi
+    [ -s /proc/net/if_inet6 ] && return 0
+    command_exists ip && ip -6 addr show 2>/dev/null | grep -q 'inet6'
+}
+
+ipv6_stack_available() {
+    ipv6_socket_available || return 1
+    if command_exists ip; then
+        {
+            ip -6 route show default 2>/dev/null || true
+            ip -6 addr show scope global 2>/dev/null || true
+        } | grep -q .
+        return $?
+    fi
+    [ -s /proc/net/if_inet6 ]
+}
+
+get_bindv6only() {
+    local value=0
+
+    if [ -r /proc/sys/net/ipv6/bindv6only ]; then
+        value=$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || printf '0')
+    fi
+    [ "$value" = 1 ] && printf '1\n' || printf '0\n'
+}
+
 atomic_write_file() {
     local target_file="$1"
     local mode="${2:-644}"
@@ -72,6 +233,21 @@ atomic_write_file() {
     fi
     chmod "$mode" "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$target_file"
+}
+
+persist_install_settings() {
+    local settings_file="${1:-${install_env_file:-/etc/sing-box/install.env}}"
+
+    resolve_service_ports || return 1
+    {
+        printf 'PORT=%s\n' "$PORT"
+        printf 'REALITY_PORT=%s\n' "$vless_port"
+        printf 'NGINX_PORT=%s\n' "$nginx_port"
+        printf 'TUIC_PORT=%s\n' "$tuic_port"
+        printf 'HY2_PORT=%s\n' "$hy2_port"
+        printf 'ARGO_PORT=%s\n' "$argo_port"
+    } | atomic_write_file "$settings_file" 600 || return 1
+    chmod 600 "$settings_file"
 }
 
 is_valid_subscription_token() {
@@ -266,6 +442,8 @@ check_nginx() {
 
 # 根据系统类型安装、卸载依赖
 manage_packages() {
+    local action package
+
     if [ $# -lt 2 ]; then
         red "Unspecified package name or action"
         return 1
@@ -274,21 +452,22 @@ manage_packages() {
     action=$1
     shift
 
-    # 首次安装更新系统
+    # 首次安装只刷新软件包元数据，不执行全系统升级。
     if [ "$action" == "install" ] && [ ! -d "$work_dir" ]; then
-        yellow "正在更新系统软件包...\n"
+        yellow "正在刷新软件包元数据...\n"
         if command_exists apt; then
-            DEBIAN_FRONTEND=noninteractive apt update -y && DEBIAN_FRONTEND=noninteractive apt upgrade -y
+            DEBIAN_FRONTEND=noninteractive apt update -y || return 1
         elif command_exists dnf; then
-            dnf update -y
+            dnf makecache || return 1
         elif command_exists yum; then
-            yum update -y
+            yum makecache || return 1
         elif command_exists apk; then
-            apk update && apk upgrade
+            apk update || return 1
         else
-            yellow "Unknown system!\n"
+            red "Unknown system!\n"
+            return 1
         fi
-        green "finished updated system\n"
+        green "finished refreshing package metadata\n"
     fi
 
     for package in "$@"; do
@@ -299,13 +478,13 @@ manage_packages() {
             fi
             yellow "正在安装 ${package}..."
             if command_exists apt; then
-                DEBIAN_FRONTEND=noninteractive apt install -y "$package"
+                DEBIAN_FRONTEND=noninteractive apt install -y "$package" || return 1
             elif command_exists dnf; then
-                dnf install -y "$package"
+                dnf install -y "$package" || return 1
             elif command_exists yum; then
-                yum install -y "$package"
+                yum install -y "$package" || return 1
             elif command_exists apk; then
-                apk add "$package"
+                apk add "$package" || return 1
             else
                 red "Unknown system!"
                 return 1
@@ -1249,60 +1428,102 @@ remove_remote_tunnel_subscription_via_api() {
 
 # 处理防火墙
 allow_port() {
-    has_ufw=0
-    has_firewalld=0
-    has_iptables=0
-    has_ip6tables=0
+    local has_ufw=0
+    local has_firewalld=0
+    local has_iptables=0
+    local has_ip6tables=0
+    local port proto rule
+    local status=0
 
     command_exists ufw && has_ufw=1
     command_exists firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1 && has_firewalld=1
     command_exists iptables && has_iptables=1
     command_exists ip6tables && has_ip6tables=1
 
-    [ "$has_ufw" -eq 1 ] && ufw --force default allow outgoing >/dev/null 2>&1
-    [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --zone=public --set-target=ACCEPT >/dev/null 2>&1
-    [ "$has_iptables" -eq 1 ] && {
-        iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -i lo -j ACCEPT
-        iptables -C INPUT -p icmp -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p icmp -j ACCEPT
-        iptables -P FORWARD DROP 2>/dev/null || true
-        iptables -P OUTPUT ACCEPT 2>/dev/null || true
-    }
-    [ "$has_ip6tables" -eq 1 ] && {
-        ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || ip6tables -I INPUT 3 -i lo -j ACCEPT
-        ip6tables -C INPUT -p icmp -j ACCEPT 2>/dev/null || ip6tables -I INPUT 4 -p icmp -j ACCEPT
-        ip6tables -P FORWARD DROP 2>/dev/null || true
-        ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
-    }
+    while [ "$#" -gt 0 ]; do
+        rule="$1"
+        if [[ "$rule" == */* ]]; then
+            port="${rule%/*}"
+            proto="${rule#*/}"
+            shift
+        else
+            [ "$#" -ge 2 ] || { red "防火墙规则缺少协议: $rule"; return 1; }
+            port="$1"
+            proto="$2"
+            shift 2
+        fi
+        validate_port_value "$port" firewall_port || return 1
+        case "$proto" in
+            tcp|udp) ;;
+            *) red "不支持的防火墙协议: $proto"; return 1 ;;
+        esac
 
-    for rule in "$@"; do
-        port=${rule%/*}
-        proto=${rule#*/}
-        [ "$has_ufw" -eq 1 ] && ufw allow in ${port}/${proto} >/dev/null 2>&1
-        [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --add-port=${port}/${proto} >/dev/null 2>&1
-        [ "$has_iptables" -eq 1 ] && (iptables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p ${proto} --dport ${port} -j ACCEPT)
-        [ "$has_ip6tables" -eq 1 ] && (ip6tables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || ip6tables -I INPUT 4 -p ${proto} --dport ${port} -j ACCEPT)
+        if [ "$has_ufw" -eq 1 ]; then
+            ufw allow in "${port}/${proto}" >/dev/null 2>&1 || status=1
+        fi
+        if [ "$has_firewalld" -eq 1 ]; then
+            firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || status=1
+        fi
+        if [ "$has_iptables" -eq 1 ]; then
+            iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
+                iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT || status=1
+        fi
+        if [ "$has_ip6tables" -eq 1 ]; then
+            ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
+                ip6tables -I INPUT -p "$proto" --dport "$port" -j ACCEPT || status=1
+        fi
     done
 
-    [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1
+    if [ "$has_firewalld" -eq 1 ]; then
+        firewall-cmd --reload >/dev/null 2>&1 || status=1
+    fi
 
     if command_exists rc-service 2>/dev/null; then
-        [ "$has_iptables" -eq 1 ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        [ "$has_ip6tables" -eq 1 ] && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+        [ "$has_iptables" -eq 0 ] || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        [ "$has_ip6tables" -eq 0 ] || ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
     else
-        if ! command_exists netfilter-persistent; then
-            manage_packages install iptables-persistent || yellow "请手动安装netfilter-persistent或保存iptables规则"
+        if { [ "$has_iptables" -eq 1 ] || [ "$has_ip6tables" -eq 1 ]; } && command_exists netfilter-persistent; then
             netfilter-persistent save >/dev/null 2>&1
-        elif command_exists service; then
+        elif { [ "$has_iptables" -eq 1 ] || [ "$has_ip6tables" -eq 1 ]; } && command_exists service; then
             service iptables save 2>/dev/null
             service ip6tables save 2>/dev/null
         fi
     fi
+
+    return "$status"
 }
 
 # 下载并安装 sing-box,cloudflared
 install_singbox() {
+    local has_v4=0
+    local has_v6=0
+    local bindv6only=0
+    local listener_address dns_strategy
+
     clear
     purple "正在安装sing-box中，请稍后..."
+    if ! resolve_service_ports; then
+        red "端口设置无效，安装中止。"
+        return 1
+    fi
+    if ! check_service_ports_available; then
+        red "检测到服务端口冲突，安装中止。"
+        return 1
+    fi
+    ipv4_stack_available && has_v4=1
+    ipv6_stack_available && has_v6=1
+    if [ "$has_v4" = 0 ] && [ "$has_v6" = 0 ]; then
+        red "未检测到可用的 IPv4 或 IPv6 网络栈，安装中止。"
+        return 1
+    fi
+    bindv6only=$(get_bindv6only)
+    listener_address=$(get_listener_address "$has_v4" "$has_v6" "$bindv6only") || return 1
+    if [ "$has_v4" = 1 ]; then
+        dns_strategy="prefer_ipv4"
+    else
+        dns_strategy="prefer_ipv6"
+    fi
+
     ARCH_RAW=$(uname -m)
     case "${ARCH_RAW}" in
         'x86_64' | 'amd64')  ARCH='amd64' ;;
@@ -1310,43 +1531,38 @@ install_singbox() {
         'aarch64' | 'arm64') ARCH='arm64' ;;
         'armv7l')  ARCH='armv7' ;;
         's390x')   ARCH='s390x' ;;
-        *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
+        *) red "不支持的架构: ${ARCH_RAW}"; return 1 ;;
     esac
 
-    mkdir -p "${work_dir}" "${conf_dir}"
+    mkdir -p "${work_dir}" "${conf_dir}" || return 1
     chmod 755 "${work_dir}"
     # latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
     # curl -sLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"
     # curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
-    download_binary "https://$ARCH.ssss.nyc.mn/qrencode" "${work_dir}/qrencode" || exit 1
-    download_binary "https://$ARCH.ssss.nyc.mn/sbx-1.13.13" "${work_dir}/sing-box" || exit 1
-    download_binary "https://$ARCH.ssss.nyc.mn/bot" "${work_dir}/argo" || exit 1
+    download_binary "https://$ARCH.ssss.nyc.mn/qrencode" "${work_dir}/qrencode" || return 1
+    download_binary "https://$ARCH.ssss.nyc.mn/sbx-1.13.13" "${work_dir}/sing-box" || return 1
+    download_binary "https://$ARCH.ssss.nyc.mn/bot" "${work_dir}/argo" || return 1
     # tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
     # mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/" && \
     # rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
-    chown root:root "${work_dir}"
+    chown root:root "${work_dir}" || return 1
 
-    nginx_port=$(($vless_port + 1))
-    tuic_port=$(($vless_port + 2))
-    hy2_port=$(($vless_port + 3))
-    uuid=$(cat /proc/sys/kernel/random/uuid)
-    password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
-    output=$(/etc/sing-box/sing-box generate reality-keypair)
+    uuid=$(cat /proc/sys/kernel/random/uuid) || return 1
+    password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24) || return 1
+    output=$(/etc/sing-box/sing-box generate reality-keypair) || return 1
     private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
     public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
+    [ -n "$uuid" ] && [ -n "$password" ] && [ -n "$private_key" ] && [ -n "$public_key" ] || return 1
 
-    allow_port $vless_port/tcp $nginx_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1
+    allow_port "$vless_port/tcp" "$nginx_port/tcp" "$tuic_port/udp" "$hy2_port/udp" > /dev/null 2>&1 || return 1
 
-    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
-    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || return 1
+    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com" || return 1
     chmod 600 "${work_dir}/private.key" 2>/dev/null || true
 
-    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g') || return 1
 
-    dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
-        (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
-
-    cat > "${conf_dir}/log.json" << EOF
+    cat > "${conf_dir}/log.json" << EOF || return 1
 {
   "log": {
     "disabled": false,
@@ -1357,7 +1573,7 @@ install_singbox() {
 }
 EOF
 
-    cat > ${conf_dir}/ntp.json << EOF
+    cat > ${conf_dir}/ntp.json << EOF || return 1
 {
     "ntp": {
         "enabled": true,
@@ -1368,7 +1584,7 @@ EOF
 }
 EOF
 
-    cat > "${conf_dir}/dns.json" << EOF
+    cat > "${conf_dir}/dns.json" << EOF || return 1
 {
   "dns": {
     "servers": [
@@ -1382,13 +1598,13 @@ EOF
 }
 EOF
 
-    cat > "${conf_dir}/inbounds.json" << EOF
+    cat > "${conf_dir}/inbounds.json" << EOF || return 1
 {
   "inbounds": [
     {
       "type": "vless",
       "tag": "vless-reality",
-      "listen": "::",
+      "listen": "$listener_address",
       "listen_port": $vless_port,
       "users": [
         {
@@ -1414,7 +1630,7 @@ EOF
       "type": "vless",
       "tag": "vless-ws-argo",
       "listen": "127.0.0.1",
-      "listen_port": ${ARGO_PORT},
+      "listen_port": $argo_port,
       "users": [
         {
           "uuid": "$uuid"
@@ -1428,7 +1644,7 @@ EOF
     {
       "type": "hysteria2",
       "tag": "hysteria2",
-      "listen": "::",
+      "listen": "$listener_address",
       "listen_port": $hy2_port,
       "users": [
         {
@@ -1449,7 +1665,7 @@ EOF
     {
       "type": "tuic",
       "tag": "tuic",
-      "listen": "::",
+      "listen": "$listener_address",
       "listen_port": $tuic_port,
       "users": [
         {
@@ -1469,7 +1685,7 @@ EOF
 }
 EOF
 
-    cat > "${conf_dir}/outbounds.json" << EOF
+    cat > "${conf_dir}/outbounds.json" << EOF || return 1
 {
   "outbounds": [
     {
@@ -1480,13 +1696,13 @@ EOF
 }
 EOF
 
-    cat > "${conf_dir}/endpoints.json" << EOF
+    cat > "${conf_dir}/endpoints.json" << EOF || return 1
 {
   "endpoints": []
 }
 EOF
 
-    cat > "${conf_dir}/route.json" << EOF
+    cat > "${conf_dir}/route.json" << EOF || return 1
 {
   "route": {
     "rule_set": [
@@ -1506,11 +1722,12 @@ EOF
   }
 }
 EOF
+    persist_install_settings "$install_env_file" || return 1
 }
 
 # debian/ubuntu/centos 守护进程
 main_systemd_services() {
-    cat > /etc/systemd/system/sing-box.service << EOF
+    cat > /etc/systemd/system/sing-box.service << EOF || return 1
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
@@ -1542,8 +1759,8 @@ EOF
         elif [[ "$ARGO_AUTH" =~ TunnelSecret ]]; then
             tunnel_id=$(extract_argo_tunnel_id "$ARGO_AUTH")
             if [ -n "$tunnel_id" ]; then
-                echo "$ARGO_AUTH" > "${work_dir}/tunnel.json"
-                cat > "${work_dir}/tunnel.yml" << EOF
+                echo "$ARGO_AUTH" > "${work_dir}/tunnel.json" || return 1
+                cat > "${work_dir}/tunnel.yml" << EOF || return 1
 tunnel: ${tunnel_id}
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
@@ -1573,7 +1790,7 @@ EOF
         argo_exec="ExecStart=/bin/sh -c \"/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1\""
     fi
 
-    cat > /etc/systemd/system/argo.service << EOF
+    cat > /etc/systemd/system/argo.service << EOF || return 1
 [Unit]
 Description=Cloudflare Tunnel
 After=network.target
@@ -1590,23 +1807,23 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
     if [ -f /etc/centos-release ]; then
-        yum install -y chrony
-        systemctl start chronyd
-        systemctl enable chronyd
-        chronyc -a makestep
-        yum update -y ca-certificates
-        bash -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
+        yum install -y chrony || return 1
+        systemctl start chronyd || return 1
+        systemctl enable chronyd || return 1
+        chronyc -a makestep || return 1
+        yum update -y ca-certificates || return 1
+        bash -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range' || return 1
     fi
-    systemctl daemon-reload
-    systemctl enable sing-box
-    systemctl start sing-box
-    systemctl enable argo
-    systemctl start argo
+    systemctl daemon-reload || return 1
+    systemctl enable sing-box || return 1
+    systemctl start sing-box || return 1
+    systemctl enable argo || return 1
+    systemctl start argo || return 1
 }
 
 # 适配alpine 守护进程
 alpine_openrc_services() {
-    cat > /etc/init.d/sing-box << 'EOF'
+    cat > /etc/init.d/sing-box << 'EOF' || return 1
 #!/sbin/openrc-run
 description="sing-box service"
 command="/etc/sing-box/sing-box"
@@ -1626,8 +1843,8 @@ EOF
         elif [[ "$ARGO_AUTH" =~ TunnelSecret ]]; then
             tunnel_id=$(extract_argo_tunnel_id "$ARGO_AUTH")
             if [ -n "$tunnel_id" ]; then
-                echo "$ARGO_AUTH" > "${work_dir}/tunnel.json"
-                cat > "${work_dir}/tunnel.yml" << EOF
+                echo "$ARGO_AUTH" > "${work_dir}/tunnel.json" || return 1
+                cat > "${work_dir}/tunnel.yml" << EOF || return 1
 tunnel: ${tunnel_id}
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
@@ -1657,7 +1874,7 @@ EOF
         argo_command_args="-c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
     fi
 
-    cat > /etc/init.d/argo << EOF
+    cat > /etc/init.d/argo << EOF || return 1
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
 command="/bin/sh"
@@ -1665,10 +1882,10 @@ command_args="${argo_command_args}"
 command_background=true
 pidfile="/var/run/argo.pid"
 EOF
-    chmod +x /etc/init.d/sing-box
-    chmod +x /etc/init.d/argo
-    rc-update add sing-box default > /dev/null 2>&1
-    rc-update add argo default     > /dev/null 2>&1
+    chmod +x /etc/init.d/sing-box || return 1
+    chmod +x /etc/init.d/argo || return 1
+    rc-update add sing-box default > /dev/null 2>&1 || return 1
+    rc-update add argo default     > /dev/null 2>&1 || return 1
 }
 
 # 生成节点和订阅链接
@@ -1808,6 +2025,7 @@ render_nginx_subscription_server() {
     local port="${1:-}"
     local http_path="${2:-}"
     local https_path="${3:-}"
+    local has_ipv6="${4:-1}"
 
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
     [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
@@ -1815,11 +2033,16 @@ render_nginx_subscription_server() {
     if [ -n "$https_path" ]; then
         is_valid_subscription_path "$https_path" || return 1
     fi
+    [[ "$has_ipv6" =~ ^[01]$ ]] || return 1
 
     cat << EOF
 server {
     listen ${port};
-    listen [::]:${port};
+EOF
+    if [ "$has_ipv6" = 1 ]; then
+        printf '    listen [::]:%s;\n' "$port"
+    fi
+    cat << EOF
     server_name _;
 
     add_header X-Frame-Options DENY;
@@ -1896,6 +2119,7 @@ apply_nginx_subscription_config() {
     local https_path="${3:-}"
     local config_file="${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"
     local config_dir tmp_file backup_file had_config=0
+    local has_ipv6=0
 
     command_exists nginx || { red "nginx未安装，无法配置订阅服务"; return 1; }
     config_dir=$(dirname "$config_file")
@@ -1903,7 +2127,10 @@ apply_nginx_subscription_config() {
     tmp_file=$(mktemp "${config_dir}/.sing-box.conf.XXXXXX") || return 1
     backup_file="${config_file}.bak.sb"
 
-    if ! render_nginx_subscription_server "$port" "$http_path" "$https_path" > "$tmp_file"; then
+    if declare -F ipv6_socket_available >/dev/null && ipv6_socket_available; then
+        has_ipv6=1
+    fi
+    if ! render_nginx_subscription_server "$port" "$http_path" "$https_path" "$has_ipv6" > "$tmp_file"; then
         rm -f "$tmp_file"
         return 1
     fi
@@ -2140,8 +2367,10 @@ EOF
     [ ! -e /usr/local/bin/sing-box ] && ln -sf "$work_dir/sb.sh" /usr/local/bin/sing-box
     if [ -s /usr/local/bin/sb ] || [ -s /usr/bin/sb ]; then
         green "\n快捷指令 sb 创建成功\n"
+        return 0
     else
         red "\n快捷指令创建失败\n"
+        return 1
     fi
 }
 
@@ -2162,29 +2391,53 @@ auto_install() {
     check_singbox &>/dev/null
     if [ $? -eq 0 ]; then
         yellow "sing-box 已经安装，跳过安装流程。"
-        exit 0
+        return 0
     fi
 
     green "Starting non-interactive sing-box install..."
-    manage_packages install nginx jq tar openssl lsof coreutils
-    install_singbox
+    manage_packages install nginx jq tar openssl lsof coreutils || {
+        red "依赖安装失败，安装中止。"
+        return 1
+    }
+    install_singbox || {
+        red "sing-box 配置安装失败，安装中止。"
+        return 1
+    }
+    validate_singbox_config || {
+        red "sing-box 配置检查失败，安装中止。"
+        return 1
+    }
 
     if command_exists systemctl; then
-        main_systemd_services
+        main_systemd_services || {
+            red "systemd 服务安装或启动失败，安装中止。"
+            return 1
+        }
+        systemctl is-active --quiet sing-box && systemctl is-active --quiet argo || {
+            red "sing-box 或 Argo 服务未处于 active 状态，安装中止。"
+            return 1
+        }
     elif command_exists rc-update; then
-        alpine_openrc_services
-        change_hosts
-        rc-service sing-box restart
-        rc-service argo restart
+        alpine_openrc_services || {
+            red "OpenRC 服务安装失败，安装中止。"
+            return 1
+        }
+        change_hosts || return 1
+        rc-service sing-box restart || return 1
+        rc-service argo restart || return 1
+        rc-service sing-box status >/dev/null 2>&1 && rc-service argo status >/dev/null 2>&1 || {
+            red "sing-box 或 Argo 服务未启动，安装中止。"
+            return 1
+        }
     else
         red "不支持的 init 系统，安装中止。"
-        exit 1
+        return 1
     fi
 
     sleep 5
-    add_nginx_conf
-    get_info
-    create_shortcut
+    add_nginx_conf || { red "Nginx 订阅配置失败，安装中止。"; return 1; }
+    get_info || { red "节点信息生成失败，安装中止。"; return 1; }
+    create_shortcut || { red "快捷指令创建失败，安装中止。"; return 1; }
     green "\nsing-box 安装完成\n"
 }
 
@@ -5045,7 +5298,7 @@ trap 'stop_warp_candidate_proxy 2>/dev/null || true; red "\n强制退出"; exit'
 case "$1" in
     -i | --install)
         auto_install
-        exit 0
+        exit $?
         ;;
     --update | --upgrade)
         update_shortcut
