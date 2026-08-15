@@ -614,6 +614,174 @@ use_quick_argo_fallback() {
     ARGO_AUTH=""
 }
 
+is_valid_tunnel_subscription_regex() {
+    local expression="${1:-}"
+    local path
+
+    [ "${expression:0:1}" = '^' ] && [ "${expression: -1}" = '$' ] || return 1
+    path="${expression:1:${#expression}-2}"
+    is_valid_subscription_path "$path"
+}
+
+detect_argo_tunnel_mode() {
+    local service_file="${1:-}"
+
+    if [ -z "$service_file" ]; then
+        if command_exists rc-service && [ -r /etc/init.d/argo ]; then
+            service_file=/etc/init.d/argo
+        elif [ -r /etc/systemd/system/argo.service ]; then
+            service_file=/etc/systemd/system/argo.service
+        else
+            return 1
+        fi
+    fi
+    [ -r "$service_file" ] || return 1
+
+    if grep -Eq -- 'tunnel[^[:cntrl:]]*--url[[:space:]]+http://(127\.0\.0\.1|localhost)' "$service_file"; then
+        printf 'quick\n'
+    elif grep -Eq -- 'tunnel[^[:cntrl:]]*--config[[:space:]]+[^[:space:]]+' "$service_file"; then
+        printf 'local\n'
+    elif grep -Eq -- 'tunnel[^[:cntrl:]]*(run[[:space:]]+)?--token[[:space:]]+[^[:space:]]+' "$service_file"; then
+        printf 'remote\n'
+    else
+        return 1
+    fi
+}
+
+strip_local_tunnel_subscription_rule() {
+    local input_file="${1:-}"
+    local output_file="${2:-}"
+    local output_dir tmp_file last_rule
+
+    [ -r "$input_file" ] && [ -n "$output_file" ] || return 1
+    output_dir=$(dirname "$output_file")
+    mkdir -p "$output_dir" || return 1
+    tmp_file=$(mktemp "${output_dir}/.tunnel-strip.XXXXXX") || return 1
+
+    if ! awk '
+        BEGIN { inside = 0; starts = 0; ends = 0; error = 0 }
+        index($0, "# sing-box-subscription:start") {
+            if (inside) error = 1
+            inside = 1
+            starts++
+            next
+        }
+        index($0, "# sing-box-subscription:end") {
+            if (!inside) error = 1
+            inside = 0
+            ends++
+            next
+        }
+        !inside { print }
+        END {
+            if (inside || starts != ends || error) exit 42
+        }
+    ' "$input_file" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    last_rule=$(awk 'NF { line=$0 } END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", line); print line }' "$tmp_file")
+    if [ "$last_rule" != '- service: http_status:404' ]; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    mv -f "$tmp_file" "$output_file"
+}
+
+render_local_tunnel_with_subscription() {
+    local input_file="${1:-}"
+    local output_file="${2:-}"
+    local domain="${3:-}"
+    local path_regex="${4:-}"
+    local port="${5:-}"
+    local mode="${6:-}"
+    local output_dir clean_file tmp_file
+
+    is_valid_subscription_domain "$domain" || return 1
+    is_valid_tunnel_subscription_regex "$path_regex" || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+    [[ "$mode" == reuse || "$mode" == separate ]] || return 1
+
+    output_dir=$(dirname "$output_file")
+    mkdir -p "$output_dir" || return 1
+    clean_file=$(mktemp "${output_dir}/.tunnel-clean.XXXXXX") || return 1
+    tmp_file=$(mktemp "${output_dir}/.tunnel-render.XXXXXX") || { rm -f "$clean_file"; return 1; }
+    if ! strip_local_tunnel_subscription_rule "$input_file" "$clean_file"; then
+        rm -f "$clean_file" "$tmp_file"
+        return 1
+    fi
+
+    if ! awk -v host="$domain" -v path="$path_regex" -v port="$port" -v mode="$mode" '
+        function trim(value) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            return value
+        }
+        function emit_rule() {
+            print "  # sing-box-subscription:start"
+            print "  - hostname: " host
+            print "    path: " path
+            print "    service: http://127.0.0.1:" port
+            print "  # sing-box-subscription:end"
+        }
+        BEGIN { inserted = 0 }
+        {
+            current = trim($0)
+            if (!inserted && mode == "reuse" && current == "- hostname: " host) {
+                emit_rule()
+                inserted = 1
+            } else if (!inserted && mode == "separate" && current == "- service: http_status:404") {
+                emit_rule()
+                inserted = 1
+            }
+            print
+        }
+        END { if (!inserted) exit 43 }
+    ' "$clean_file" > "$tmp_file"; then
+        rm -f "$clean_file" "$tmp_file"
+        return 1
+    fi
+
+    rm -f "$clean_file"
+    mv -f "$tmp_file" "$output_file"
+}
+
+remove_local_tunnel_subscription_rule() {
+    strip_local_tunnel_subscription_rule "$1" "$2"
+}
+
+apply_local_tunnel_subscription_rule() {
+    local domain="${1:-}"
+    local path_regex="${2:-}"
+    local port="${3:-}"
+    local mode="${4:-}"
+    local tunnel_config="${5:-${work_dir}/tunnel.yml}"
+    local backup_file="${tunnel_config}.bak.subscription"
+    local tmp_file public_path
+
+    [ -r "$tunnel_config" ] || return 1
+    tmp_file=$(mktemp "$(dirname "$tunnel_config")/.tunnel-apply.XXXXXX") || return 1
+    render_local_tunnel_with_subscription "$tunnel_config" "$tmp_file" \
+        "$domain" "$path_regex" "$port" "$mode" || { rm -f "$tmp_file"; return 1; }
+
+    cp -p "$tunnel_config" "$backup_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$backup_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$tunnel_config" || return 1
+
+    public_path="${path_regex#^}"
+    public_path="${public_path%$}"
+    if ! "${work_dir}/argo" tunnel --config "$tunnel_config" ingress validate > /dev/null 2>&1 || \
+       ! "${work_dir}/argo" tunnel --config "$tunnel_config" ingress rule \
+            "https://${domain}${public_path}" > /dev/null 2>&1 || \
+       ! restart_argo > /dev/null 2>&1; then
+        cp -p "$backup_file" "$tunnel_config"
+        restart_argo > /dev/null 2>&1 || true
+        return 1
+    fi
+}
+
 # 处理防火墙
 allow_port() {
     has_ufw=0
