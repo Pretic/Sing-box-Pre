@@ -508,15 +508,12 @@ print_manual_https_route() {
 show_subscription_status() {
     local config_file="/etc/nginx/conf.d/sing-box.conf"
     local port http_path source_url host tunnel_mode
-    local -a paths
 
     load_subscription_state
     host=$(get_subscription_host 2>/dev/null || true)
     port=$(get_nginx_subscription_port "$config_file" 2>/dev/null || true)
-    mapfile -t paths < <(get_nginx_subscription_paths "$config_file" 2>/dev/null)
-    http_path="${SUB_HTTP_PATH:-${paths[0]:-}}"
-    is_valid_http_subscription_path "$http_path" || http_path="${paths[0]:-}"
-    source_url=$(resolve_subscription_source_url "$host" "$port" "$http_path" 2>/dev/null || true)
+    http_path=$(select_nginx_http_subscription_path "$config_file" 2>/dev/null || true)
+    source_url=$(resolve_installed_subscription_source_url "$host" "$config_file" 2>/dev/null || true)
     tunnel_mode=$(detect_argo_tunnel_mode 2>/dev/null || printf 'unknown')
 
     clear; echo ""
@@ -1801,7 +1798,10 @@ EOF
     yellow "\n温馨提醒:"
     yellow "如果节点里的ip是ipv6的，可在 修改节点配置 菜单切换ipv4后重新订阅节点\n"
     red "如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
-    show_subscription_links "$(build_http_subscription_url "$sub_host" "$nginx_port" "/$password" 2>/dev/null || true)"
+    local source_url
+    source_url=$(resolve_installed_subscription_source_url "$sub_host" 2>/dev/null || true)
+    [ -n "$source_url" ] || source_url=$(build_http_subscription_url "$sub_host" "$nginx_port" "/$password" 2>/dev/null || true)
+    show_subscription_links "$source_url"
 }
 
 # nginx订阅配置
@@ -1878,6 +1878,33 @@ get_nginx_subscription_paths() {
     while IFS= read -r path; do
         is_valid_http_subscription_path "$path" && printf '%s\n' "$path"
     done < <(sed -n 's/^[[:space:]]*location = \(\/[^[:space:]]*\)[[:space:]]*{.*/\1/p' "$config_file")
+}
+
+select_nginx_http_subscription_path() {
+    local config_file="${1:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
+    local path
+    local -a paths
+
+    mapfile -t paths < <(get_nginx_subscription_paths "$config_file")
+    [ "${#paths[@]}" -gt 0 ] || return 1
+    load_subscription_state
+    if is_valid_http_subscription_path "${SUB_HTTP_PATH:-}"; then
+        for path in "${paths[@]}"; do
+            [ "$path" = "$SUB_HTTP_PATH" ] && { printf '%s\n' "$path"; return 0; }
+        done
+    fi
+    printf '%s\n' "${paths[0]}"
+}
+
+resolve_installed_subscription_source_url() {
+    local host="${1:-}"
+    local config_file="${2:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
+    local port path
+
+    port=$(get_nginx_subscription_port "$config_file") || return 1
+    path=$(select_nginx_http_subscription_path "$config_file") || return 1
+    load_subscription_state
+    resolve_subscription_source_url "$host" "$port" "$path"
 }
 
 apply_nginx_subscription_config() {
@@ -2164,8 +2191,8 @@ auto_install() {
     fi
 
     sleep 5
-    get_info
     add_nginx_conf
+    get_info
     create_shortcut
     green "\nsing-box 安装完成\n"
 }
@@ -3134,14 +3161,9 @@ check_nodes() {
     fi
 
     server_ip=$(get_subscription_host)
-    local lujing sub_port base64_url cfy_result_file
+    local base64_url cfy_result_file
     cfy_result_file="${work_dir}/cfy-url.txt"
-
-    if [ -f "/etc/nginx/conf.d/sing-box.conf" ]; then
-        lujing=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
-        sub_port=$(sed -n 's/^\s*listen \([0-9]\+\);/\1/p' "/etc/nginx/conf.d/sing-box.conf" | head -1)
-    fi
-    base64_url="http://${server_ip}:${sub_port}/${lujing}"
+    base64_url=$(resolve_installed_subscription_source_url "$server_ip" 2>/dev/null || true)
 
     clear; echo ""
     green "=== 当前节点信息 ===\n"
@@ -4156,8 +4178,8 @@ case "$1" in
                             echo "Unsupported init system"; exit 1
                         fi
                         sleep 5
-                        get_info
                         add_nginx_conf
+                        get_info
                         create_shortcut
                     fi
                     ;;

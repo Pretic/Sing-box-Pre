@@ -4,6 +4,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+work_dir="$tmp_dir"
+subscription_state_file="${work_dir}/subscription.conf"
 
 extract_function() {
     sed -n "/^${1}() {/,/^}/p" "$script"
@@ -20,12 +24,20 @@ assert_rejected() {
 
 for function_name in \
     format_url_host \
+    is_valid_subscription_token \
     is_valid_subscription_domain \
     is_valid_subscription_path \
     is_valid_http_subscription_path \
+    atomic_write_file \
+    reset_subscription_state \
+    load_subscription_state \
+    get_nginx_subscription_port \
+    get_nginx_subscription_paths \
+    select_nginx_http_subscription_path \
     build_http_subscription_url \
     build_https_subscription_url \
     resolve_subscription_source_url \
+    resolve_installed_subscription_source_url \
     render_terminal_qr \
     show_subscription_links; do
     function_source="$(extract_function "$function_name")"
@@ -70,6 +82,76 @@ SUB_HTTPS_VERIFIED_AT='2026-08-15T00:00:00Z'
 
 assert_rejected 'subscription source without valid HTTPS or HTTP data' \
     resolve_subscription_source_url '203.0.113.10' '' ''
+
+nginx_fixture="${tmp_dir}/sing-box.conf"
+cat > "$nginx_fixture" <<'NGINX'
+server {
+    listen 8080;
+    listen [::]:8080;
+    location = /LegacySubscriptionPath123 {
+        alias /etc/sing-box/sub.txt;
+    }
+}
+NGINX
+rm -f "$subscription_state_file"
+[[ "$(resolve_installed_subscription_source_url '203.0.113.10' "$nginx_fixture")" == \
+   'http://203.0.113.10:8080/LegacySubscriptionPath123' ]]
+
+token='0123456789abcdefghjkmnpqrstvwxyz'
+cat > "$nginx_fixture" <<NGINX
+server {
+    listen 8080;
+    listen [::]:8080;
+    location = /${token} { alias /etc/sing-box/sub.txt; }
+    location = /sub/${token} { alias /etc/sing-box/sub.txt; }
+}
+NGINX
+cat > "$subscription_state_file" <<STATE
+SUB_TOKEN=${token}
+SUB_HTTP_PATH=/${token}
+SUB_HTTPS_ENABLED=1
+SUB_HTTPS_DOMAIN=sub.example.com
+SUB_HTTPS_DOMAIN_MODE=separate
+SUB_HTTPS_PATH=/${token}
+SUB_TUNNEL_MODE=remote
+SUB_HTTPS_VERIFIED_AT=2026-08-15T00:00:00Z
+STATE
+[[ "$(select_nginx_http_subscription_path "$nginx_fixture")" == "/${token}" ]]
+[[ "$(resolve_installed_subscription_source_url '203.0.113.10' "$nginx_fixture")" == \
+   "https://sub.example.com/${token}" ]]
+
+sed -i 's/SUB_HTTPS_VERIFIED_AT=.*/SUB_HTTPS_VERIFIED_AT=invalid/' "$subscription_state_file"
+[[ "$(resolve_installed_subscription_source_url '203.0.113.10' "$nginx_fixture")" == \
+   "http://203.0.113.10:8080/${token}" ]]
+assert_rejected 'installed subscription without nginx config' \
+    resolve_installed_subscription_source_url '203.0.113.10' "${tmp_dir}/missing.conf"
+
+installed_source="$(extract_function resolve_installed_subscription_source_url)"
+if grep -Fq 'curl ' <<< "$installed_source"; then
+    echo 'FAIL: installed subscription resolver probes public HTTP reachability (breaks NAT semantics)' >&2
+    exit 1
+fi
+
+check_source="$(extract_function check_nodes)"
+grep -Fq 'resolve_installed_subscription_source_url' <<< "$check_source"
+if grep -Fq 'base64_url="http://${server_ip}:${sub_port}/${lujing}"' <<< "$check_source"; then
+    echo 'FAIL: check_nodes still constructs malformed subscription URLs directly' >&2
+    exit 1
+fi
+
+status_source="$(extract_function show_subscription_status)"
+grep -Fq 'resolve_installed_subscription_source_url' <<< "$status_source" || {
+    echo 'FAIL: subscription status bypasses the installed subscription resolver' >&2
+    exit 1
+}
+
+auto_source="$(extract_function auto_install)"
+add_line="$(grep -n 'add_nginx_conf' <<< "$auto_source" | head -1 | cut -d: -f1)"
+info_line="$(grep -n 'get_info' <<< "$auto_source" | head -1 | cut -d: -f1)"
+[[ -n "$add_line" && -n "$info_line" && "$add_line" -lt "$info_line" ]] || {
+    echo 'FAIL: auto install prints subscription links before nginx configuration exists' >&2
+    exit 1
+}
 
 qr_source="$(extract_function render_terminal_qr)"
 grep -Fq '"$encoder" -t ANSIUTF8 -m 1 -- "$url"' <<< "$qr_source"
