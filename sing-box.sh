@@ -3260,7 +3260,7 @@ warp_endpoint_is_valid() {
 # 为当前 VPS 生成独立密钥并直接向 Cloudflare WARP API 注册。
 # 私钥始终在本机生成；账户令牌和 endpoint 仅以 600 权限保存在本机。
 generate_unique_warp_identity() {
-    local state_dir="${conf_dir}/warp"
+    local state_dir="${1:-${conf_dir}/warp}"
     local register_dir response_file request_file endpoint_file account_file
     local singbox_bin keypair private_key public_key random_hex install_id fcm_token tos
     local http_code registered client_id reserved_bytes r1 r2 r3 extra
@@ -3349,6 +3349,7 @@ generate_unique_warp_identity() {
     client_id=$(jq -r '.config.client_id' "$response_file")
     read -r r1 r2 r3 extra < <(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1)
     if [ -z "${r1:-}" ] || [ -z "${r2:-}" ] || [ -z "${r3:-}" ] || [ -n "${extra:-}" ]; then
+        delete_warp_registration "$response_file" || true
         rm -rf -- "$register_dir"
         red "Cloudflare WARP client_id 无效，现有配置未修改。"
         return 1
@@ -3378,11 +3379,13 @@ generate_unique_warp_identity() {
         }]
       }
       ' > "$endpoint_file" || {
+        delete_warp_registration "$response_file" || true
         rm -rf -- "$register_dir"
         return 1
       }
     jq --arg private "$private_key" --argjson reserved "$reserved_bytes" \
       '. + {private_key:$private,reserved:$reserved}' "$response_file" > "$account_file" || {
+        delete_warp_registration "$response_file" || true
         rm -rf -- "$register_dir"
         return 1
       }
@@ -3391,6 +3394,7 @@ generate_unique_warp_identity() {
     local generated_endpoint
     generated_endpoint=$(extract_warp_endpoint "$endpoint_file")
     if ! warp_endpoint_is_valid "$generated_endpoint" || warp_endpoint_is_legacy "$generated_endpoint"; then
+        delete_warp_registration "$response_file" || true
         rm -rf -- "$register_dir"
         red "生成的 WARP endpoint 校验失败，现有配置未修改。"
         return 1
@@ -3405,9 +3409,460 @@ generate_unique_warp_identity() {
         chmod 600 "${state_dir}/endpoint.json" "${state_dir}/account.json"
     fi
     local install_status=$?
+    [ "$install_status" -eq 0 ] || delete_warp_registration "$response_file" || true
     rm -rf -- "$register_dir"
     [ "$install_status" -eq 0 ] || return "$install_status"
     green "已为本机生成独立 WARP 身份。"
+}
+
+delete_warp_registration() {
+    local account_file="$1" device_id device_token
+    [ -s "$account_file" ] || return 0
+    device_id=$(jq -r '.id // empty' "$account_file" 2>/dev/null)
+    device_token=$(jq -r '.token // empty' "$account_file" 2>/dev/null)
+    [ -n "$device_id" ] && [ -n "$device_token" ] || return 0
+    curl -fsS --connect-timeout 5 --max-time 15 -X DELETE \
+      "https://api.cloudflareclient.com/v0a2158/reg/${device_id}" \
+      -H "Authorization: Bearer ${device_token}" \
+      -H 'User-Agent: okhttp/3.12.1' >/dev/null 2>&1 || return 1
+}
+
+WARP_PROBE_PID=''
+WARP_PROBE_DIR=''
+WARP_PROBE_PROXY=''
+WARP_PROBE_PORT=''
+
+stop_warp_candidate_proxy() {
+    local safe_dir=false attempt
+    case "${WARP_PROBE_DIR:-}" in
+      "${conf_dir}/warp/.probe."*) safe_dir=true ;;
+    esac
+    if [ "$safe_dir" = true ] && [ -n "${WARP_PROBE_PID:-}" ] && \
+       [ -r "/proc/${WARP_PROBE_PID}/cmdline" ] && \
+       tr '\0' ' ' < "/proc/${WARP_PROBE_PID}/cmdline" | grep -Fq "${WARP_PROBE_DIR}/config.json" && \
+       kill -0 "$WARP_PROBE_PID" 2>/dev/null; then
+        kill "$WARP_PROBE_PID" 2>/dev/null || true
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$WARP_PROBE_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -0 "$WARP_PROBE_PID" 2>/dev/null && kill -9 "$WARP_PROBE_PID" 2>/dev/null || true
+        wait "$WARP_PROBE_PID" 2>/dev/null || true
+    fi
+    [ "$safe_dir" = true ] && rm -rf -- "$WARP_PROBE_DIR"
+    unset WARP_PROBE_PID WARP_PROBE_DIR WARP_PROBE_PROXY WARP_PROBE_PORT
+}
+
+start_warp_candidate_proxy() {
+    local endpoint_json="$1" singbox_bin port attempt
+    warp_endpoint_is_valid "$endpoint_json" || return 1
+    stop_warp_candidate_proxy
+    mkdir -p "${conf_dir}/warp" && chmod 700 "${conf_dir}/warp"
+    WARP_PROBE_DIR=$(mktemp -d "${conf_dir}/warp/.probe.XXXXXX") || return 1
+    chmod 700 "$WARP_PROBE_DIR"
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        port=$((20000 + RANDOM % 30000))
+        if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then
+            WARP_PROBE_PORT=$port
+            break
+        fi
+    done
+    [ -n "${WARP_PROBE_PORT:-}" ] || { stop_warp_candidate_proxy; return 1; }
+    jq -n --argjson endpoint "$endpoint_json" --argjson port "$WARP_PROBE_PORT" '
+      {
+        log:{level:"error"},
+        inbounds:[{type:"mixed",tag:"warp-probe",listen:"127.0.0.1",listen_port:$port}],
+        endpoints:[$endpoint],
+        route:{final:"wireguard-out"}
+      }
+    ' > "${WARP_PROBE_DIR}/config.json" || { stop_warp_candidate_proxy; return 1; }
+    chmod 600 "${WARP_PROBE_DIR}/config.json"
+    singbox_bin="${work_dir}/${server_name}"
+    [ -x "$singbox_bin" ] || singbox_bin=$(command -v sing-box 2>/dev/null || true)
+    [ -x "$singbox_bin" ] || { stop_warp_candidate_proxy; return 1; }
+    "$singbox_bin" check -c "${WARP_PROBE_DIR}/config.json" >/dev/null 2>&1 || {
+        stop_warp_candidate_proxy; return 1
+    }
+    "$singbox_bin" run -c "${WARP_PROBE_DIR}/config.json" \
+      >"${WARP_PROBE_DIR}/sing-box.log" 2>&1 &
+    WARP_PROBE_PID=$!
+    local ready=false probe_proxy="socks5h://127.0.0.1:${WARP_PROBE_PORT}"
+    for attempt in 1 2 3 4 5; do
+        kill -0 "$WARP_PROBE_PID" 2>/dev/null || { stop_warp_candidate_proxy; return 1; }
+        if command_exists ss; then
+            ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "127\.0\.0\.1:${WARP_PROBE_PORT}$" && { ready=true; break; }
+        elif command_exists lsof; then
+            lsof -nP -a -p "$WARP_PROBE_PID" -iTCP:"$WARP_PROBE_PORT" -sTCP:LISTEN -t 2>/dev/null | \
+              grep -qx "$WARP_PROBE_PID" && { ready=true; break; }
+        else
+            curl -fsS --connect-timeout 2 --max-time 4 --proxy "$probe_proxy" \
+              https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=' && { ready=true; break; }
+        fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { stop_warp_candidate_proxy; return 1; }
+    WARP_PROBE_PROXY="$probe_proxy"
+}
+
+probe_warp_trace() {
+    local proxy="$1" trace
+    trace=$(curl -fsS --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || return 1
+    WARP_PROBE_IP=$(awk -F= '/^ip=/{print $2; exit}' <<< "$trace")
+    WARP_PROBE_LOC=$(awk -F= '/^loc=/{print $2; exit}' <<< "$trace")
+    WARP_PROBE_COLO=$(awk -F= '/^colo=/{print $2; exit}' <<< "$trace")
+    WARP_PROBE_STATE=$(awk -F= '/^warp=/{print $2; exit}' <<< "$trace")
+    [ -n "$WARP_PROBE_IP" ] && [[ "$WARP_PROBE_STATE" =~ ^(on|plus)$ ]]
+}
+
+check_unlock_netflix() {
+    local proxy="$1" title body parsed_region region='' successful=0 playable=false
+    for title in 81280792 70143836; do
+        if body=$(curl -fsSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+          -A 'Mozilla/5.0' "https://www.netflix.com/title/${title}" 2>/dev/null); then
+            successful=$((successful + 1))
+            parsed_region=$(sed -n 's/.*"requestCountry"[^}]*"id"[ ]*:[ ]*"\([A-Za-z][A-Za-z]\)".*/\1/p' \
+              <<< "$body" | head -1)
+            [ -n "$region" ] || region="$parsed_region"
+            grep -q 'og:video' <<< "$body" && playable=true
+        fi
+    done
+    if [ "$successful" -eq 0 ] || [ -z "$region" ]; then
+        WARP_UNLOCK_STATUS='检测失败'; return 2
+    fi
+    if [ "$playable" = true ]; then
+        WARP_UNLOCK_STATUS="解锁 (${region^^})"; return 0
+    fi
+    WARP_UNLOCK_STATUS="仅自制剧 (${region^^})"; return 1
+}
+
+check_unlock_disney() {
+    local proxy="$1" assertion token_content refresh_token graph_payload graph_result effective region supported
+    assertion=$(curl -fsS --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+      -A 'Mozilla/5.0' -X POST https://disney.api.edge.bamgrid.com/devices \
+      -H 'authorization: Bearer ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84' \
+      -H 'content-type: application/json; charset=UTF-8' \
+      -d '{"deviceFamily":"browser","applicationRuntime":"chrome","deviceProfile":"windows","attributes":{}}' 2>/dev/null || true)
+    assertion=$(jq -r '.assertion // empty' <<< "$assertion" 2>/dev/null)
+    [ -n "$assertion" ] || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
+    token_content=$(curl -fsS --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+      -A 'Mozilla/5.0' -X POST https://disney.api.edge.bamgrid.com/token \
+      -H 'authorization: Bearer ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84' \
+      -H 'content-type: application/x-www-form-urlencoded' \
+      --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
+      --data-urlencode 'latitude=0' --data-urlencode 'longitude=0' --data-urlencode 'platform=browser' \
+      --data-urlencode "subject_token=${assertion}" \
+      --data-urlencode 'subject_token_type=urn:bamtech:params:oauth:token-type:device' 2>/dev/null || true)
+    if grep -qiE 'forbidden-location|403 ERROR' <<< "$token_content"; then
+        WARP_UNLOCK_STATUS='受限'; return 1
+    fi
+    refresh_token=$(jq -r '.refresh_token // empty' <<< "$token_content" 2>/dev/null)
+    [ -n "$refresh_token" ] || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
+    graph_payload=$(jq -n --arg refresh "$refresh_token" \
+      '{query:"mutation refreshToken($input: RefreshTokenInput!) { refreshToken(refreshToken: $input) { activeSession { sessionId } } }",variables:{input:{refreshToken:$refresh}}}')
+    graph_result=$(curl -fsSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+      -A 'Mozilla/5.0' -X POST https://disney.api.edge.bamgrid.com/graph/v1/device/graphql \
+      -H 'authorization: ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84' \
+      -H 'content-type: application/json' -d "$graph_payload" 2>/dev/null || true)
+    region=$(sed -n 's/.*"countryCode":[ ]*"\([^"]*\)".*/\1/p' <<< "$graph_result" | head -1)
+    supported=$(sed -n 's/.*"inSupportedLocation":[ ]*\([^,}]*\).*/\1/p' <<< "$graph_result" | head -1)
+    [ -n "$region" ] || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
+    effective=$(curl -fsSL -o /dev/null -w '%{url_effective}' --connect-timeout 5 --max-time 12 \
+      --proxy "$proxy" -A 'Mozilla/5.0' https://www.disneyplus.com 2>/dev/null) || {
+        WARP_UNLOCK_STATUS='检测失败'; return 2
+    }
+    if grep -qiE 'preview.*unavailable' <<< "$effective"; then
+        WARP_UNLOCK_STATUS='受限'; return 1
+    fi
+    if [ "${region^^}" = JP ] || [ "$supported" = true ]; then
+        WARP_UNLOCK_STATUS="解锁 (${region^^})"; return 0
+    fi
+    WARP_UNLOCK_STATUS="受限 (${region^^})"; return 1
+}
+
+check_unlock_chatgpt() {
+    local proxy="$1" web_meta web_code web_url ios_file ios_meta ios_code restriction
+    web_meta=$(curl -sSIL -L --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+      -A 'Mozilla/5.0' -o /dev/null -w $'%{http_code}\t%{url_effective}' \
+      https://chatgpt.com 2>/dev/null) || {
+        WARP_UNLOCK_STATUS='检测失败'; return 2
+    }
+    IFS=$'\t' read -r web_code web_url <<< "$web_meta"
+    ios_file=$(mktemp) || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
+    if ! ios_meta=$(curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+      -A 'Mozilla/5.0' -o "$ios_file" -w '%{http_code}' \
+      https://ios.chat.openai.com 2>/dev/null); then
+        rm -f -- "$ios_file"; WARP_UNLOCK_STATUS='检测失败'; return 2
+    fi
+    ios_code="$ios_meta"
+    restriction=$(cat "$ios_file" 2>/dev/null)
+    rm -f -- "$ios_file"
+    [ -n "$restriction" ] || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
+    if grep -qiE 'unsupported_country_region_territory|unsupported_country|blocked_why_headline|blocked_why|disallowed|request is not allowed' <<< "$restriction"; then
+        WARP_UNLOCK_STATUS='受限'; return 1
+    fi
+    if grep -qE '\(1\)|\(2\)' <<< "$restriction"; then
+        WARP_UNLOCK_STATUS='仅网页可用'; return 1
+    fi
+    [[ "$web_code" =~ ^2[0-9][0-9]$ ]] && \
+      [[ "$web_url" =~ ^https://([^.]+\.)*chatgpt\.com(/|$) ]] && \
+      [[ "$ios_code" =~ ^[234][0-9][0-9]$ ]] || {
+        WARP_UNLOCK_STATUS='检测失败'; return 2
+    }
+    WARP_UNLOCK_STATUS='解锁'; return 0
+}
+
+check_unlock_gemini() {
+    local proxy="$1" result meta code effective
+    WARP_UNLOCK_STATUS='检测失败'
+    result=$(mktemp) || return 2
+    if ! meta=$(curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+      -A 'Mozilla/5.0' -H 'Accept-Language: en-US,en;q=0.9' -o "$result" \
+      -w $'%{http_code}\t%{url_effective}' https://gemini.google.com/app 2>/dev/null); then
+        rm -f -- "$result"; return 2
+    fi
+    IFS=$'\t' read -r code effective <<< "$meta"
+    if grep -qiE 'not (currently )?available in your country|unsupported country|isn.t available' "$result"; then
+        rm -f -- "$result"
+        WARP_UNLOCK_STATUS='受限'; return 1
+    fi
+    if [ "$code" = 200 ] && [[ "$effective" =~ ^https://gemini\.google\.com(/|$) ]] && \
+      grep -Fq '45631641,null,true' "$result"; then
+        rm -f -- "$result"
+        WARP_UNLOCK_STATUS='网络/地区可用'; return 0
+    fi
+    rm -f -- "$result"; return 2
+}
+
+run_selected_unlock_checks() {
+    local proxy="$1" selection="$2" digit label rc overall=0
+    WARP_UNLOCK_SUMMARY=''
+    [[ "$selection" =~ ^[1-4]+$ ]] || return 1
+    for digit in 1 2 3 4; do
+        [[ "$selection" == *"$digit"* ]] || continue
+        case "$digit" in
+          1) label='Netflix'; check_unlock_netflix "$proxy" || rc=$? ;;
+          2) label='Disney+'; check_unlock_disney "$proxy" || rc=$? ;;
+          3) label='ChatGPT'; check_unlock_chatgpt "$proxy" || rc=$? ;;
+          4) label='Gemini'; check_unlock_gemini "$proxy" || rc=$? ;;
+        esac
+        rc=${rc:-0}
+        WARP_UNLOCK_SUMMARY+="${label}: ${WARP_UNLOCK_STATUS}"$'\n'
+        [ "$rc" -eq 0 ] || overall=1
+        unset rc
+    done
+    [ "$overall" -eq 0 ]
+}
+
+write_warp_status_cache() {
+    local selection="${1:-}" summary="${2:-}" cache="${conf_dir}/warp/status.json"
+    mkdir -p "${conf_dir}/warp" && chmod 700 "${conf_dir}/warp"
+    jq -n --argjson checked "$(date +%s)" --arg ip "${WARP_PROBE_IP:-}" \
+      --arg loc "${WARP_PROBE_LOC:-}" --arg colo "${WARP_PROBE_COLO:-}" \
+      --arg warp "${WARP_PROBE_STATE:-}" --arg selection "$selection" --arg summary "$summary" \
+      '{checked_at:$checked,ip:$ip,loc:$loc,colo:$colo,warp:$warp,selection:$selection,summary:$summary}' \
+      > "${cache}.tmp" && chmod 600 "${cache}.tmp" && mv -f "${cache}.tmp" "$cache"
+}
+
+probe_active_warp() {
+    local endpoint
+    endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
+    warp_endpoint_is_valid "$endpoint" || return 1
+    start_warp_candidate_proxy "$endpoint" || return 1
+    probe_warp_trace "$WARP_PROBE_PROXY"
+    local rc=$?
+    stop_warp_candidate_proxy
+    return "$rc"
+}
+
+activate_warp_candidate() {
+    local candidate_dir="$1" state_dir="${conf_dir}/warp" endpoint_file="${conf_dir}/endpoints.json"
+    local expected_ip="${2:-}" strict_selection="${3:-}" endpoint_json backup_dir endpoint_tmp
+    endpoint_json=$(extract_warp_endpoint "${candidate_dir}/endpoint.json" 2>/dev/null || true)
+    warp_endpoint_is_valid "$endpoint_json" || return 1
+    backup_dir=$(mktemp -d "${conf_dir}/.warp-activate.XXXXXX") || return 1
+    chmod 700 "$backup_dir"
+    cp -p "$endpoint_file" "$backup_dir/endpoints.json" || { rm -rf -- "$backup_dir"; return 1; }
+    if [ -s "$state_dir/account.json" ]; then
+        cp -p "$state_dir/account.json" "$backup_dir/account.json" || { rm -rf -- "$backup_dir"; return 1; }
+        : > "$backup_dir/had-account"
+    fi
+    if [ -s "$state_dir/endpoint.json" ]; then
+        cp -p "$state_dir/endpoint.json" "$backup_dir/endpoint.json" || { rm -rf -- "$backup_dir"; return 1; }
+        : > "$backup_dir/had-endpoint"
+    fi
+    endpoint_tmp=$(mktemp "${conf_dir}/.endpoints.activate.XXXXXX") || { rm -rf -- "$backup_dir"; return 1; }
+    if ! jq --argjson endpoint "$endpoint_json" '.endpoints=([.endpoints[]?|select(.tag!="wireguard-out")]+[$endpoint])' \
+      "$endpoint_file" > "$endpoint_tmp" || ! install -m 600 "${candidate_dir}/account.json" "$state_dir/account.json" || \
+      ! install -m 600 "${candidate_dir}/endpoint.json" "$state_dir/endpoint.json" || ! chmod 600 "$endpoint_tmp" || \
+      ! mv -f "$endpoint_tmp" "$endpoint_file" || ! validate_singbox_config || ! restart_singbox_checked || \
+      ! singbox_service_is_active || \
+      ! verify_activated_warp "$expected_ip" "$strict_selection"; then
+        local rollback_ok=true
+        rm -f -- "$endpoint_tmp"
+        install -m 600 "$backup_dir/endpoints.json" "$endpoint_file" || rollback_ok=false
+        if [ -e "$backup_dir/had-account" ]; then install -m 600 "$backup_dir/account.json" "$state_dir/account.json" || rollback_ok=false; else rm -f -- "$state_dir/account.json" || rollback_ok=false; fi
+        if [ -e "$backup_dir/had-endpoint" ]; then install -m 600 "$backup_dir/endpoint.json" "$state_dir/endpoint.json" || rollback_ok=false; else rm -f -- "$state_dir/endpoint.json" || rollback_ok=false; fi
+        restart_singbox_checked >/dev/null 2>&1 || rollback_ok=false
+        singbox_service_is_active || rollback_ok=false
+        if [ "$rollback_ok" = true ]; then
+            rm -rf -- "$backup_dir"
+            return 1
+        fi
+        WARP_KEEP_FAILED_CANDIDATE=true
+        red "严重错误：旧 WARP 配置恢复不完整，已停止后续操作。"
+        red "保留恢复目录: ${backup_dir}"
+        return 2
+    fi
+    write_warp_status_cache
+    if [ -e "$backup_dir/had-account" ]; then
+        delete_warp_registration "$backup_dir/account.json" || yellow "旧 WARP 云端设备未能自动清理，可稍后重试。"
+    fi
+    rm -rf -- "$backup_dir"
+}
+
+verify_activated_warp() {
+    local expected_ip="${1:-}" selection="${2:-}" endpoint
+    probe_active_warp || return 1
+    [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ] || return 1
+    [ -z "$selection" ] && return 0
+    endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json")
+    start_warp_candidate_proxy "$endpoint" || return 1
+    local rc
+    if run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then rc=0; else rc=$?; fi
+    stop_warp_candidate_proxy
+    return "$rc"
+}
+
+singbox_service_is_active() {
+    local attempt pid_before pid_after
+    if command_exists systemctl; then
+        for attempt in 1 2 3 4; do
+            if systemctl is-active --quiet sing-box; then
+                pid_before=$(systemctl show -p MainPID --value sing-box 2>/dev/null)
+                sleep 1
+                pid_after=$(systemctl show -p MainPID --value sing-box 2>/dev/null)
+                [ -n "$pid_before" ] && [ "$pid_before" != 0 ] && [ "$pid_before" = "$pid_after" ] && \
+                  systemctl is-active --quiet sing-box && return 0
+            else
+                sleep 1
+            fi
+        done
+        return 1
+    elif command_exists rc-service; then
+        for attempt in 1 2 3 4; do
+            rc-service sing-box status >/dev/null 2>&1 && { sleep 1; rc-service sing-box status >/dev/null 2>&1 && return 0; }
+            sleep 1
+        done
+        return 1
+    else
+        return 1
+    fi
+}
+
+rotate_warp_identity_once() {
+    local old_ip candidate_dir candidate_endpoint new_ip activate_rc
+    warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
+        red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
+    }
+    probe_active_warp && old_ip="$WARP_PROBE_IP" || old_ip=''
+    candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
+    chmod 700 "$candidate_dir"
+    if ! generate_unique_warp_identity "$candidate_dir"; then rm -rf -- "$candidate_dir"; return 1; fi
+    candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
+    if ! start_warp_candidate_proxy "$candidate_endpoint" || ! probe_warp_trace "$WARP_PROBE_PROXY"; then
+        stop_warp_candidate_proxy; delete_warp_registration "$candidate_dir/account.json" || true
+        rm -rf -- "$candidate_dir"; return 1
+    fi
+    new_ip="$WARP_PROBE_IP"; stop_warp_candidate_proxy
+    WARP_KEEP_FAILED_CANDIDATE=false
+    activate_warp_candidate "$candidate_dir" "$new_ip"
+    activate_rc=$?
+    if [ "$activate_rc" -eq 0 ]; then
+        rm -rf -- "$candidate_dir"
+        green "WARP 身份已更换：${old_ip:-未知} -> ${new_ip}"
+        [ "$old_ip" = "$new_ip" ] && yellow "Cloudflare 分配的公网出口 IP 未变化。"
+        return 0
+    fi
+    if [ "$activate_rc" -eq 2 ]; then
+        red "候选凭据保留在: ${candidate_dir}"
+        return 2
+    fi
+    delete_warp_registration "$candidate_dir/account.json" || true
+    rm -rf -- "$candidate_dir"; return 1
+}
+
+auto_select_warp_candidate() {
+    local selection="${1:-1234}" active_ip candidate_dir candidate_endpoint attempt candidate_ip activate_rc
+    local WARP_MAX_CANDIDATES=5
+    warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
+        red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
+    }
+    probe_active_warp && active_ip="$WARP_PROBE_IP" || { red "无法取得当前 WARP 出口 IP，已停止优选。"; return 1; }
+    for ((attempt=1; attempt<=WARP_MAX_CANDIDATES; attempt++)); do
+        WARP_KEEP_FAILED_CANDIDATE=false
+        yellow "正在测试候选 ${attempt}/${WARP_MAX_CANDIDATES}..."
+        candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
+        chmod 700 "$candidate_dir"
+        if generate_unique_warp_identity "$candidate_dir"; then
+            candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
+            if start_warp_candidate_proxy "$candidate_endpoint" && probe_warp_trace "$WARP_PROBE_PROXY"; then
+                if [ -n "$active_ip" ] && [ "$WARP_PROBE_IP" = "$active_ip" ]; then
+                    yellow "候选出口仍为 ${WARP_PROBE_IP}，继续。"
+                elif run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then
+                    printf '%s' "$WARP_UNLOCK_SUMMARY"
+                    candidate_ip="$WARP_PROBE_IP"
+                    stop_warp_candidate_proxy
+                    activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection"
+                    activate_rc=$?
+                    if [ "$activate_rc" -eq 0 ]; then
+                        rm -rf -- "$candidate_dir"; green "已启用新的 WARP 出口 ${candidate_ip}"; return 0
+                    fi
+                    if [ "$activate_rc" -eq 2 ]; then
+                        red "候选凭据保留在: ${candidate_dir}"
+                        red "因回滚不完整，自动优选已立即停止。"
+                        return 2
+                    fi
+                else
+                    printf '%s' "$WARP_UNLOCK_SUMMARY"
+                fi
+            fi
+            stop_warp_candidate_proxy
+            delete_warp_registration "$candidate_dir/account.json" || yellow "候选云端设备清理失败。"
+        fi
+        rm -rf -- "$candidate_dir"
+        [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
+    done
+    red "未找到满足条件的新出口，原 WARP 身份保持不变。"
+    return 1
+}
+
+show_warp_status_and_unlocks() {
+    local account_file="${conf_dir}/warp/account.json" selection="${1:-1234}"
+    warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
+        yellow "内置 WARP 尚未初始化。"; return 1
+    }
+    if ! probe_active_warp; then red "内置 WARP 运行探测失败。"; return 1; fi
+    start_warp_candidate_proxy "$(extract_warp_endpoint "${conf_dir}/endpoints.json")" || return 1
+    run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" || true
+    stop_warp_candidate_proxy
+    write_warp_status_cache "$selection" "$WARP_UNLOCK_SUMMARY"
+    green "设备 ID: $(jq -r '.id // "unknown"' "$account_file" 2>/dev/null)"
+    green "出口 IP: ${WARP_PROBE_IP}  地区: ${WARP_PROBE_LOC:-未知}  机房: ${WARP_PROBE_COLO:-未知}"
+    green "WARP: ${WARP_PROBE_STATE}"
+    printf '%s' "$WARP_UNLOCK_SUMMARY"
+}
+
+get_warp_menu_status() {
+    local endpoint cache="${conf_dir}/warp/status.json" now checked warp
+    endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
+    warp_endpoint_is_valid "$endpoint" || { echo 'not configured'; return; }
+    now=$(date +%s); checked=$(jq -r '.checked_at // 0' "$cache" 2>/dev/null || echo 0)
+    warp=$(jq -r '.warp // empty' "$cache" 2>/dev/null || true)
+    if [ $((now - checked)) -gt 300 ]; then
+        if probe_active_warp; then write_warp_status_cache; warp="$WARP_PROBE_STATE"; else warp='failed'; fi
+    fi
+    [[ "$warp" =~ ^(on|plus)$ ]] && echo running || echo degraded
 }
 
 # 输出 sing-box 内置 WARP endpoint。它只供 sing-box 出站使用，
@@ -3733,6 +4188,12 @@ warp_manage() {
     skyblue "----------------------"
     red "4. 删除 Socks5/HTTP 出站"
     skyblue "----------------------"
+    green "5. 查看内置 WARP 状态及解锁情况"
+    skyblue "----------------------------"
+    green "6. 更换内置 WARP 身份/IP"
+    skyblue "----------------------"
+    green "7. 自动优选 WARP IP（多平台解锁）"
+    skyblue "----------------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
     purple "00. 退出脚本"
@@ -3743,6 +4204,21 @@ warp_manage() {
         2)  delete_rule_menu ;;
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
+        5)  clear; show_warp_status_and_unlocks; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
+        6)  clear; rotate_warp_identity_once || red "WARP 身份更换失败，原配置未改变。"; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
+        7)
+            clear
+            green "选择需要严格解锁的平台（可多选，如 134，回车默认 1234）:"
+            green "1. Netflix  2. Disney+  3. ChatGPT  4. Gemini"
+            reading "请输入: " warp_unlock_selection
+            warp_unlock_selection=${warp_unlock_selection:-1234}
+            if [[ "$warp_unlock_selection" =~ ^[1-4]+$ ]]; then
+                auto_select_warp_candidate "$warp_unlock_selection" || true
+            else
+                red "输入无效，只能使用数字 1-4。"
+            fi
+            read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage
+            ;;
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
@@ -4531,6 +5007,7 @@ menu() {
     singbox_status=$(check_singbox 2>/dev/null)
     nginx_status=$(check_nginx 2>/dev/null)
     argo_status=$(check_argo 2>/dev/null)
+    warp_status=$(get_warp_menu_status 2>/dev/null || echo degraded)
 
     clear; echo ""
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
@@ -4538,6 +5015,7 @@ menu() {
     green "Github地址: ${purple}https://github.com/eooce/sing-box${re}\n"
     purple "=== 老王sing-box四合一安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
+    purple "---WARP 状态: ${warp_status}"
     purple "--Nginx 状态: ${nginx_status}"
     purple "singbox 状态: ${singbox_status}\n"
     green "1. 安装sing-box"
@@ -4561,7 +5039,7 @@ menu() {
 }
 
 # 捕获 Ctrl+C
-trap 'red "\n强制退出"; exit' INT
+trap 'stop_warp_candidate_proxy 2>/dev/null || true; red "\n强制退出"; exit' INT TERM
 
 # ---- 参数解析入口 ----
 case "$1" in

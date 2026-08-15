@@ -102,10 +102,18 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 - 已添加其他代理时，菜单仍会把“内置 WARP”列为第一个选项，也可以选择已有代理。
 - 未匹配服务继续使用服务器原 IP，脚本不会安装系统级 WARP、创建系统 WireGuard 网卡或修改宿主机默认路由。
 - 双栈 VPS 检测到可用原生 IPv6 时，所选服务的 IPv4 使用 WARP、IPv6 保持直连，避免部分 WARP 配置的 IPv6 路径超时；没有原生 IPv6 的单栈/NAT VPS 不添加该直连回退。
-- 首次启用内置 WARP 时，脚本在本机生成密钥并直接向 Cloudflare 注册免费设备（即接受 Cloudflare WARP 服务条款）；私钥与账户信息只以 `600` 权限保存在 `/etc/sing-box/warp/`，不会使用所有 VPS 共用的公开身份。旧共享身份会在下次设置分流时自动迁移。
+- 首次启用内置 WARP 时，脚本在本机生成密钥并直接向 Cloudflare 注册免费设备（即接受 Cloudflare WARP 服务条款）；私钥与账户信息只以 `600` 权限保存在 `/etc/sing-box/conf/warp/`，不会使用所有 VPS 共用的公开身份。旧共享身份会在下次设置分流时自动迁移。
 - 内置 WARP peer 每 25 秒发送持久保活，避免空闲后 UDP/NAT 映射失效；NAT 机不需要增加入站映射，但服务商必须允许 VPS 向 Cloudflare WARP endpoint 发起出站 UDP 连接。
 
 菜单会显示 `wireguard-out` 是否就绪。首次设置规则时会自动补齐缺失的 endpoint、规则集和 `direct` 出站；修改前后执行完整配置校验，校验或重启失败会恢复原路由。全局代理与恢复直连会清空选择性分流规则并显式调整 `route.final`，不再删除 `route.json`、`endpoints.json` 或 `direct` 出站。
+
+`WARP分流管理` 还提供三个内置身份操作：
+
+- `查看内置 WARP 状态及解锁情况`：脱敏显示设备 ID、出口 IP、地区、Cloudflare 机房及 Netflix、Disney+、ChatGPT、Gemini 检测结果，不显示令牌、私钥、client ID 或 reserved bytes。
+- `更换内置 WARP 身份/IP`：注册并验证一个新身份后事务替换；Cloudflare 可能仍分配相同出口 IP，菜单会明确提示。
+- `自动优选 WARP IP（多平台解锁）`：用户可多选上述四个平台，默认全选；候选必须满足 WARP 在线、出口 IP 已改变且所选项目全部通过。最多尝试 5 个候选，失败时保留原身份，不会无限注册或留下后台进程。
+
+首页的 `WARP 状态` 指 sing-box 内置端点而非系统网卡：`running` 表示最近探测正常，`not configured` 表示尚未初始化，`degraded` 表示端点存在但最近探测失败。状态结果短暂缓存，避免每次重绘菜单都重复测速。上述操作只启动临时的 localhost 探测代理，不安装系统 WARP、Cloudflare Client、WireProxy、定时任务或守护进程；公网 IP 和地区由 Cloudflare Anycast 调度，脚本无法保证得到指定国家或指定 IP。
 
 ## 订阅与 cfy 联动
 
