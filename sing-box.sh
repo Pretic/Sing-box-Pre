@@ -373,6 +373,98 @@ format_url_host() {
     fi
 }
 
+is_valid_http_subscription_path() {
+    is_valid_subscription_path "${1:-}" && return 0
+    [[ "${1:-}" =~ ^/[A-Za-z0-9_-]{16,128}$ ]]
+}
+
+build_http_subscription_url() {
+    local host="${1:-}"
+    local port="${2:-}"
+    local path="${3:-}"
+
+    [ -n "$host" ] || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+    is_valid_http_subscription_path "$path" || return 1
+
+    if [[ "$host" == \[*\] ]]; then
+        [[ "$host" =~ ^\[[0-9A-Fa-f:.]+\]$ ]] || return 1
+    elif [[ "$host" == *:* ]]; then
+        [[ "$host" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    else
+        [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    fi
+
+    host=$(format_url_host "$host")
+    if [ "$port" = 80 ]; then
+        printf 'http://%s%s\n' "$host" "$path"
+    else
+        printf 'http://%s:%s%s\n' "$host" "$port" "$path"
+    fi
+}
+
+build_https_subscription_url() {
+    local domain="${1:-}"
+    local path="${2:-}"
+
+    domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+    is_valid_subscription_domain "$domain" || return 1
+    is_valid_subscription_path "$path" || return 1
+    printf 'https://%s%s\n' "$domain" "$path"
+}
+
+resolve_subscription_source_url() {
+    local host="${1:-}"
+    local port="${2:-}"
+    local path="${3:-}"
+    local url
+
+    if [ "${SUB_HTTPS_ENABLED:-0}" = 1 ] && [ -n "${SUB_HTTPS_VERIFIED_AT:-}" ]; then
+        url=$(build_https_subscription_url "${SUB_HTTPS_DOMAIN:-}" "${SUB_HTTPS_PATH:-}" 2>/dev/null) && {
+            printf '%s\n' "$url"
+            return 0
+        }
+    fi
+
+    build_http_subscription_url "$host" "$port" "$path"
+}
+
+render_terminal_qr() {
+    local url="${1:-}"
+    local encoder="${QR_ENCODER:-${work_dir}/qrencode}"
+
+    [ -n "$url" ] && [ -t 1 ] && [ -x "$encoder" ] || return 0
+    "$encoder" -t ANSIUTF8 -m 1 -- "$url" 2>/dev/null || true
+}
+
+show_subscription_links() {
+    local source_url="${1:-}"
+    local clash_url singbox_url surge_url
+
+    if [ -z "$source_url" ]; then
+        yellow "订阅未配置：未找到有效的 HTTPS 或 HTTP 订阅地址。\n"
+        return 0
+    fi
+
+    clash_url="https://sublink.eooce.com/clash?config=${source_url}"
+    singbox_url="https://sublink.eooce.com/singbox?config=${source_url}"
+    surge_url="https://sublink.eooce.com/surge?config=${source_url}"
+
+    green "V2rayN/Shadowrocket/Nekobox/Loon/Karing/Streisand 订阅链接：\n${purple}${source_url}${re}\n"
+    render_terminal_qr "$source_url"
+    yellow "\n=========================================================================================="
+    green "\nClash/Mihomo 订阅链接：\n${purple}${clash_url}${re}\n"
+    render_terminal_qr "$clash_url"
+    yellow "\n=========================================================================================="
+    green "\nSing-box 订阅链接：\n${purple}${singbox_url}${re}\n"
+    render_terminal_qr "$singbox_url"
+    yellow "\n=========================================================================================="
+    green "\nSurge 订阅链接：\n${purple}${surge_url}${re}\n"
+    render_terminal_qr "$surge_url"
+    yellow "\n==========================================================================================\n"
+}
+
 get_public_ipv4() {
     local ip
 
@@ -1075,18 +1167,7 @@ EOF
     yellow "\n温馨提醒:"
     yellow "如果节点里的ip是ipv6的，可在 修改节点配置 菜单切换ipv4后重新订阅节点\n"
     red "如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
-    green "V2rayN,Shadowrocket,Nekobox,Loon,Karing,Sterisand订阅链接：${purple}http://${sub_host}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "http://${sub_host}:${nginx_port}/${password}"
-    yellow "\n=========================================================================================="
-    green "\n\nClash,Mihomo系列订阅链接：${purple}https://sublink.eooce.com/clash?config=http://${sub_host}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/clash?config=http://${sub_host}:${nginx_port}/${password}"
-    yellow "\n=========================================================================================="
-    green "\n\nSing-box订阅链接：${purple}https://sublink.eooce.com/singbox?config=http://${sub_host}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/singbox?config=http://${sub_host}:${nginx_port}/${password}"
-    yellow "\n=========================================================================================="
-    green "\n\nSurge订阅链接：${purple}https://sublink.eooce.com/surge?config=http://${sub_host}:${nginx_port}/${password}${re}\n"
-    $work_dir/qrencode "https://sublink.eooce.com/surge?config=http://${sub_host}:${nginx_port}/${password}"
-    yellow "\n==========================================================================================\n"
+    show_subscription_links "$(build_http_subscription_url "$sub_host" "$nginx_port" "/$password" 2>/dev/null || true)"
 }
 
 # nginx订阅配置
@@ -2018,21 +2099,7 @@ check_nodes() {
     yellow "\n温馨提醒: 如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
     green "\n=== 订阅链接 ===\n"
 
-    green "V2rayN/Shadowrocket/Nekobox/Karing 订阅链接:\n${purple}${base64_url}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "${base64_url}"
-    yellow "\n=========================================================================================="
-
-    green "\nClash/Mihomo 订阅链接:\n${purple}https://sublink.eooce.com/clash?config=${base64_url}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/clash?config=${base64_url}"
-    yellow "\n=========================================================================================="
-
-    green "\nSing-box 订阅链接:\n${purple}https://sublink.eooce.com/singbox?config=${base64_url}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/singbox?config=${base64_url}"
-    yellow "\n=========================================================================================="
-
-    green "\nSurge 订阅链接:\n${purple}https://sublink.eooce.com/surge?config=${base64_url}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "https://sublink.eooce.com/surge?config=${base64_url}"
-    yellow "\n==========================================================================================\n"
+    show_subscription_links "$base64_url"
 }
 
 change_cfip() {
@@ -2622,7 +2689,7 @@ add_socks5_inbound() {
     green "端口: ${purple}${sk_port}${re}"
     green "用户名: ${purple}${sk_user}${re}  ${green}密码:${re} ${purple}${sk_pass}${re}"
     green "节点链接: ${purple}${url_line}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
+    render_terminal_qr "$url_line"
 }
 
 remove_socks5_inbound() {
@@ -2716,7 +2783,7 @@ add_anytls() {
     green "密码(UUID): ${purple}${current_uuid}${re}"
     green "端口: ${purple}${at_port}${re}"
     green "节点链接:\n${purple}${url_line}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
+    render_terminal_qr "$url_line"
 }
 
 remove_anytls() {
@@ -2818,7 +2885,7 @@ add_ss2022() {
     green "密钥(base64): ${purple}${ss_key}${re}"
     green "端口: ${purple}${ss_port}${re}"
     green "节点链接:\n${purple}${url_line}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
+    render_terminal_qr "$url_line"
 }
 
 remove_ss2022() {
@@ -3058,4 +3125,3 @@ case "$1" in
         exit 1
         ;;
 esac
-

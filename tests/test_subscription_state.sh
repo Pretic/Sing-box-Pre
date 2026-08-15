@@ -9,6 +9,15 @@ extract_function() {
     sed -n "/^${1}() {/,/^}/p" "$script"
 }
 
+assert_rejected() {
+    local description="$1"
+    shift
+    if "$@"; then
+        echo "FAIL: accepted ${description}" >&2
+        exit 1
+    fi
+}
+
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
 subscription_state_file="${work_dir}/subscription.conf"
@@ -45,20 +54,21 @@ done
 }
 
 is_valid_subscription_token '0123456789abcdefghjkmnpqrstvwxyz'
-! is_valid_subscription_token '0123456789abcdefghjkmnpqrstvwxyi'
+assert_rejected 'token containing excluded character' \
+    is_valid_subscription_token '0123456789abcdefghjkmnpqrstvwxyi'
 
 is_valid_subscription_domain 'sub.example.com'
 is_valid_subscription_domain 'Sub.Example.com'
-! is_valid_subscription_domain 'https://sub.example.com/path'
-! is_valid_subscription_domain '*.example.com'
-! is_valid_subscription_domain '-bad.example.com'
-! is_valid_subscription_domain 'bad-.example.com'
-! is_valid_subscription_domain 'bad..example.com'
+assert_rejected 'domain with protocol and path' is_valid_subscription_domain 'https://sub.example.com/path'
+assert_rejected 'wildcard domain' is_valid_subscription_domain '*.example.com'
+assert_rejected 'domain label with leading hyphen' is_valid_subscription_domain '-bad.example.com'
+assert_rejected 'domain label with trailing hyphen' is_valid_subscription_domain 'bad-.example.com'
+assert_rejected 'domain with empty label' is_valid_subscription_domain 'bad..example.com'
 
 is_valid_subscription_path '/0123456789abcdefghjkmnpqrstvwxyz'
 is_valid_subscription_path '/sub/0123456789abcdefghjkmnpqrstvwxyz'
-! is_valid_subscription_path '/../etc/passwd'
-! is_valid_subscription_path '/sub/short'
+assert_rejected 'path traversal' is_valid_subscription_path '/../etc/passwd'
+assert_rejected 'short subscription path' is_valid_subscription_path '/sub/short'
 
 cat > "$subscription_state_file" <<'STATE'
 SUB_TOKEN=0123456789abcdefghjkmnpqrstvwxyz
@@ -87,7 +97,10 @@ if [[ "$(uname -s)" == MINGW* ]]; then
 else
     [[ "$(stat -c '%a' "$subscription_state_file")" == 600 ]]
 fi
-! grep -q '^EVIL=' "$subscription_state_file"
+if grep -q '^EVIL=' "$subscription_state_file"; then
+    echo 'FAIL: unknown state key was persisted' >&2
+    exit 1
+fi
 
 cat > "$subscription_state_file" <<'STATE'
 SUB_TOKEN=invalid
