@@ -4,7 +4,17 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"
-export JQ_BIN="${repo_root}/../tools/jq.exe"
+if [[ -z "${JQ_BIN:-}" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+        JQ_BIN="$(command -v jq)"
+    elif [[ -x "${repo_root}/../tools/jq.exe" ]]; then
+        JQ_BIN="${repo_root}/../tools/jq.exe"
+    else
+        echo 'FAIL: jq is required for remote Tunnel subscription tests' >&2
+        exit 1
+    fi
+fi
+export JQ_BIN
 
 [[ -x "$JQ_BIN" ]] || {
     echo "FAIL: test jq is missing: $JQ_BIN" >&2

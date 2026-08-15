@@ -76,6 +76,24 @@ apply_source="$(extract_function apply_nginx_subscription_config)"
 }
 grep -Fq 'nginx -t' <<< "$apply_source"
 grep -Fq '.bak.sb' <<< "$apply_source"
+source <(printf '%s\n' "$apply_source")
+
+rollback_dir="$(mktemp -d)"
+rollback_config="${rollback_dir}/sing-box.conf"
+NGINX_SUBSCRIPTION_CONF="$rollback_config"
+command_exists() { [[ "$1" == nginx ]]; }
+nginx() { [[ "${1:-}" == -t ]]; }
+start_nginx() { return 1; }
+restart_nginx() { return 0; }
+if apply_nginx_subscription_config 8080 "/${token}" ''; then
+    echo 'FAIL: nginx apply succeeded despite reload/start failure' >&2
+    exit 1
+fi
+[[ ! -e "$rollback_config" ]] || {
+    echo 'FAIL: failed first-time nginx configuration was left behind' >&2
+    exit 1
+}
+rm -rf "$rollback_dir"
 
 add_source="$(extract_function add_nginx_conf)"
 if grep -Fq 'pkill nginx' <<< "$add_source" || grep -Fq 'manage_service "nginx" "stop"' <<< "$add_source"; then

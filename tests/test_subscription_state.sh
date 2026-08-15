@@ -102,6 +102,21 @@ if grep -q '^EVIL=' "$subscription_state_file"; then
     exit 1
 fi
 
+SUB_TOKEN=''
+SUB_HTTP_PATH=''
+SUB_HTTPS_ENABLED=1
+SUB_HTTPS_DOMAIN='sub.example.com'
+SUB_HTTPS_DOMAIN_MODE=separate
+SUB_HTTPS_PATH='/0123456789abcdefghjkmnpqrstvwxyz'
+SUB_TUNNEL_MODE=remote
+SUB_HTTPS_VERIFIED_AT='2026-08-15T00:00:00Z'
+assert_rejected 'enabled HTTPS state without token and HTTP path' save_subscription_state
+
+SUB_TOKEN='0123456789abcdefghjkmnpqrstvwxyz'
+SUB_HTTP_PATH='/0123456789abcdefghjkmnpqrstvwxyz'
+SUB_HTTPS_VERIFIED_AT='not-a-time'
+assert_rejected 'enabled HTTPS state with invalid verification timestamp' save_subscription_state
+
 cat > "$subscription_state_file" <<'STATE'
 SUB_TOKEN=invalid
 SUB_HTTP_PATH=/invalid

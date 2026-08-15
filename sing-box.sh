@@ -180,11 +180,13 @@ save_subscription_state() {
         return 1
     fi
     if [ "${SUB_HTTPS_ENABLED:-0}" = 1 ]; then
+        is_valid_subscription_token "${SUB_TOKEN:-}" || return 1
+        is_valid_subscription_path "${SUB_HTTP_PATH:-}" || return 1
         is_valid_subscription_domain "${SUB_HTTPS_DOMAIN:-}" || return 1
         is_valid_subscription_path "${SUB_HTTPS_PATH:-}" || return 1
         [[ "${SUB_HTTPS_DOMAIN_MODE:-}" == reuse || "${SUB_HTTPS_DOMAIN_MODE:-}" == separate ]] || return 1
         [[ "${SUB_TUNNEL_MODE:-}" == local || "${SUB_TUNNEL_MODE:-}" == remote ]] || return 1
-        [ -n "${SUB_HTTPS_VERIFIED_AT:-}" ] || return 1
+        [[ "${SUB_HTTPS_VERIFIED_AT:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
     fi
 
     {
@@ -1944,12 +1946,20 @@ apply_nginx_subscription_config() {
 
     if command_exists rc-service; then
         if ! rc-service nginx reload > /dev/null 2>&1 && ! rc-service nginx restart > /dev/null 2>&1; then
-            [ "$had_config" = 1 ] && cp -p "$backup_file" "$config_file"
+            if [ "$had_config" = 1 ]; then
+                cp -p "$backup_file" "$config_file"
+            else
+                rm -f "$config_file"
+            fi
             rc-service nginx restart > /dev/null 2>&1 || true
             return 1
         fi
     elif ! nginx -s reload > /dev/null 2>&1 && ! start_nginx > /dev/null 2>&1; then
-        [ "$had_config" = 1 ] && cp -p "$backup_file" "$config_file"
+        if [ "$had_config" = 1 ]; then
+            cp -p "$backup_file" "$config_file"
+        else
+            rm -f "$config_file"
+        fi
         restart_nginx > /dev/null 2>&1 || true
         return 1
     fi
