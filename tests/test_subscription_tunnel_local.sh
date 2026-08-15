@@ -123,5 +123,6 @@ apply_source="$(extract_function apply_local_tunnel_subscription_rule)"
 grep -Fq 'ingress validate' <<< "$apply_source"
 grep -Fq 'ingress rule' <<< "$apply_source"
 grep -Fq 'restart_argo' <<< "$apply_source"
+grep -Fq 'verify_https_subscription' <<< "$apply_source"
 
 echo 'Local Tunnel subscription tests passed.'

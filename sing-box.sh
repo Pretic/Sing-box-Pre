@@ -465,6 +465,79 @@ show_subscription_links() {
     yellow "\n==========================================================================================\n"
 }
 
+verify_https_subscription() {
+    local url="${1:-}"
+    local expected_file="${2:-${work_dir}/sub.txt}"
+    local curl_bin="${CURL_BIN:-curl}"
+    local tmp_dir remote_file expected_flat remote_flat
+
+    [[ "$url" == https://* ]] && [ -s "$expected_file" ] || return 1
+    tmp_dir=$(mktemp -d "${work_dir}/.subscription-verify.XXXXXX") || return 1
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    remote_file="${tmp_dir}/remote-subscription.txt"
+
+    if ! "$curl_bin" -fsS --compressed --retry 2 --connect-timeout 10 --max-time 30 \
+        -o "$remote_file" "$url"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    if cmp -s "$expected_file" "$remote_file"; then
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+
+    expected_flat=$(tr -d '\r\n' < "$expected_file")
+    remote_flat=$(tr -d '\r\n' < "$remote_file")
+    rm -rf "$tmp_dir"
+    [ -n "$expected_flat" ] && [ "$expected_flat" = "$remote_flat" ]
+}
+
+print_manual_https_route() {
+    local domain="${1:-}"
+    local path_regex="${2:-}"
+    local port="${3:-}"
+
+    green "\n请在 Cloudflare Tunnel 的 Published application 中添加以下路由："
+    green "Hostname: ${purple}${domain}${re}"
+    green "Path:     ${purple}${path_regex}${re}"
+    green "Type:     ${purple}HTTP${re}"
+    green "URL:      ${purple}http://localhost:${port}${re}\n"
+}
+
+show_subscription_status() {
+    local config_file="/etc/nginx/conf.d/sing-box.conf"
+    local port http_path source_url host tunnel_mode
+    local -a paths
+
+    load_subscription_state
+    host=$(get_subscription_host 2>/dev/null || true)
+    port=$(get_nginx_subscription_port "$config_file" 2>/dev/null || true)
+    mapfile -t paths < <(get_nginx_subscription_paths "$config_file" 2>/dev/null)
+    http_path="${SUB_HTTP_PATH:-${paths[0]:-}}"
+    is_valid_http_subscription_path "$http_path" || http_path="${paths[0]:-}"
+    source_url=$(resolve_subscription_source_url "$host" "$port" "$http_path" 2>/dev/null || true)
+    tunnel_mode=$(detect_argo_tunnel_mode 2>/dev/null || printf 'unknown')
+
+    clear; echo ""
+    green "=== 节点订阅详细状态 ===\n"
+    green "Nginx 端口: ${purple}${port:-未配置}${re}"
+    green "HTTP 路径: ${purple}${http_path:-未配置}${re}"
+    green "Tunnel 类型: ${purple}${tunnel_mode}${re}"
+    if [ "$SUB_HTTPS_ENABLED" = 1 ]; then
+        green "HTTPS 状态: ${purple}已验证${re}"
+        green "HTTPS 域名: ${purple}${SUB_HTTPS_DOMAIN}${re}"
+        green "域名模式: ${purple}${SUB_HTTPS_DOMAIN_MODE}${re}"
+        green "验证时间: ${purple}${SUB_HTTPS_VERIFIED_AT}${re}\n"
+    else
+        yellow "HTTPS 状态: 未启用或未通过验证\n"
+    fi
+    [ "$tunnel_mode" = quick ] && yellow "临时 Tunnel 不适合作为稳定 HTTPS 订阅。\n"
+    [ -n "$source_url" ] && green "当前首选订阅：${purple}${source_url}${re}\n"
+    show_subscription_links "$source_url"
+    yellow "使用第三方转换链接时，转换服务能够看到原始订阅 URL 和其中的随机密钥。\n"
+}
+
 get_public_ipv4() {
     local ip
 
@@ -758,6 +831,7 @@ apply_local_tunnel_subscription_rule() {
     local port="${3:-}"
     local mode="${4:-}"
     local tunnel_config="${5:-${work_dir}/tunnel.yml}"
+    local verify_url="${6:-}"
     local backup_file="${tunnel_config}.bak.subscription"
     local tmp_file public_path
 
@@ -775,6 +849,29 @@ apply_local_tunnel_subscription_rule() {
     if ! "${work_dir}/argo" tunnel --config "$tunnel_config" ingress validate > /dev/null 2>&1 || \
        ! "${work_dir}/argo" tunnel --config "$tunnel_config" ingress rule \
             "https://${domain}${public_path}" > /dev/null 2>&1 || \
+       ! restart_argo > /dev/null 2>&1 || \
+       { [ -n "$verify_url" ] && ! verify_https_subscription "$verify_url"; }; then
+        cp -p "$backup_file" "$tunnel_config"
+        restart_argo > /dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+apply_local_tunnel_subscription_removal() {
+    local tunnel_config="${1:-${work_dir}/tunnel.yml}"
+    local backup_file="${tunnel_config}.bak.subscription-removal"
+    local tmp_file
+
+    [ -r "$tunnel_config" ] || return 1
+    tmp_file=$(mktemp "$(dirname "$tunnel_config")/.tunnel-remove.XXXXXX") || return 1
+    remove_local_tunnel_subscription_rule "$tunnel_config" "$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    cp -p "$tunnel_config" "$backup_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$backup_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$tunnel_config" || return 1
+    if ! "${work_dir}/argo" tunnel --config "$tunnel_config" ingress validate > /dev/null 2>&1 || \
        ! restart_argo > /dev/null 2>&1; then
         cp -p "$backup_file" "$tunnel_config"
         restart_argo > /dev/null 2>&1 || true
@@ -1093,6 +1190,59 @@ apply_remote_tunnel_subscription_rule() {
         fi
     fi
 
+    unset CF_API_TOKEN
+    rm -rf "$tmp_dir"
+    [ "$operation_ok" = 1 ]
+}
+
+remove_remote_tunnel_subscription_via_api() {
+    local domain="${1:-}"
+    local path_regex="${2:-}"
+    local jq_bin="${JQ_BIN:-jq}"
+    local account_id tunnel_id CF_API_TOKEN tmp_dir get_response old_config
+    local new_config put_body put_response operation_ok=0 remote_updated=0
+
+    is_valid_subscription_domain "$domain" || return 1
+    is_valid_tunnel_subscription_regex "$path_regex" || return 1
+    reading "请输入 Cloudflare Account ID: " account_id
+    reading "请输入 Cloudflare Tunnel ID: " tunnel_id
+    [[ "$account_id" =~ ^[A-Fa-f0-9]{32}$ ]] || { red "Account ID 格式无效"; return 1; }
+    [[ "$tunnel_id" =~ ^[A-Za-z0-9-]{16,128}$ ]] || { red "Tunnel ID 格式无效"; return 1; }
+    read -r -s -p "$(red '请输入 Cloudflare API token（输入不会显示）: ')" CF_API_TOKEN
+    echo ""
+    [[ "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || { unset CF_API_TOKEN; return 1; }
+
+    tmp_dir=$(mktemp -d "${work_dir}/.cf-subscription-remove.XXXXXX") || { unset CF_API_TOKEN; return 1; }
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    get_response="${tmp_dir}/get-response.json"
+    old_config="${tmp_dir}/old-config.json"
+    new_config="${tmp_dir}/new-config.json"
+    put_body="${tmp_dir}/put-body.json"
+    put_response="${tmp_dir}/put-response.json"
+
+    while :; do
+        cloudflare_api GET \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" \
+            > "$get_response" 2>/dev/null || break
+        "$jq_bin" -e '.success == true and (.result.config | type == "object")' \
+            "$get_response" > /dev/null || break
+        "$jq_bin" '.result.config' "$get_response" > "$old_config" || break
+        remove_remote_tunnel_subscription_rule "$(< "$old_config")" "$domain" "$path_regex" \
+            > "$new_config" || break
+        "$jq_bin" -cn --slurpfile config "$new_config" '{config: $config[0]}' > "$put_body" || break
+        cloudflare_api PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" \
+            "$put_body" > "$put_response" 2>/dev/null || break
+        "$jq_bin" -e '.success == true' "$put_response" > /dev/null || break
+        remote_updated=1
+        operation_ok=1
+        break
+    done
+
+    if [ "$operation_ok" != 1 ] && [ "$remote_updated" = 1 ]; then
+        rollback_remote_tunnel_configuration "$account_id" "$tunnel_id" "$old_config" \
+            "${tmp_dir}/rollback-response.json" || true
+    fi
     unset CF_API_TOKEN
     rm -rf "$tmp_dir"
     [ "$operation_ok" = 1 ]
@@ -2321,6 +2471,298 @@ IEOF
     esac
 }
 
+configure_cf_https_subscription() {
+    local force_rotate="${1:-0}"
+    local tunnel_mode domain_mode domain choice token port http_path https_path path_regex https_url
+    local old_domain old_https_path old_path_regex config_file nginx_backup pending_state state_target
+    local old_http_path tunnel_id dns_choice confirm apply_method manual_confirm operation_ok=0
+
+    load_subscription_state
+    tunnel_mode=$(detect_argo_tunnel_mode 2>/dev/null || true)
+    if [ "$tunnel_mode" = quick ] || [ -z "$tunnel_mode" ]; then
+        yellow "当前不是可识别的固定 Tunnel；请先在 Argo 隧道管理中添加固定 Tunnel。"
+        return 1
+    fi
+
+    old_domain="${SUB_HTTPS_DOMAIN:-}"
+    old_https_path="${SUB_HTTPS_PATH:-}"
+    old_path_regex=""
+    is_valid_subscription_path "$old_https_path" && old_path_regex="^${old_https_path}$"
+
+    if [ "$force_rotate" = 1 ] && [ "$SUB_HTTPS_ENABLED" = 1 ]; then
+        domain_mode="$SUB_HTTPS_DOMAIN_MODE"
+        domain="$SUB_HTTPS_DOMAIN"
+    else
+        green "\nHTTPS 订阅域名模式："
+        green "1. 复用现有固定 Argo 域名（推荐，无需新增域名）"
+        green "2. 使用独立订阅域名"
+        reading "请选择 [1-2，默认1]: " choice
+        case "$choice" in
+            ""|1) domain_mode=reuse ;;
+            2) domain_mode=separate ;;
+            *) red "无效的域名模式"; return 1 ;;
+        esac
+
+        if [ "$domain_mode" = reuse ] && [ "$tunnel_mode" = local ]; then
+            domain=$(sed -n 's/^[[:space:]]*- hostname:[[:space:]]*\([^[:space:]]*\).*/\1/p' \
+                "${work_dir}/tunnel.yml" | head -1)
+            if ! is_valid_subscription_domain "$domain"; then
+                reading "未能读取固定 Argo 域名，请输入现有 Argo 域名: " domain
+            else
+                green "将复用固定 Argo 域名：${purple}${domain}${re}"
+            fi
+        elif [ "$domain_mode" = reuse ]; then
+            reading "请输入 Cloudflare 中现有的固定 Argo 域名: " domain
+        else
+            reading "请输入你自己的独立订阅域名（例如 sub.example.com）: " domain
+        fi
+        domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+        is_valid_subscription_domain "$domain" || { red "订阅域名格式无效"; return 1; }
+    fi
+
+    config_file="/etc/nginx/conf.d/sing-box.conf"
+    port=$(get_nginx_subscription_port "$config_file" 2>/dev/null || true)
+    old_http_path=$(get_nginx_subscription_paths "$config_file" 2>/dev/null | head -1)
+    [ -n "$port" ] && is_valid_http_subscription_path "$old_http_path" || {
+        red "未找到有效的 Nginx HTTP 订阅配置，请先开启节点订阅。"
+        return 1
+    }
+
+    token="${SUB_TOKEN:-}"
+    if [ "$force_rotate" = 1 ] || ! is_valid_subscription_token "$token"; then
+        yellow "启用或轮换 32 字符密钥后，旧订阅 URL 将失效，需要更新客户端。"
+        reading "确认继续？[y/N]: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+        token=$(generate_subscription_token) || { red "订阅密钥生成失败"; return 1; }
+    fi
+
+    http_path="/${token}"
+    [ "$domain_mode" = reuse ] && https_path="/sub/${token}" || https_path="/${token}"
+    path_regex="^${https_path}$"
+    https_url=$(build_https_subscription_url "$domain" "$https_path") || return 1
+
+    if [ "$tunnel_mode" = local ] && [ "$domain_mode" = separate ]; then
+        tunnel_id=$(sed -n 's/^[[:space:]]*tunnel:[[:space:]]*\([^[:space:]]*\).*/\1/p' \
+            "${work_dir}/tunnel.yml" | head -1)
+        green "\n独立域名需要 CNAME：${purple}${domain}${re} -> ${purple}${tunnel_id}.cfargotunnel.com${re}（已代理）"
+        reading "是否尝试由 cloudflared 自动创建 DNS？[y/N]: " dns_choice
+        if [[ "$dns_choice" =~ ^[Yy]$ ]] && \
+           ! "${work_dir}/argo" tunnel route dns "$tunnel_id" "$domain"; then
+            yellow "自动创建 DNS 失败，请在 Cloudflare Dashboard 手动创建上述 CNAME。"
+        fi
+        reading "确认 DNS 已配置后输入 y 继续: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    fi
+
+    nginx_backup=$(mktemp "/etc/nginx/conf.d/.sing-box-https-backup.XXXXXX") || return 1
+    cp -p "$config_file" "$nginx_backup" || { rm -f "$nginx_backup"; return 1; }
+    chmod 600 "$nginx_backup" 2>/dev/null || true
+    pending_state=$(mktemp "${work_dir}/.subscription-state-pending.XXXXXX") || {
+        rm -f "$nginx_backup"
+        return 1
+    }
+    rm -f "$pending_state"
+
+    SUB_TOKEN="$token"
+    SUB_HTTP_PATH="$http_path"
+    SUB_HTTPS_ENABLED=1
+    SUB_HTTPS_DOMAIN="$domain"
+    SUB_HTTPS_DOMAIN_MODE="$domain_mode"
+    SUB_HTTPS_PATH="$https_path"
+    SUB_TUNNEL_MODE="$tunnel_mode"
+    SUB_HTTPS_VERIFIED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    state_target="$subscription_state_file"
+    subscription_state_file="$pending_state"
+    if ! save_subscription_state; then
+        subscription_state_file="$state_target"
+        rm -f "$nginx_backup" "$pending_state"
+        red "无法预写订阅状态，配置未改变。"
+        return 1
+    fi
+    subscription_state_file="$state_target"
+
+    if ! apply_nginx_subscription_config "$port" "$http_path" "$https_path"; then
+        rm -f "$nginx_backup" "$pending_state"
+        load_subscription_state
+        return 1
+    fi
+
+    case "$tunnel_mode" in
+        local)
+            apply_local_tunnel_subscription_rule "$domain" "$path_regex" "$port" \
+                "$domain_mode" "${work_dir}/tunnel.yml" "$https_url" && operation_ok=1
+            ;;
+        remote)
+            green "\n远程管理 Tunnel 配置方式："
+            green "1. 使用 Cloudflare API token 自动配置"
+            green "2. 在 Cloudflare Dashboard 手动配置"
+            reading "请选择 [1-2，默认2]: " apply_method
+            if [ "$apply_method" = 1 ]; then
+                apply_remote_tunnel_subscription_rule "$domain" "$path_regex" "$port" \
+                    "$domain_mode" "$old_domain" "$old_path_regex" "$https_url" && operation_ok=1
+            else
+                print_manual_https_route "$domain" "$path_regex" "$port"
+                if [ -n "$old_domain" ] && [ -n "$old_path_regex" ] && \
+                   { [ "$old_domain" != "$domain" ] || [ "$old_path_regex" != "$path_regex" ]; }; then
+                    yellow "轮换完成后，请删除旧路由：Hostname=${old_domain}, Path=${old_path_regex}"
+                fi
+                reading "完成 Dashboard 配置后输入 y 进行公网验证: " manual_confirm
+                [[ "$manual_confirm" =~ ^[Yy]$ ]] && \
+                    verify_https_subscription "$https_url" && operation_ok=1
+            fi
+            ;;
+    esac
+
+    if [ "$operation_ok" != 1 ]; then
+        cp -p "$nginx_backup" "$config_file"
+        nginx -t > /dev/null 2>&1 && { nginx -s reload > /dev/null 2>&1 || restart_nginx > /dev/null 2>&1; }
+        rm -f "$nginx_backup" "$pending_state"
+        load_subscription_state
+        red "HTTPS 订阅配置或验证失败，Nginx 已恢复，原 HTTP 订阅保持可用。"
+        return 1
+    fi
+
+    if ! mv -f "$pending_state" "$subscription_state_file"; then
+        cp -p "$nginx_backup" "$config_file"
+        nginx -t > /dev/null 2>&1 && { nginx -s reload > /dev/null 2>&1 || restart_nginx > /dev/null 2>&1; }
+        [ "$tunnel_mode" = local ] && [ -r "${work_dir}/tunnel.yml.bak.subscription" ] && {
+            cp -p "${work_dir}/tunnel.yml.bak.subscription" "${work_dir}/tunnel.yml"
+            restart_argo > /dev/null 2>&1 || true
+        }
+        rm -f "$nginx_backup" "$pending_state"
+        load_subscription_state
+        red "状态文件提交失败，已尽力恢复原配置。"
+        return 1
+    fi
+    chmod 600 "$subscription_state_file" 2>/dev/null || true
+    rm -f "$nginx_backup"
+    green "\nCloudflare HTTPS 订阅已启用并通过内容验证：\n${purple}${https_url}${re}\n"
+}
+
+disable_cf_https_subscription() {
+    local tunnel_mode path_regex method confirm port http_path
+
+    load_subscription_state
+    if [ "$SUB_HTTPS_ENABLED" != 1 ]; then
+        yellow "Cloudflare HTTPS 订阅尚未启用。"
+        return 0
+    fi
+    tunnel_mode="${SUB_TUNNEL_MODE:-$(detect_argo_tunnel_mode 2>/dev/null || true)}"
+    path_regex="^${SUB_HTTPS_PATH}$"
+
+    case "$tunnel_mode" in
+        local)
+            apply_local_tunnel_subscription_removal "${work_dir}/tunnel.yml" || {
+                red "本地 Tunnel 订阅路由移除失败，状态未改变。"
+                return 1
+            }
+            ;;
+        remote)
+            green "1. 使用 Cloudflare API token 自动移除路由"
+            green "2. 在 Dashboard 手动移除路由"
+            reading "请选择 [1-2，默认2]: " method
+            if [ "$method" = 1 ]; then
+                remove_remote_tunnel_subscription_via_api "$SUB_HTTPS_DOMAIN" "$path_regex" || return 1
+            else
+                yellow "请删除路由：Hostname=${SUB_HTTPS_DOMAIN}, Path=${path_regex}"
+                reading "确认已删除后输入 y: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+            fi
+            ;;
+        *) red "无法识别原固定 Tunnel 类型，未修改状态。"; return 1 ;;
+    esac
+
+    port=$(get_nginx_subscription_port 2>/dev/null || true)
+    http_path="${SUB_HTTP_PATH:-$(get_nginx_subscription_paths 2>/dev/null | head -1)}"
+    if [ -n "$port" ] && is_valid_http_subscription_path "$http_path"; then
+        apply_nginx_subscription_config "$port" "$http_path" "" || \
+            yellow "HTTPS 路由已关闭，但 Nginx 未能移除额外 HTTPS origin 路径。"
+    fi
+
+    SUB_HTTPS_ENABLED=0
+    SUB_HTTPS_DOMAIN=''
+    SUB_HTTPS_DOMAIN_MODE=''
+    SUB_HTTPS_PATH=''
+    SUB_TUNNEL_MODE=''
+    SUB_HTTPS_VERIFIED_AT=''
+    save_subscription_state || return 1
+    green "Cloudflare HTTPS 订阅已关闭；HTTP 订阅仍保留。"
+}
+
+update_cf_https_subscription_origin() {
+    local port="${1:-}"
+    local tunnel_mode path_regex https_url method confirm operation_ok=0
+
+    load_subscription_state
+    [ "$SUB_HTTPS_ENABLED" = 1 ] || return 0
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+    tunnel_mode="${SUB_TUNNEL_MODE:-$(detect_argo_tunnel_mode 2>/dev/null || true)}"
+    path_regex="^${SUB_HTTPS_PATH}$"
+    https_url=$(build_https_subscription_url "$SUB_HTTPS_DOMAIN" "$SUB_HTTPS_PATH") || return 1
+
+    case "$tunnel_mode" in
+        local)
+            apply_local_tunnel_subscription_rule "$SUB_HTTPS_DOMAIN" "$path_regex" "$port" \
+                "$SUB_HTTPS_DOMAIN_MODE" "${work_dir}/tunnel.yml" "$https_url" && operation_ok=1
+            ;;
+        remote)
+            green "HTTPS 订阅已启用，端口变化还需要更新远程 Tunnel origin。"
+            green "1. 使用 Cloudflare API token 自动更新"
+            green "2. 在 Dashboard 手动更新"
+            reading "请选择 [1-2，默认2]: " method
+            if [ "$method" = 1 ]; then
+                apply_remote_tunnel_subscription_rule "$SUB_HTTPS_DOMAIN" "$path_regex" "$port" \
+                    "$SUB_HTTPS_DOMAIN_MODE" "$SUB_HTTPS_DOMAIN" "$path_regex" "$https_url" && operation_ok=1
+            else
+                print_manual_https_route "$SUB_HTTPS_DOMAIN" "$path_regex" "$port"
+                reading "更新完成后输入 y 进行公网验证: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] && verify_https_subscription "$https_url" && operation_ok=1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+
+    [ "$operation_ok" = 1 ] || return 1
+    SUB_HTTPS_VERIFIED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    save_subscription_state
+}
+
+rotate_subscription_token() {
+    local port old_path token new_path host link confirm
+
+    load_subscription_state
+    if [ "$SUB_HTTPS_ENABLED" = 1 ]; then
+        configure_cf_https_subscription 1
+        return $?
+    fi
+
+    port=$(get_nginx_subscription_port 2>/dev/null || true)
+    old_path=$(get_nginx_subscription_paths 2>/dev/null | head -1)
+    [ -n "$port" ] && is_valid_http_subscription_path "$old_path" || {
+        red "未找到有效的 HTTP 订阅，无法轮换密钥。"
+        return 1
+    }
+    yellow "轮换后旧 HTTP 订阅 URL 将立即失效。"
+    reading "确认继续？[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    token=$(generate_subscription_token) || return 1
+    new_path="/${token}"
+    apply_nginx_subscription_config "$port" "$new_path" "" || return 1
+
+    SUB_TOKEN="$token"
+    SUB_HTTP_PATH="$new_path"
+    SUB_HTTPS_ENABLED=0
+    SUB_HTTPS_DOMAIN=''
+    SUB_HTTPS_DOMAIN_MODE=''
+    SUB_HTTPS_PATH=''
+    SUB_TUNNEL_MODE=''
+    SUB_HTTPS_VERIFIED_AT=''
+    save_subscription_state || return 1
+    host=$(get_subscription_host 2>/dev/null || true)
+    link=$(build_http_subscription_url "$host" "$port" "$new_path" 2>/dev/null || true)
+    green "订阅密钥已轮换，新 HTTP 订阅：${purple}${link}${re}"
+}
+
 disable_open_sub() {
     local singbox_installed=$?
     check_singbox &>/dev/null; singbox_installed=$?
@@ -2339,6 +2781,14 @@ disable_open_sub() {
     skyblue "------------"
     green "4. 重启订阅服务"
     skyblue "------------"
+    green "5. 查看订阅链接与详细状态"
+    skyblue "--------------------------"
+    green "6. 配置 Cloudflare HTTPS 订阅"
+    skyblue "---------------------------"
+    green "7. 关闭 Cloudflare HTTPS 订阅"
+    skyblue "---------------------------"
+    green "8. 重新生成订阅密钥"
+    skyblue "------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
     reading "请输入选择: " choice
@@ -2406,6 +2856,13 @@ disable_open_sub() {
             server_ip=$(get_subscription_host)
             allow_port $sub_port/tcp > /dev/null 2>&1
             if apply_nginx_subscription_config "$sub_port" "$current_http_path" "$current_https_path"; then
+                if ! update_cf_https_subscription_origin "$sub_port"; then
+                    [ -r "/etc/nginx/conf.d/sing-box.conf.bak.sb" ] && \
+                        cp -p "/etc/nginx/conf.d/sing-box.conf.bak.sb" "/etc/nginx/conf.d/sing-box.conf"
+                    nginx -t > /dev/null 2>&1 && { nginx -s reload > /dev/null 2>&1 || restart_nginx > /dev/null 2>&1; }
+                    red "Tunnel origin 更新失败，订阅端口已恢复。"
+                    return 1
+                fi
                 link=$(build_http_subscription_url "$server_ip" "$sub_port" "$current_http_path" 2>/dev/null || true)
                 green "\n订阅端口更换成功\n新的订阅链接为：${purple}${link}${re}\n"
             else
@@ -2414,6 +2871,10 @@ disable_open_sub() {
             fi
             ;;
         4) restart_nginx ;;
+        5) show_subscription_status ;;
+        6) configure_cf_https_subscription ;;
+        7) disable_cf_https_subscription ;;
+        8) rotate_subscription_token ;;
         0) menu ;;
         *) red "无效的选项！" ;;
     esac
@@ -2524,11 +2985,22 @@ EOF
                 fi
                 restart_argo; sleep 1; change_argo_domain
             else
-                yellow "输入不匹配，请重新输入"; manage_argo
+                yellow "输入不匹配，请重新输入"; manage_argo; return
+            fi
+            if [ "$ARGO_FIXED_READY" = 1 ] && [ -t 0 ]; then
+                reading "是否同时配置 Cloudflare HTTPS 订阅？[y/N]: " enable_https_subscription
+                [[ "$enable_https_subscription" =~ ^[Yy]$ ]] && configure_cf_https_subscription
             fi
             ;;
         5)
             clear
+            load_subscription_state
+            if [ "$SUB_HTTPS_ENABLED" = 1 ]; then
+                SUB_HTTPS_ENABLED=0
+                SUB_HTTPS_VERIFIED_AT=''
+                save_subscription_state || true
+                yellow "已切换到临时 Tunnel，稳定 HTTPS 订阅状态已暂停；HTTP 订阅保留。"
+            fi
             use_quick_argo_fallback
             if command_exists rc-service 2>/dev/null; then alpine_openrc_services
             else main_systemd_services; fi
