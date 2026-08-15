@@ -165,7 +165,7 @@ exec /usr/local/lib/sing-box-pre/sing-box.sh "$@"
 
 Point `/usr/local/bin/sb` and `/usr/bin/sb` to that wrapper, and `/usr/local/bin/sing-box` to `/etc/sing-box/sing-box`. Add an explicit update helper that downloads to the installed directory, requires `bash -n`, preserves `.previous`, and only then renames the new file.
 
-Set `umask 077` before any secret generation. Store fixed Tunnel token in `/etc/sing-box/argo.token` mode 600 and configure cloudflared to read the file through its token-file option; store JSON credentials mode 600. Do not print fixed credentials after input, and use `read -rs` for interactive token entry.
+Set `umask 077` before any secret generation. Store fixed Tunnel token as `TUNNEL_TOKEN=...` in `/etc/sing-box/argo.env` mode 600, reference it with systemd `EnvironmentFile=-/etc/sing-box/argo.env` (or OpenRC's root-only environment file), and run `cloudflared tunnel --no-autoupdate run` without a token argument. Store JSON credentials mode 600. Do not print fixed credentials after input, and use `read -rs` for interactive token entry.
 
 Replace the third-party proxy-check URL with local:
 

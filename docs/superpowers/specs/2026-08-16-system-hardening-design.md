@@ -46,7 +46,7 @@ HY2 端口跳跃使用脚本专用 chain 或带唯一 comment 的精确规则；
 
 ### 5. 凭据和配置权限
 
-脚本默认 `umask 077`。包含 UUID、Reality 私钥、WARP、Argo JSON/token 或代理凭据的文件使用 `0600`。固定 Argo token 不写进 world-readable unit，也不通过交互明文回显；服务从 root-only 凭据文件读取。
+脚本默认 `umask 077`。包含 UUID、Reality 私钥、WARP、Argo JSON/token 或代理凭据的文件使用 `0600`。固定 Argo token 不写进 world-readable unit，也不通过交互明文回显；服务通过 root-only `EnvironmentFile` 注入 `TUNNEL_TOKEN`，命令行不包含 token。
 
 Socks/HTTP 出站健康检查使用本机 `curl --proxy`，完整代理 URL 不发送给第三方检测站点。
 
