@@ -782,6 +782,322 @@ apply_local_tunnel_subscription_rule() {
     fi
 }
 
+build_remote_tunnel_config() {
+    local current_config="${1:-}"
+    local domain="${2:-}"
+    local path_regex="${3:-}"
+    local service="${4:-}"
+    local mode="${5:-}"
+    local old_domain="${6:-}"
+    local old_path_regex="${7:-}"
+    local jq_bin="${JQ_BIN:-jq}"
+
+    is_valid_subscription_domain "$domain" || return 1
+    is_valid_tunnel_subscription_regex "$path_regex" || return 1
+    [[ "$service" =~ ^http://(127\.0\.0\.1|localhost):[0-9]+$ ]] || return 1
+    [[ "$mode" == reuse || "$mode" == separate ]] || return 1
+
+    printf '%s' "$current_config" | "$jq_bin" -ce \
+        --arg host "$domain" \
+        --arg path "$path_regex" \
+        --arg service "$service" \
+        --arg mode "$mode" \
+        --arg old_host "$old_domain" \
+        --arg old_path "$old_path_regex" '
+        def is_catchall:
+            type == "object" and
+            .service == "http_status:404" and
+            (has("hostname") | not) and
+            (has("path") | not);
+        def without_owned($rules):
+            $rules
+            | map(select(
+                if ($old_host != "" and $old_path != "") then
+                    ((.hostname? == $old_host and .path? == $old_path) | not)
+                else true end
+            ))
+            | map(select(
+                ((.hostname? == $host and .path? == $path and .service? == $service) | not)
+            ));
+        if type != "object" or
+           (.ingress | type) != "array" or
+           (.ingress | length) == 0 or
+           (.ingress | all(.[]; type == "object") | not) or
+           (.ingress[-1] | is_catchall | not) then
+            error("invalid remote Tunnel ingress")
+        else
+            .ingress = without_owned(.ingress)
+            | .ingress as $rules
+            | {hostname: $host, path: $path, service: $service} as $new_rule
+            | if $mode == "reuse" then
+                ($rules | map((.hostname? == $host) and (has("path") | not)) | index(true)) as $index
+                | if $index == null then
+                    error("reuse hostname rule not found")
+                  else
+                    .ingress = ($rules[0:$index] + [$new_rule] + $rules[$index:])
+                  end
+              else
+                .ingress = ($rules[0:-1] + [$new_rule] + [$rules[-1]])
+              end
+        end
+    '
+}
+
+remove_remote_tunnel_subscription_rule() {
+    local current_config="${1:-}"
+    local domain="${2:-}"
+    local path_regex="${3:-}"
+    local jq_bin="${JQ_BIN:-jq}"
+
+    is_valid_subscription_domain "$domain" || return 1
+    is_valid_tunnel_subscription_regex "$path_regex" || return 1
+    printf '%s' "$current_config" | "$jq_bin" -ce \
+        --arg host "$domain" --arg path "$path_regex" '
+        if type != "object" or (.ingress | type) != "array" then
+            error("invalid remote Tunnel config")
+        else
+            .ingress |= map(select((.hostname? == $host and .path? == $path) | not))
+        end
+    '
+}
+
+build_dns_change_plan() {
+    local current_records="${1:-}"
+    local tunnel_id="${2:-}"
+    local domain="${3:-}"
+    local jq_bin="${JQ_BIN:-jq}"
+    local target="${tunnel_id}.cfargotunnel.com"
+
+    [[ "$tunnel_id" =~ ^[A-Za-z0-9-]{16,128}$ ]] || return 1
+    is_valid_subscription_domain "$domain" || return 1
+    printf '%s' "$current_records" | "$jq_bin" -ce \
+        --arg domain "$domain" --arg target "$target" '
+        if type != "array" or length > 1 then
+            error("ambiguous DNS record set")
+        else
+            {
+                type: "CNAME",
+                name: $domain,
+                content: $target,
+                proxied: true,
+                ttl: 1
+            } as $desired
+            | if length == 0 then
+                {action: "create", original: null, desired: $desired}
+              elif .[0].type == "CNAME" and
+                   .[0].content == $target and
+                   .[0].proxied == true then
+                {action: "noop", original: .[0], desired: $desired}
+              else
+                {action: "update", original: .[0], desired: $desired}
+              end
+        end
+    '
+}
+
+cloudflare_api() {
+    local method="${1:-}"
+    local url="${2:-}"
+    local body_file="${3:-}"
+
+    [[ "${CF_API_TOKEN:-}" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || return 1
+    if [ -n "$body_file" ]; then
+        {
+            printf 'header = "Authorization: Bearer %s"\n' "$CF_API_TOKEN"
+            printf 'header = "Content-Type: application/json"\n'
+        } | curl -q --config - -fsS -X "$method" "$url" --data-binary "@$body_file"
+    else
+        {
+            printf 'header = "Authorization: Bearer %s"\n' "$CF_API_TOKEN"
+            printf 'header = "Content-Type: application/json"\n'
+        } | curl -q --config - -fsS -X "$method" "$url"
+    fi
+}
+
+rollback_remote_tunnel_configuration() {
+    local account_id="${1:-}"
+    local tunnel_id="${2:-}"
+    local old_config_file="${3:-}"
+    local response_file="${4:-}"
+    local jq_bin="${JQ_BIN:-jq}"
+    local body_file
+
+    [ -r "$old_config_file" ] && [ -n "$response_file" ] || return 1
+    body_file=$(mktemp "$(dirname "$old_config_file")/.rollback-config.XXXXXX") || return 1
+    "$jq_bin" -cn --slurpfile config "$old_config_file" '{config: $config[0]}' > "$body_file" || {
+        rm -f "$body_file"
+        return 1
+    }
+    cloudflare_api PUT \
+        "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" \
+        "$body_file" > "$response_file" 2>/dev/null
+    local rc=$?
+    rm -f "$body_file"
+    [ "$rc" -eq 0 ] && "$jq_bin" -e '.success == true' "$response_file" > /dev/null 2>&1
+}
+
+rollback_cloudflare_dns_change() {
+    local zone_id="${1:-}"
+    local plan_file="${2:-}"
+    local new_record_id="${3:-}"
+    local response_file="${4:-}"
+    local jq_bin="${JQ_BIN:-jq}"
+    local action record_id body_file
+
+    [ -r "$plan_file" ] && [ -n "$response_file" ] || return 1
+    action=$("$jq_bin" -r '.action' "$plan_file") || return 1
+    case "$action" in
+        create)
+            [ -n "$new_record_id" ] || return 1
+            cloudflare_api DELETE \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${new_record_id}" \
+                > "$response_file" 2>/dev/null
+            ;;
+        update)
+            record_id=$("$jq_bin" -r '.original.id // empty' "$plan_file")
+            [ -n "$record_id" ] || return 1
+            body_file=$(mktemp "$(dirname "$plan_file")/.rollback-dns.XXXXXX") || return 1
+            "$jq_bin" '{type, name, content, proxied, ttl}' \
+                < <("$jq_bin" '.original' "$plan_file") > "$body_file" || {
+                rm -f "$body_file"
+                return 1
+            }
+            cloudflare_api PUT \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
+                "$body_file" > "$response_file" 2>/dev/null
+            local rc=$?
+            rm -f "$body_file"
+            return "$rc"
+            ;;
+        noop) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+apply_remote_tunnel_subscription_rule() {
+    local domain="${1:-}"
+    local path_regex="${2:-}"
+    local port="${3:-}"
+    local mode="${4:-}"
+    local old_domain="${5:-}"
+    local old_path_regex="${6:-}"
+    local verify_url="${7:-}"
+    local jq_bin="${JQ_BIN:-jq}"
+    local account_id tunnel_id zone_id CF_API_TOKEN
+    local tmp_dir get_response old_config new_config put_body put_response
+    local dns_response dns_records dns_plan dns_body dns_apply_response dns_action
+    local new_record_id='' remote_updated=0 dns_changed=0 operation_ok=0
+
+    is_valid_subscription_domain "$domain" || return 1
+    is_valid_tunnel_subscription_regex "$path_regex" || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+    [[ "$mode" == reuse || "$mode" == separate ]] || return 1
+
+    reading "请输入 Cloudflare Account ID: " account_id
+    reading "请输入 Cloudflare Tunnel ID: " tunnel_id
+    [[ "$account_id" =~ ^[A-Fa-f0-9]{32}$ ]] || { red "Account ID 格式无效"; return 1; }
+    [[ "$tunnel_id" =~ ^[A-Za-z0-9-]{16,128}$ ]] || { red "Tunnel ID 格式无效"; return 1; }
+    if [ "$mode" = separate ]; then
+        reading "请输入该域名所在的 Cloudflare Zone ID: " zone_id
+        [[ "$zone_id" =~ ^[A-Fa-f0-9]{32}$ ]] || { red "Zone ID 格式无效"; return 1; }
+    fi
+    read -r -s -p "$(red '请输入 Cloudflare API token（输入不会显示）: ')" CF_API_TOKEN
+    echo ""
+    [[ "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || {
+        unset CF_API_TOKEN
+        red "Cloudflare API token 格式无效"
+        return 1
+    }
+
+    tmp_dir=$(mktemp -d "${work_dir}/.cf-subscription.XXXXXX") || { unset CF_API_TOKEN; return 1; }
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    get_response="${tmp_dir}/get-response.json"
+    old_config="${tmp_dir}/old-config.json"
+    new_config="${tmp_dir}/new-config.json"
+    put_body="${tmp_dir}/put-body.json"
+    put_response="${tmp_dir}/put-response.json"
+    dns_response="${tmp_dir}/dns-response.json"
+    dns_records="${tmp_dir}/dns-records.json"
+    dns_plan="${tmp_dir}/dns-plan.json"
+    dns_body="${tmp_dir}/dns-body.json"
+    dns_apply_response="${tmp_dir}/dns-apply-response.json"
+
+    while :; do
+        cloudflare_api GET \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" \
+            > "$get_response" 2>/dev/null || break
+        "$jq_bin" -e '.success == true and (.result.config | type == "object")' \
+            "$get_response" > /dev/null || break
+        "$jq_bin" '.result.config' "$get_response" > "$old_config" || break
+
+        build_remote_tunnel_config "$(< "$old_config")" "$domain" "$path_regex" \
+            "http://127.0.0.1:${port}" "$mode" "$old_domain" "$old_path_regex" \
+            > "$new_config" || break
+        "$jq_bin" -cn --slurpfile config "$new_config" '{config: $config[0]}' > "$put_body" || break
+        cloudflare_api PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" \
+            "$put_body" > "$put_response" 2>/dev/null || break
+        "$jq_bin" -e '.success == true' "$put_response" > /dev/null || break
+        remote_updated=1
+
+        if [ "$mode" = separate ]; then
+            cloudflare_api GET \
+                "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=CNAME&name=${domain}" \
+                > "$dns_response" 2>/dev/null || break
+            "$jq_bin" -e '.success == true and (.result | type == "array")' "$dns_response" > /dev/null || break
+            "$jq_bin" '.result' "$dns_response" > "$dns_records" || break
+            build_dns_change_plan "$(< "$dns_records")" "$tunnel_id" "$domain" > "$dns_plan" || break
+            dns_action=$("$jq_bin" -r '.action' "$dns_plan") || break
+            "$jq_bin" '.desired' "$dns_plan" > "$dns_body" || break
+            case "$dns_action" in
+                create)
+                    cloudflare_api POST \
+                        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+                        "$dns_body" > "$dns_apply_response" 2>/dev/null || break
+                    "$jq_bin" -e '.success == true' "$dns_apply_response" > /dev/null || break
+                    new_record_id=$("$jq_bin" -r '.result.id // empty' "$dns_apply_response")
+                    [ -n "$new_record_id" ] || break
+                    dns_changed=1
+                    ;;
+                update)
+                    local existing_record_id
+                    existing_record_id=$("$jq_bin" -r '.original.id // empty' "$dns_plan")
+                    [ -n "$existing_record_id" ] || break
+                    cloudflare_api PUT \
+                        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${existing_record_id}" \
+                        "$dns_body" > "$dns_apply_response" 2>/dev/null || break
+                    "$jq_bin" -e '.success == true' "$dns_apply_response" > /dev/null || break
+                    dns_changed=1
+                    ;;
+                noop) ;;
+                *) break ;;
+            esac
+        fi
+
+        if [ -n "$verify_url" ]; then
+            declare -F verify_https_subscription > /dev/null || break
+            verify_https_subscription "$verify_url" || break
+        fi
+        operation_ok=1
+        break
+    done
+
+    if [ "$operation_ok" != 1 ]; then
+        if [ "$dns_changed" = 1 ]; then
+            rollback_cloudflare_dns_change "$zone_id" "$dns_plan" "$new_record_id" \
+                "${tmp_dir}/dns-rollback-response.json" || true
+        fi
+        if [ "$remote_updated" = 1 ]; then
+            rollback_remote_tunnel_configuration "$account_id" "$tunnel_id" "$old_config" \
+                "${tmp_dir}/tunnel-rollback-response.json" || true
+        fi
+    fi
+
+    unset CF_API_TOKEN
+    rm -rf "$tmp_dir"
+    [ "$operation_ok" = 1 ]
+}
+
 # 处理防火墙
 allow_port() {
     has_ufw=0
