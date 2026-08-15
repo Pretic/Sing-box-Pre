@@ -3,7 +3,7 @@
 # =========================
 # 老王sing-box四合一安装脚本
 # vless-version-reality|vless-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议]
-# 最后更新时间: 2026.8.15[修复WARP分流自愈、配置校验与失败回滚]
+# 最后更新时间: 2026.8.15[修复WARP共享身份冲突与空闲失活]
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1482,27 +1482,7 @@ EOF
 
     cat > "${conf_dir}/endpoints.json" << EOF
 {
-  "endpoints": [
-    {
-      "type": "wireguard",
-      "tag": "wireguard-out",
-      "mtu": 1280,
-      "address": [
-        "172.16.0.2/32",
-        "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
-      ],
-      "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
-      "peers": [
-        {
-          "address": "engage.cloudflareclient.com",
-          "port": 2408,
-          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "reserved": [78, 135, 76]
-        }
-      ]
-    }
-  ]
+  "endpoints": []
 }
 EOF
 
@@ -3237,30 +3217,226 @@ change_cfip() {
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
 }
 
+# 从 endpoint 对象或 endpoints.json 中提取内置 WARP endpoint。
+extract_warp_endpoint() {
+    local source_file="$1"
+    [ -s "$source_file" ] || return 1
+    jq -c '
+      if (.type? == "wireguard" and .tag? == "wireguard-out") then .
+      elif ((.endpoints? | type) == "array") then
+        first(.endpoints[]? | select(.type == "wireguard" and .tag == "wireguard-out"))
+      else empty end
+    ' "$source_file" 2>/dev/null
+}
+
+# 旧版公开脚本把同一份 WARP 身份写进所有 VPS。该 IPv6 地址只用于
+# 识别并迁移那份旧配置，避免继续发生 WireGuard peer 漫游冲突。
+warp_endpoint_is_legacy() {
+    local endpoint_json="$1"
+    jq -e '
+      (.address // []) |
+      index("2606:4700:110:8dfe:d141:69bb:6b80:925/128") != null
+    ' >/dev/null 2>&1 <<< "$endpoint_json"
+}
+
+warp_endpoint_is_valid() {
+    local endpoint_json="$1"
+    jq -e '
+      type == "object" and
+      .type == "wireguard" and
+      .tag == "wireguard-out" and
+      ((.address | type) == "array" and (.address | length) > 0) and
+      ((.private_key | type) == "string" and (.private_key | length) > 0) and
+      ((.peers | type) == "array" and (.peers | length) > 0) and
+      ((.peers[0].address | type) == "string" and (.peers[0].address | length) > 0) and
+      ((.peers[0].port | type) == "number" and .peers[0].port > 0 and .peers[0].port <= 65535) and
+      ((.peers[0].public_key | type) == "string" and (.peers[0].public_key | length) > 0) and
+      ((.peers[0].allowed_ips | type) == "array" and (.peers[0].allowed_ips | length) > 0) and
+      ((.peers[0].reserved | type) == "array" and (.peers[0].reserved | length) == 3) and
+      ([.peers[0].reserved[] | type == "number" and . >= 0 and . <= 255] | all)
+    ' >/dev/null 2>&1 <<< "$endpoint_json"
+}
+
+# 为当前 VPS 生成独立密钥并直接向 Cloudflare WARP API 注册。
+# 私钥始终在本机生成；账户令牌和 endpoint 仅以 600 权限保存在本机。
+generate_unique_warp_identity() {
+    local state_dir="${conf_dir}/warp"
+    local register_dir response_file request_file endpoint_file account_file
+    local singbox_bin keypair private_key public_key random_hex install_id fcm_token tos
+    local http_code registered client_id reserved_bytes r1 r2 r3 extra
+    local v4 v6 peer_key attempt
+
+    command_exists curl || { red "生成独立 WARP 身份需要 curl。"; return 1; }
+    command_exists jq || { red "生成独立 WARP 身份需要 jq。"; return 1; }
+    command_exists base64 || { red "生成独立 WARP 身份需要 base64。"; return 1; }
+    command_exists od || { red "生成独立 WARP 身份需要 od。"; return 1; }
+
+    singbox_bin="${work_dir}/${server_name}"
+    if [ ! -x "$singbox_bin" ]; then
+        singbox_bin=$(command -v sing-box 2>/dev/null || true)
+    fi
+    [ -x "$singbox_bin" ] || { red "找不到 sing-box，无法生成 WARP 密钥。"; return 1; }
+
+    mkdir -p "$state_dir" || return 1
+    chmod 700 "$state_dir" 2>/dev/null || true
+    register_dir=$(mktemp -d "${state_dir}/.register.XXXXXX") || return 1
+    request_file="${register_dir}/request.json"
+    response_file="${register_dir}/response.json"
+    endpoint_file="${register_dir}/endpoint.json"
+    account_file="${register_dir}/account.json"
+
+    keypair=$("$singbox_bin" generate wg-keypair 2>/dev/null) || {
+        rm -rf -- "$register_dir"
+        red "生成 WARP WireGuard 密钥失败。"
+        return 1
+    }
+    private_key=$(awk -F': ' '/PrivateKey/{print $2; exit}' <<< "$keypair")
+    public_key=$(awk -F': ' '/PublicKey/{print $2; exit}' <<< "$keypair")
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        rm -rf -- "$register_dir"
+        red "无法解析 WARP WireGuard 密钥。"
+        return 1
+    fi
+
+    random_hex=$(od -An -N96 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    if [ "${#random_hex}" -lt 160 ]; then
+        rm -rf -- "$register_dir"
+        red "无法生成 WARP 注册随机数。"
+        return 1
+    fi
+    install_id="${random_hex:0:22}"
+    fcm_token="${install_id}:APA91b${random_hex:22:134}"
+    tos=$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')
+    jq -n \
+      --arg key "$public_key" \
+      --arg install "$install_id" \
+      --arg fcm "$fcm_token" \
+      --arg tos "$tos" \
+      '{key:$key,install_id:$install,fcm_token:$fcm,tos:$tos,model:"PC",serial_number:$install,locale:"en_US"}' \
+      > "$request_file" || {
+        rm -rf -- "$register_dir"
+        return 1
+      }
+    chmod 600 "$request_file"
+
+    registered=false
+    for attempt in 1 2 3; do
+        http_code=""
+        if http_code=$(curl -sS --location --connect-timeout 10 --max-time 45 \
+          -o "$response_file" -w '%{http_code}' \
+          --request POST 'https://api.cloudflareclient.com/v0a2158/reg' \
+          --header 'User-Agent: okhttp/3.12.1' \
+          --header 'CF-Client-Version: a-6.10-2158' \
+          --header 'Content-Type: application/json' \
+          --data-binary "@${request_file}") && \
+          [ "$http_code" = 200 ] && \
+          jq -e '
+            .id and .token and .config.client_id and
+            .config.interface.addresses.v4 and .config.interface.addresses.v6 and
+            .config.peers[0].public_key
+          ' "$response_file" >/dev/null 2>&1; then
+            registered=true
+            break
+        fi
+        sleep $((attempt * 2))
+    done
+    if [ "$registered" != true ]; then
+        rm -rf -- "$register_dir"
+        red "Cloudflare WARP 注册失败，现有配置未修改。"
+        return 1
+    fi
+
+    client_id=$(jq -r '.config.client_id' "$response_file")
+    read -r r1 r2 r3 extra < <(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1)
+    if [ -z "${r1:-}" ] || [ -z "${r2:-}" ] || [ -z "${r3:-}" ] || [ -n "${extra:-}" ]; then
+        rm -rf -- "$register_dir"
+        red "Cloudflare WARP client_id 无效，现有配置未修改。"
+        return 1
+    fi
+    reserved_bytes=$(jq -n --argjson a "$r1" --argjson b "$r2" --argjson c "$r3" '[$a,$b,$c]')
+    v4=$(jq -r '.config.interface.addresses.v4' "$response_file")
+    v6=$(jq -r '.config.interface.addresses.v6' "$response_file")
+    peer_key=$(jq -r '.config.peers[0].public_key' "$response_file")
+
+    jq -n \
+      --arg private "$private_key" \
+      --arg v4 "$v4" \
+      --arg v6 "$v6" \
+      --arg peer "$peer_key" \
+      --argjson reserved "$reserved_bytes" '
+      {
+        type:"wireguard", tag:"wireguard-out", mtu:1280,
+        address:[
+          (if ($v4 | contains("/")) then $v4 else ($v4 + "/32") end),
+          (if ($v6 | contains("/")) then $v6 else ($v6 + "/128") end)
+        ],
+        private_key:$private,
+        peers:[{
+          address:"engage.cloudflareclient.com", port:2408,
+          public_key:$peer, allowed_ips:["0.0.0.0/0","::/0"],
+          persistent_keepalive_interval:25, reserved:$reserved
+        }]
+      }
+      ' > "$endpoint_file" || {
+        rm -rf -- "$register_dir"
+        return 1
+      }
+    jq --arg private "$private_key" --argjson reserved "$reserved_bytes" \
+      '. + {private_key:$private,reserved:$reserved}' "$response_file" > "$account_file" || {
+        rm -rf -- "$register_dir"
+        return 1
+      }
+    chmod 600 "$response_file" "$endpoint_file" "$account_file"
+
+    local generated_endpoint
+    generated_endpoint=$(extract_warp_endpoint "$endpoint_file")
+    if ! warp_endpoint_is_valid "$generated_endpoint" || warp_endpoint_is_legacy "$generated_endpoint"; then
+        rm -rf -- "$register_dir"
+        red "生成的 WARP endpoint 校验失败，现有配置未修改。"
+        return 1
+    fi
+
+    if command_exists install; then
+        install -m 600 "$endpoint_file" "${state_dir}/endpoint.json" && \
+        install -m 600 "$account_file" "${state_dir}/account.json"
+    else
+        cp "$endpoint_file" "${state_dir}/endpoint.json" && \
+        cp "$account_file" "${state_dir}/account.json" && \
+        chmod 600 "${state_dir}/endpoint.json" "${state_dir}/account.json"
+    fi
+    local install_status=$?
+    rm -rf -- "$register_dir"
+    [ "$install_status" -eq 0 ] || return "$install_status"
+    green "已为本机生成独立 WARP 身份。"
+}
+
 # 输出 sing-box 内置 WARP endpoint。它只供 sing-box 出站使用，
 # 不创建系统网卡，也不会修改宿主机默认路由。
 warp_endpoint_json() {
-    cat <<'EOF'
-{
-  "type": "wireguard",
-  "tag": "wireguard-out",
-  "mtu": 1280,
-  "address": [
-    "172.16.0.2/32",
-    "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
-  ],
-  "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
-  "peers": [
-    {
-      "address": "engage.cloudflareclient.com",
-      "port": 2408,
-      "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "allowed_ips": ["0.0.0.0/0", "::/0"],
-      "reserved": [78, 135, 76]
-    }
-  ]
-}
-EOF
+    local current_endpoint state_endpoint endpoint_file state_file
+    endpoint_file="${conf_dir}/endpoints.json"
+    state_file="${conf_dir}/warp/endpoint.json"
+
+    current_endpoint=$(extract_warp_endpoint "$endpoint_file" 2>/dev/null || true)
+    if [ -n "$current_endpoint" ] && \
+       warp_endpoint_is_valid "$current_endpoint" && \
+       ! warp_endpoint_is_legacy "$current_endpoint"; then
+        jq -c '.peers = [.peers[] | .persistent_keepalive_interval = 25]' <<< "$current_endpoint"
+        return
+    fi
+
+    state_endpoint=$(extract_warp_endpoint "$state_file" 2>/dev/null || true)
+    if [ -z "$state_endpoint" ] || \
+       ! warp_endpoint_is_valid "$state_endpoint" || \
+       warp_endpoint_is_legacy "$state_endpoint"; then
+        yellow "正在为本机注册独立 WARP 身份..."
+        generate_unique_warp_identity || return 1
+        state_endpoint=$(extract_warp_endpoint "$state_file" 2>/dev/null || true)
+    fi
+
+    warp_endpoint_is_valid "$state_endpoint" || return 1
+    warp_endpoint_is_legacy "$state_endpoint" && return 1
+    jq -c '.peers = [.peers[] | .persistent_keepalive_interval = 25]' <<< "$state_endpoint"
 }
 
 warp_rule_sets_json() {
@@ -3529,11 +3705,16 @@ warp_manage() {
 
     echo ""
     green "=== WARP 分流管理 ===\n"
-    if jq -e '.endpoints[]? | select(.tag == "wireguard-out" and .type == "wireguard")' \
-       "${conf_dir}/endpoints.json" >/dev/null 2>&1; then
-        green "内置 WARP 出站: ready（不修改系统默认路由）"
+    local current_warp_endpoint
+    current_warp_endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
+    if [ -n "$current_warp_endpoint" ] && \
+       warp_endpoint_is_valid "$current_warp_endpoint" && \
+       ! warp_endpoint_is_legacy "$current_warp_endpoint"; then
+        green "内置 WARP 出站: ready（本机独立身份，不修改系统默认路由）"
+    elif [ -n "$current_warp_endpoint" ] && warp_endpoint_is_legacy "$current_warp_endpoint"; then
+        yellow "内置 WARP 出站: 旧共享身份（下次设置分流时自动迁移）"
     else
-        yellow "内置 WARP 出站: 未初始化（首次设置分流时自动创建）"
+        yellow "内置 WARP 出站: 未初始化（首次设置分流时自动注册独立身份）"
     fi
     green "当前已启用的分流规则集:"
     jq -r '.route.rules[] | select(.rule_set != null) | "\(.rule_set[]?) -> \(.outbound // "unknown")\(if .ip_version == 6 then " (IPv6)" else "" end)"' \

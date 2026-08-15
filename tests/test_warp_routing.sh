@@ -16,6 +16,10 @@ fail() {
 }
 
 for function_name in \
+    extract_warp_endpoint \
+    warp_endpoint_is_legacy \
+    warp_endpoint_is_valid \
+    generate_unique_warp_identity \
     warp_endpoint_json \
     warp_rule_sets_json \
     ensure_warp_prerequisites \
@@ -29,7 +33,7 @@ for function_name in \
         fail "${function_name} is not implemented"
 done
 
-warp_block=$(sed -n '/^warp_endpoint_json() {/,/^warp_manage() {/p' "$script" | sed '$d')
+warp_block=$(sed -n '/^extract_warp_endpoint() {/,/^warp_manage() {/p' "$script" | sed '$d')
 [[ -n "$warp_block" ]] || fail 'WARP helper block could not be extracted'
 source /dev/stdin <<< "$warp_block"
 
@@ -65,6 +69,26 @@ reset_fixture() {
     MOCK_VALIDATE_STATUS=0
     MOCK_RESTART_STATUS=0
     MOCK_RESTART_CALLS=0
+
+    mkdir -p "$conf_dir/warp"
+    cat > "$conf_dir/warp/endpoint.json" <<'EOF'
+{
+  "type": "wireguard",
+  "tag": "wireguard-out",
+  "mtu": 1280,
+  "address": ["172.16.0.2/32", "2606:4700:110:8abc::1234/128"],
+  "private_key": "test-unique-private-key",
+  "peers": [{
+    "address": "engage.cloudflareclient.com",
+    "port": 2408,
+    "public_key": "test-peer-public-key",
+    "allowed_ips": ["0.0.0.0/0", "::/0"],
+    "persistent_keepalive_interval": 25,
+    "reserved": [1, 2, 3]
+  }]
+}
+EOF
+    chmod 600 "$conf_dir/warp/endpoint.json"
 }
 
 write_custom_fixture() {
@@ -99,6 +123,13 @@ jq -e '.outbounds | any(.tag == "custom-proxy")' "$outbound_file" >/dev/null || 
     fail 'custom outbound was not preserved'
 jq -e '.endpoints | any(.tag == "wireguard-out" and .type == "wireguard")' "$conf_dir/endpoints.json" >/dev/null || \
     fail 'wireguard-out endpoint was not repaired'
+jq -e '.endpoints | any(
+    .tag == "wireguard-out" and
+    (.address | index("2606:4700:110:8abc::1234/128")) and
+    (.peers | any((.reserved | length) == 3)) and
+    (.peers | any(.persistent_keepalive_interval == 25))
+)' "$conf_dir/endpoints.json" >/dev/null || \
+    fail 'wireguard-out endpoint did not use persisted unique state with reserved bytes and keepalive'
 jq -e '.endpoints | any(.tag == "custom-endpoint")' "$conf_dir/endpoints.json" >/dev/null || \
     fail 'custom endpoint was not preserved'
 jq -e '.route.rule_set | any(.tag == "streaming")' "$route_file" >/dev/null || \
@@ -109,6 +140,17 @@ jq -e '.route.rules | any(.domain_suffix == ["example.com"])' "$route_file" >/de
     fail 'unrelated route rule was not preserved'
 [[ "$(jq -r '.route.final' "$route_file")" == custom-proxy ]] || \
     fail 'existing route final was overwritten during repair'
+
+cat > "$conf_dir/endpoints.json" <<'EOF'
+{"endpoints":[{"type":"wireguard","tag":"wireguard-out","address":["172.16.0.2/32","2606:4700:110:8dfe:d141:69bb:6b80:925/128"],"private_key":"legacy","peers":[{"public_key":"legacy","reserved":[78,135,76]}]}]}
+EOF
+ensure_warp_prerequisites
+jq -e '.endpoints | any(
+    .tag == "wireguard-out" and
+    (.address | index("2606:4700:110:8abc::1234/128")) and
+    ((.address | index("2606:4700:110:8dfe:d141:69bb:6b80:925/128")) | not)
+)' "$conf_dir/endpoints.json" >/dev/null || \
+    fail 'legacy shared WARP identity was not migrated to persisted unique state'
 
 add_service_route google wireguard-out true
 [[ "$(jq -r '.route.rules[0].action' "$route_file")" == sniff ]] || \
@@ -190,6 +232,9 @@ grep -Fq '10. 常见流媒体（聚合规则）' "$script" || \
     fail 'common streaming menu item is missing'
 grep -Fq '内置 WARP 出站:' "$script" || \
     fail 'WARP readiness status is missing'
+if grep -Fq 'YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=' "$script"; then
+    fail 'legacy shared WARP private key is still embedded in the public script'
+fi
 if grep -Fq 'rm -rf ${route_file} ${conf_dir}/endpoints.json' "$script"; then
     fail 'global proxy still deletes route and endpoint files'
 fi
