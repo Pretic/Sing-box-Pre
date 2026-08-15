@@ -25,7 +25,7 @@ validate_port_value() {
     local value="${1:-}"
     local label="${2:-port}"
 
-    [[ "$value" =~ ^[0-9]+$ ]] && \
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] && \
         [ "$value" -ge 1 ] 2>/dev/null && [ "$value" -le 65535 ] 2>/dev/null || {
         echo "${label} 必须是 1-65535 的整数。" >&2
         return 1
@@ -62,7 +62,9 @@ get_listener_address() {
     local bindv6only="${3:-0}"
 
     [[ "$has_v4" =~ ^[01]$ && "$has_v6" =~ ^[01]$ && "$bindv6only" =~ ^[01]$ ]] || return 1
-    if [ "$has_v6" = 1 ] && { [ "$has_v4" = 0 ] || [ "$bindv6only" = 0 ]; }; then
+    if [ "$has_v4" = 1 ] && [ "$has_v6" = 1 ] && [ "$bindv6only" = 1 ]; then
+        printf '%s\n' '0.0.0.0' '::'
+    elif [ "$has_v6" = 1 ] && { [ "$has_v4" = 0 ] || [ "$bindv6only" = 0 ]; }; then
         printf '%s\n' '::'
     elif [ "$has_v4" = 1 ]; then
         printf '%s\n' '0.0.0.0'
@@ -1493,12 +1495,178 @@ allow_port() {
     return "$status"
 }
 
+render_vless_reality_inbound() {
+    local tag="${1:-}"
+    local listen_address="${2:-}"
+
+    [ -n "$tag" ] && [ -n "$listen_address" ] || return 1
+    cat << EOF
+    {
+      "type": "vless",
+      "tag": "$tag",
+      "listen": "$listen_address",
+      "listen_port": $vless_port,
+      "users": [
+        {
+          "uuid": "$uuid",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.iij.ad.jp",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.iij.ad.jp",
+            "server_port": 443
+          },
+          "private_key": "$private_key",
+          "short_id": [""]
+        }
+      }
+    }
+EOF
+}
+
+render_argo_inbound() {
+    cat << EOF
+    {
+      "type": "vless",
+      "tag": "vless-ws-argo",
+      "listen": "127.0.0.1",
+      "listen_port": $argo_port,
+      "users": [
+        {
+          "uuid": "$uuid"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/vless-argo"
+      }
+    }
+EOF
+}
+
+render_hysteria2_inbound() {
+    local tag="${1:-}"
+    local listen_address="${2:-}"
+
+    [ -n "$tag" ] && [ -n "$listen_address" ] || return 1
+    cat << EOF
+    {
+      "type": "hysteria2",
+      "tag": "$tag",
+      "listen": "$listen_address",
+      "listen_port": $hy2_port,
+      "users": [
+        {
+          "password": "$uuid"
+        }
+      ],
+      "ignore_client_bandwidth": false,
+      "masquerade": "https://bing.com",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "min_version": "1.3",
+        "max_version": "1.3",
+        "certificate_path": "$work_dir/cert.pem",
+        "key_path": "$work_dir/private.key"
+      }
+    }
+EOF
+}
+
+render_tuic_inbound() {
+    local tag="${1:-}"
+    local listen_address="${2:-}"
+
+    [ -n "$tag" ] && [ -n "$listen_address" ] || return 1
+    cat << EOF
+    {
+      "type": "tuic",
+      "tag": "$tag",
+      "listen": "$listen_address",
+      "listen_port": $tuic_port,
+      "users": [
+        {
+          "uuid": "$uuid",
+          "password": "$uuid"
+        }
+      ],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "$work_dir/cert.pem",
+        "key_path": "$work_dir/private.key"
+      }
+    }
+EOF
+}
+
+render_inbounds_config() {
+    local has_v4="${1:-0}"
+    local has_v6="${2:-0}"
+    local bindv6only="${3:-0}"
+    local listener suffix separator=''
+    local -a listeners suffixes
+
+    [[ "$has_v4" =~ ^[01]$ && "$has_v6" =~ ^[01]$ && "$bindv6only" =~ ^[01]$ ]] || return 1
+    [ "$has_v4" = 1 ] || [ "$has_v6" = 1 ] || return 1
+
+    if [ "$has_v4" = 1 ] && [ "$has_v6" = 1 ] && [ "$bindv6only" = 0 ]; then
+        listeners=('::')
+        suffixes=('')
+    else
+        if [ "$has_v4" = 1 ]; then
+            listeners+=('0.0.0.0')
+            suffixes+=('')
+        fi
+        if [ "$has_v6" = 1 ]; then
+            listeners+=('::')
+            if [ "$has_v4" = 1 ]; then
+                suffixes+=('-ipv6')
+            else
+                suffixes+=('')
+            fi
+        fi
+    fi
+
+    printf '%s\n' '{' '  "inbounds": ['
+    local index
+    for index in "${!listeners[@]}"; do
+        [ -z "$separator" ] || printf ',\n'
+        listener="${listeners[$index]}"
+        suffix="${suffixes[$index]}"
+        render_vless_reality_inbound "vless-reality${suffix}" "$listener" || return 1
+        separator=1
+    done
+    printf ',\n'
+    render_argo_inbound || return 1
+    for index in "${!listeners[@]}"; do
+        printf ',\n'
+        listener="${listeners[$index]}"
+        suffix="${suffixes[$index]}"
+        render_hysteria2_inbound "hysteria2${suffix}" "$listener" || return 1
+    done
+    for index in "${!listeners[@]}"; do
+        printf ',\n'
+        listener="${listeners[$index]}"
+        suffix="${suffixes[$index]}"
+        render_tuic_inbound "tuic${suffix}" "$listener" || return 1
+    done
+    printf '%s\n' '  ]' '}'
+}
+
 # 下载并安装 sing-box,cloudflared
 install_singbox() {
     local has_v4=0
     local has_v6=0
     local bindv6only=0
-    local listener_address dns_strategy
+    local dns_strategy
 
     clear
     purple "正在安装sing-box中，请稍后..."
@@ -1517,7 +1685,6 @@ install_singbox() {
         return 1
     fi
     bindv6only=$(get_bindv6only)
-    listener_address=$(get_listener_address "$has_v4" "$has_v6" "$bindv6only") || return 1
     if [ "$has_v4" = 1 ]; then
         dns_strategy="prefer_ipv4"
     else
@@ -1598,92 +1765,7 @@ EOF
 }
 EOF
 
-    cat > "${conf_dir}/inbounds.json" << EOF || return 1
-{
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-reality",
-      "listen": "$listener_address",
-      "listen_port": $vless_port,
-      "users": [
-        {
-          "uuid": "$uuid",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.iij.ad.jp",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "www.iij.ad.jp",
-            "server_port": 443
-          },
-          "private_key": "$private_key",
-          "short_id": [""]
-        }
-      }
-    },
-    {
-      "type": "vless",
-      "tag": "vless-ws-argo",
-      "listen": "127.0.0.1",
-      "listen_port": $argo_port,
-      "users": [
-        {
-          "uuid": "$uuid"
-        }
-      ],
-      "transport": {
-        "type": "ws",
-        "path": "/vless-argo"
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hysteria2",
-      "listen": "$listener_address",
-      "listen_port": $hy2_port,
-      "users": [
-        {
-          "password": "$uuid"
-        }
-      ],
-      "ignore_client_bandwidth": false,
-      "masquerade": "https://bing.com",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "min_version": "1.3",
-        "max_version": "1.3",
-        "certificate_path": "$work_dir/cert.pem",
-        "key_path": "$work_dir/private.key"
-      }
-    },
-    {
-      "type": "tuic",
-      "tag": "tuic",
-      "listen": "$listener_address",
-      "listen_port": $tuic_port,
-      "users": [
-        {
-          "uuid": "$uuid",
-          "password": "$uuid"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "$work_dir/cert.pem",
-        "key_path": "$work_dir/private.key"
-      }
-    }
-  ]
-}
-EOF
+    render_inbounds_config "$has_v4" "$has_v6" "$bindv6only" > "${conf_dir}/inbounds.json" || return 1
 
     cat > "${conf_dir}/outbounds.json" << EOF || return 1
 {
@@ -1993,8 +2075,8 @@ EOF
 
     echo ""
     while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
-    update_sub
-    chmod 644 ${work_dir}/sub.txt
+    update_sub || return 1
+    chmod 644 "${work_dir}/sub.txt" || return 1
     yellow "\n温馨提醒:"
     yellow "如果节点里的ip是ipv6的，可在 修改节点配置 菜单切换ipv4后重新订阅节点\n"
     red "如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
@@ -2177,21 +2259,25 @@ apply_nginx_subscription_config() {
 
 add_nginx_conf() {
     local http_end_line
+    local main_conf="${NGINX_MAIN_CONF:-/etc/nginx/nginx.conf}"
+    local nginx_conf_dir="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
+    local backup_file="${main_conf}.bak.sb"
 
     command_exists nginx || { red "nginx未安装，无法配置订阅服务"; return 1; }
-    mkdir -p /etc/nginx/conf.d
+    mkdir -p "$nginx_conf_dir" || return 1
 
-    if [ -f "/etc/nginx/nginx.conf" ]; then
-        cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.sb > /dev/null 2>&1
-        chmod 600 /etc/nginx/nginx.conf.bak.sb 2>/dev/null || true
+    if [ -f "$main_conf" ]; then
+        cp "$main_conf" "$backup_file" > /dev/null 2>&1 || return 1
+        chmod 600 "$backup_file" 2>/dev/null || return 1
         sed -i -e '15{/include \/etc\/nginx\/modules\/\*\.conf/d;}' \
-               -e '18{/include \/etc\/nginx\/conf\.d\/\*\.conf/d;}' /etc/nginx/nginx.conf > /dev/null 2>&1
-        if ! grep -q "include.*conf.d" /etc/nginx/nginx.conf; then
-            http_end_line=$(grep -n "^}" /etc/nginx/nginx.conf | tail -1 | cut -d: -f1)
-            [ -n "$http_end_line" ] && sed -i "${http_end_line}i \    include /etc/nginx/conf.d/*.conf;" /etc/nginx/nginx.conf > /dev/null 2>&1
+               -e '18{/include \/etc\/nginx\/conf\.d\/\*\.conf/d;}' "$main_conf" > /dev/null 2>&1 || return 1
+        if ! grep -q "include.*conf.d" "$main_conf"; then
+            http_end_line=$(grep -n "^}" "$main_conf" | tail -1 | cut -d: -f1)
+            [ -n "$http_end_line" ] || return 1
+            sed -i "${http_end_line}i \    include ${nginx_conf_dir}/*.conf;" "$main_conf" > /dev/null 2>&1 || return 1
         fi
     else
-        cat > /etc/nginx/nginx.conf << 'EOF'
+        cat > "$main_conf" << EOF || return 1
 user nginx;
 worker_processes auto;
 error_log /var/log/nginx/error.log;
@@ -2204,7 +2290,7 @@ http {
     default_type  application/octet-stream;
     sendfile        on;
     keepalive_timeout  65;
-    include /etc/nginx/conf.d/*.conf;
+    include ${nginx_conf_dir}/*.conf;
 }
 EOF
     fi
@@ -2355,17 +2441,28 @@ uninstall_singbox() {
 
 # 创建快捷指令
 create_shortcut() {
-    [ ! -d "$work_dir" ] && mkdir -p "$work_dir"
-    cat > "$work_dir/sb.sh" << 'EOF'
+    local shortcut_root="${SHORTCUT_ROOT:-}"
+    local local_bin_dir="${shortcut_root}/usr/local/bin"
+    local usr_bin_dir="${shortcut_root}/usr/bin"
+    local local_sb="${local_bin_dir}/sb"
+    local usr_sb="${usr_bin_dir}/sb"
+    local singbox_link="${local_bin_dir}/sing-box"
+
+    if [ ! -d "$work_dir" ]; then
+        mkdir -p "$work_dir" || return 1
+    fi
+    cat > "$work_dir/sb.sh" << 'EOF' || return 1
 #!/usr/bin/env bash
 exec bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) "$@"
 EOF
-    chmod +x "$work_dir/sb.sh"
-    mkdir -p /usr/local/bin /usr/bin
-    ln -sf "$work_dir/sb.sh" /usr/local/bin/sb
-    ln -sf "$work_dir/sb.sh" /usr/bin/sb
-    [ ! -e /usr/local/bin/sing-box ] && ln -sf "$work_dir/sb.sh" /usr/local/bin/sing-box
-    if [ -s /usr/local/bin/sb ] || [ -s /usr/bin/sb ]; then
+    chmod +x "$work_dir/sb.sh" || return 1
+    mkdir -p "$local_bin_dir" "$usr_bin_dir" || return 1
+    ln -sf "$work_dir/sb.sh" "$local_sb" || return 1
+    ln -sf "$work_dir/sb.sh" "$usr_sb" || return 1
+    if [ ! -e "$singbox_link" ]; then
+        ln -sf "$work_dir/sb.sh" "$singbox_link" || return 1
+    fi
+    if [ -s "$local_sb" ] && [ -s "$usr_sb" ]; then
         green "\n快捷指令 sb 创建成功\n"
         return 0
     else
