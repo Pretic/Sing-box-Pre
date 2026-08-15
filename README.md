@@ -109,6 +109,52 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 sb -c
 ```
 
+## 可选的 Cloudflare HTTPS 订阅
+
+脚本默认仍生成 HTTP 原始订阅，不会在一键安装时强制询问域名、Cloudflare API token，也不会自动改变旧安装的订阅地址。HTTPS 是用户主动启用的可选发布方式，只改变订阅文件的访问入口，不改变节点协议、cfy 优选结果或代理数据通路。
+
+### 适用条件与资源开销
+
+- HTTPS 订阅复用脚本已有的 Nginx、`/etc/sing-box/sub.txt`、`cloudflared` 固定 Tunnel，不安装额外常驻转换服务，也不依赖 ACME 证书。
+- 必须使用用户自己的 Cloudflare 域名和固定 Tunnel；临时 `trycloudflare.com` Tunnel 的域名会变化，不适合作为稳定订阅入口。
+- Tunnel 到 Nginx 的源站地址使用 `http://localhost:<订阅端口>`。因此 NAT 机不需要新增公网端口映射，IPv4 单栈、IPv6 单栈和双栈 VPS 都可以使用。
+- 订阅访问只是按需传输一个小文本文件，不把 Nginx 或订阅转换放进节点转发链路，对节点网速和 VPS 负载的影响通常可以忽略。
+
+### 域名模式
+
+推荐复用现有固定 Argo 主机名：
+
+```text
+节点入口：https://argo.example.com/<节点路径>
+订阅入口：https://argo.example.com/sub/<32字符密钥>
+```
+
+这样不需要新增 DNS 记录，脚本会让精确订阅路径规则排在同主机名的节点规则之前。也可使用独立订阅主机名，例如 `https://sub.example.com/<32字符密钥>`；职责更清楚，但需要新增 Published Application，并可能需要创建 DNS 记录。两种模式都复用同一个 Tunnel 和 Nginx。
+
+### 配置方式
+
+添加固定 Tunnel 成功后，脚本会询问是否同时配置 HTTPS 订阅，默认回答为 `N`。也可稍后进入：
+
+```text
+sb → 管理节点订阅 → 配置 Cloudflare HTTPS 订阅
+```
+
+- 本地 JSON 凭据管理的固定 Tunnel：脚本备份本地配置、插入精确路径规则、执行 `cloudflared tunnel ingress validate`，验证失败时自动回滚。
+- token 方式运行的远程管理 Tunnel：可选择 Cloudflare API 自动配置，或按脚本给出的 Hostname、Path、Type 和 URL 在 Dashboard 手动添加后再验证。
+- API token 最小权限为 `Cloudflare Tunnel/Connector Write`；只有独立域名需要脚本自动创建或修改 DNS 时，才额外需要 `DNS Write`。
+- API token 由终端静默读取，只用于本次请求，不写入磁盘、不写入脚本状态文件，也不作为 `curl` 命令行参数显示。Tunnel 启动 token 与 Cloudflare API token 不是同一种凭据。
+
+HTTPS 只有在脚本从公网取得的内容与本机 `/etc/sing-box/sub.txt` 一致后才会成为首选订阅地址。API、DNS、Tunnel、Nginx 或内容验证失败时，脚本回滚本次改动，已有节点不受影响；只要 Nginx 原配置有效，订阅输出会继续回退到 HTTP。
+
+### 密钥、兼容性与菜单语义
+
+- 新密钥固定为 32 个易辨认字符，使用系统随机源生成，与节点 UUID 相互独立；Nginx 只开放对应的精确路径，关闭该路径的访问日志，并返回 `no-store`。
+- V2rayN、Shadowrocket、Nekobox、Loon、Karing、Streisand 直接使用 VPS 发布的 Base64 原始订阅。Clash/Mihomo、Sing-box、Surge 链接仍由 `sublink.eooce.com` 转换；使用第三方转换地址意味着原始订阅 URL 会发送给该服务，请自行评估隐私和可用性。
+- `关闭节点订阅` 会停止 Nginx，因此 HTTP 和经 Tunnel 回源的 HTTPS 都会停止。
+- `关闭 Cloudflare HTTPS 订阅` 只移除 HTTPS 路由和首选状态，保留 HTTP 订阅与节点。
+- `重新生成订阅密钥` 会同步更新 Nginx 与 Tunnel 路由，旧 HTTP/HTTPS 地址随即失效，需要在客户端更新订阅。
+- 首页继续只显示简洁的 Argo、Nginx、sing-box 状态；完整 URL、Tunnel 类型和验证时间在“查看订阅链接与详细状态”二级菜单中显示。
+
 ## 快捷命令
 
 安装完成后可直接使用 `sb`：

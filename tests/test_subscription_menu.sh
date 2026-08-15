@@ -104,6 +104,24 @@ grep -Fq 'Path:' <<< "$manual_source"
 grep -Fq 'Type:' <<< "$manual_source"
 grep -Fq 'http://localhost:' <<< "$manual_source"
 
+for documentation_item in \
+    '## 可选的 Cloudflare HTTPS 订阅' \
+    '默认仍生成 HTTP 原始订阅' \
+    '用户自己的 Cloudflare 域名' \
+    'Cloudflare Tunnel/Connector Write' \
+    'DNS Write' \
+    '不写入磁盘' \
+    'IPv4 单栈' \
+    'IPv6 单栈' \
+    '关闭节点订阅' \
+    '关闭 Cloudflare HTTPS 订阅' \
+    '重新生成订阅密钥'; do
+    grep -Fq "$documentation_item" "$repo_root/README.md" || {
+        echo "FAIL: README does not document: ${documentation_item}" >&2
+        exit 1
+    }
+done
+
 if rg -n 'cfut_|988600\.xyz|sing-box-subscription\.service|sing-box-subscription\.py|subscription-path|localhost:8081' \
     "$script" "$repo_root/README.md"; then
     echo 'FAIL: current private VPS implementation leaked into public runtime files' >&2
