@@ -94,6 +94,18 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sin
 NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
 ```
 
+## WARP 分流
+
+进入 `sb → WARP分流管理 → 设置分流服务`，可以把 OpenAI、Claude、Gemini、Google、TikTok、Twitter、YouTube、Netflix、Telegram或常见流媒体聚合规则交给指定出站：
+
+- 没有添加 Socks5/HTTP 出站时，脚本自动使用 sing-box 内置的 `wireguard-out`。
+- 已添加其他代理时，菜单仍会把“内置 WARP”列为第一个选项，也可以选择已有代理。
+- 未匹配服务继续使用服务器原 IP，脚本不会安装系统级 WARP、创建系统 WireGuard 网卡或修改宿主机默认路由。
+- 双栈 VPS 检测到可用原生 IPv6 时，所选服务的 IPv4 使用 WARP、IPv6 保持直连，避免部分 WARP 配置的 IPv6 路径超时；没有原生 IPv6 的单栈/NAT VPS 不添加该直连回退。
+- NAT 机不需要增加入站映射，但服务商必须允许 VPS 向 Cloudflare WARP endpoint 发起出站 UDP 连接。
+
+菜单会显示 `wireguard-out` 是否就绪。首次设置规则时会自动补齐缺失的 endpoint、规则集和 `direct` 出站；修改前后执行完整配置校验，校验或重启失败会恢复原路由。全局代理与恢复直连会清空选择性分流规则并显式调整 `route.final`，不再删除 `route.json`、`endpoints.json` 或 `direct` 出站。
+
 ## 订阅与 cfy 联动
 
 - 对外订阅地址默认使用 IPv4 公网地址生成，避免 VPS 没有 IPv6 时订阅 URL 不可访问；默认等同 `SUB_ADDR_FAMILY=ipv4`。

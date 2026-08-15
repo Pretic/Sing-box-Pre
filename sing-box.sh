@@ -3,7 +3,7 @@
 # =========================
 # 老王sing-box四合一安装脚本
 # vless-version-reality|vless-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议]
-# 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
+# 最后更新时间: 2026.8.15[修复WARP分流自愈、配置校验与失败回滚]
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1518,9 +1518,10 @@ EOF
       {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
       {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
-      {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
+      {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"},
+      {"tag":"streaming","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/proxymedia.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [],
     "final": "direct"
   }
 }
@@ -3236,6 +3237,285 @@ change_cfip() {
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
 }
 
+# 输出 sing-box 内置 WARP endpoint。它只供 sing-box 出站使用，
+# 不创建系统网卡，也不会修改宿主机默认路由。
+warp_endpoint_json() {
+    cat <<'EOF'
+{
+  "type": "wireguard",
+  "tag": "wireguard-out",
+  "mtu": 1280,
+  "address": [
+    "172.16.0.2/32",
+    "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
+  ],
+  "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
+  "peers": [
+    {
+      "address": "engage.cloudflareclient.com",
+      "port": 2408,
+      "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+      "allowed_ips": ["0.0.0.0/0", "::/0"],
+      "reserved": [78, 135, 76]
+    }
+  ]
+}
+EOF
+}
+
+warp_rule_sets_json() {
+    cat <<'EOF'
+[
+  {"tag":"gemini","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/gemini.srs","download_detour":"direct"},
+  {"tag":"claude","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/claude.srs","download_detour":"direct"},
+  {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
+  {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
+  {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
+  {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
+  {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
+  {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
+  {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"},
+  {"tag":"streaming","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/proxymedia.srs","download_detour":"direct"}
+]
+EOF
+}
+
+restore_warp_file_backups() {
+    local backup_dir="$1"
+    shift
+    local target_file target_name
+
+    for target_file in "$@"; do
+        target_name=$(basename "$target_file")
+        if [ -e "${backup_dir}/had-${target_name}" ]; then
+            cp -p "${backup_dir}/${target_name}" "$target_file" 2>/dev/null || \
+                cp "${backup_dir}/${target_name}" "$target_file" || true
+        else
+            rm -f -- "$target_file"
+        fi
+    done
+}
+
+# 补齐 direct、WARP endpoint 与分流规则集。三份配置作为一个整体校验，
+# 任一候选文件无效时同时回滚，避免留下“菜单成功、endpoint 缺失”的半配置。
+ensure_warp_prerequisites() {
+    local endpoint_file="${conf_dir}/endpoints.json"
+    local current_route_file="${conf_dir}/route.json"
+    local current_outbound_file="${conf_dir}/outbounds.json"
+    local endpoint_tmp route_tmp outbound_tmp backup_dir
+    local warp_endpoint required_rule_sets target_file target_name
+    local -a target_files
+
+    command_exists jq || { red "WARP 分流需要 jq。"; return 1; }
+    mkdir -p "$conf_dir" || return 1
+
+    warp_endpoint=$(warp_endpoint_json) || return 1
+    required_rule_sets=$(warp_rule_sets_json) || return 1
+    jq -e . >/dev/null 2>&1 <<< "$warp_endpoint" || return 1
+    jq -e . >/dev/null 2>&1 <<< "$required_rule_sets" || return 1
+
+    endpoint_tmp=$(mktemp "${conf_dir}/.tmp.endpoints.XXXXXX") || return 1
+    route_tmp=$(mktemp "${conf_dir}/.tmp.route.XXXXXX") || { rm -f "$endpoint_tmp"; return 1; }
+    outbound_tmp=$(mktemp "${conf_dir}/.tmp.outbounds.XXXXXX") || { rm -f "$endpoint_tmp" "$route_tmp"; return 1; }
+    backup_dir=$(mktemp -d "${conf_dir}/.warp-backup.XXXXXX") || {
+        rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
+        return 1
+    }
+
+    target_files=("$endpoint_file" "$current_route_file" "$current_outbound_file")
+    for target_file in "${target_files[@]}"; do
+        target_name=$(basename "$target_file")
+        if [ -e "$target_file" ]; then
+            cp -p "$target_file" "${backup_dir}/${target_name}" 2>/dev/null || \
+                cp "$target_file" "${backup_dir}/${target_name}" || {
+                    rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
+                    rm -rf -- "$backup_dir"
+                    return 1
+                }
+            : > "${backup_dir}/had-${target_name}"
+        fi
+    done
+
+    if [ -s "$endpoint_file" ] && jq empty "$endpoint_file" >/dev/null 2>&1; then
+        jq --argjson warp "$warp_endpoint" '
+          .endpoints = ([.endpoints[]? | select(.tag != "wireguard-out")] + [$warp])
+        ' "$endpoint_file" > "$endpoint_tmp"
+    else
+        jq -n --argjson warp "$warp_endpoint" '{endpoints: [$warp]}' > "$endpoint_tmp"
+    fi || {
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
+        rm -rf -- "$backup_dir"
+        return 1
+    }
+
+    if [ -s "$current_route_file" ] && jq empty "$current_route_file" >/dev/null 2>&1; then
+        jq --argjson required "$required_rule_sets" '
+          .route = (if (.route | type) == "object" then .route else {} end) |
+          (.route.rule_set // []) as $current |
+          .route.rule_set = ([
+            ($current | if type == "array" then .[] else empty end) |
+            select(.tag as $tag | ($required | map(.tag) | index($tag) | not))
+          ] + $required) |
+          .route.rules = (if (.route.rules | type) == "array" then .route.rules else [] end) |
+          .route.final = (if (.route.final | type) == "string" and (.route.final | length) > 0 then .route.final else "direct" end)
+        ' "$current_route_file" > "$route_tmp"
+    else
+        jq -n --argjson required "$required_rule_sets" \
+           '{route: {rule_set: $required, rules: [], final: "direct"}}' > "$route_tmp"
+    fi || {
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
+        rm -rf -- "$backup_dir"
+        return 1
+    }
+
+    if [ -s "$current_outbound_file" ] && jq empty "$current_outbound_file" >/dev/null 2>&1; then
+        jq '
+          .outbounds = ([{"type":"direct","tag":"direct"}] + [
+            .outbounds[]? | select(.tag != "direct")
+          ])
+        ' "$current_outbound_file" > "$outbound_tmp"
+    else
+        jq -n '{outbounds: [{type:"direct",tag:"direct"}]}' > "$outbound_tmp"
+    fi || {
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
+        rm -rf -- "$backup_dir"
+        return 1
+    }
+
+    if ! jq empty "$endpoint_tmp" >/dev/null 2>&1 || \
+       ! jq empty "$route_tmp" >/dev/null 2>&1 || \
+       ! jq empty "$outbound_tmp" >/dev/null 2>&1 || \
+       ! mv -f "$endpoint_tmp" "$endpoint_file" || \
+       ! mv -f "$route_tmp" "$current_route_file" || \
+       ! mv -f "$outbound_tmp" "$current_outbound_file"; then
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
+        rm -rf -- "$backup_dir"
+        red "WARP 前置配置生成失败，已回滚。"
+        return 1
+    fi
+
+    chmod 600 "$endpoint_file" 2>/dev/null || true
+    chmod 644 "$current_route_file" "$current_outbound_file" 2>/dev/null || true
+    if ! validate_singbox_config; then
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        rm -rf -- "$backup_dir"
+        red "WARP 前置配置校验失败，已回滚。"
+        return 1
+    fi
+
+    rm -rf -- "$backup_dir"
+}
+
+restart_singbox_checked() {
+    yellow "正在重启 sing-box 服务\n"
+    if command_exists rc-service; then
+        rc-service sing-box restart
+    elif command_exists systemctl; then
+        systemctl daemon-reload && systemctl restart sing-box
+    else
+        red "找不到可用的服务管理器，sing-box 未重启。"
+        return 1
+    fi
+    local restart_status=$?
+    if [ "$restart_status" -eq 0 ]; then
+        green "sing-box 服务已成功重启\n"
+        return 0
+    fi
+    red "sing-box 服务重启失败\n"
+    return "$restart_status"
+}
+
+# 对 route.json 做单文件事务：生成、全配置校验、重启；失败时恢复并重启旧配置。
+apply_warp_route_update() {
+    local jq_filter="$1"
+    shift
+    local current_route_file="${route_file:-${conf_dir}/route.json}"
+    local route_tmp route_backup
+
+    [ -s "$current_route_file" ] && jq empty "$current_route_file" >/dev/null 2>&1 || return 1
+    route_tmp=$(mktemp "${conf_dir}/.tmp.route.XXXXXX") || return 1
+    route_backup=$(mktemp "${conf_dir}/.bak.route.XXXXXX") || { rm -f "$route_tmp"; return 1; }
+    cp -p "$current_route_file" "$route_backup" 2>/dev/null || cp "$current_route_file" "$route_backup" || {
+        rm -f "$route_tmp" "$route_backup"
+        return 1
+    }
+
+    if ! jq "$@" "$jq_filter" "$current_route_file" > "$route_tmp" || \
+       ! jq empty "$route_tmp" >/dev/null 2>&1 || \
+       ! mv -f "$route_tmp" "$current_route_file" || \
+       ! validate_singbox_config; then
+        mv -f "$route_backup" "$current_route_file" >/dev/null 2>&1 || true
+        rm -f "$route_tmp"
+        red "sing-box 路由配置校验失败，已回滚。"
+        return 1
+    fi
+
+    if ! restart_singbox_checked; then
+        mv -f "$route_backup" "$current_route_file" >/dev/null 2>&1 || true
+        restart_singbox_checked >/dev/null 2>&1 || true
+        red "sing-box 重启失败，已恢复原路由配置。"
+        return 1
+    fi
+
+    rm -f "$route_backup"
+}
+
+add_service_route() {
+    local rule_tag="$1"
+    local selected_out="$2"
+    local ipv6_direct_fallback="${3:-false}"
+
+    apply_warp_route_update '
+      def managed_sniff:
+        (.action? == "sniff" and .port? == [80, 443] and (keys | length) == 2);
+      .route.rules = [
+        .route.rules[]? |
+        if ((.rule_set? | type) == "array") then .rule_set -= [$tag] else . end |
+        select(((.rule_set? | type) != "array") or ((.rule_set | length) > 0)) |
+        select(managed_sniff | not)
+      ] |
+      .route.rules = [{"port":[80,443],"action":"sniff"}] + .route.rules |
+      if ($fallback and $out == "wireguard-out") then
+        .route.rules += [
+          {"rule_set":[$tag],"ip_version":6,"action":"route","outbound":"direct"},
+          {"rule_set":[$tag],"action":"route","outbound":$out}
+        ]
+      else
+        .route.rules += [{"rule_set":[$tag],"action":"route","outbound":$out}]
+      end
+    ' --arg tag "$rule_tag" --arg out "$selected_out" --argjson fallback "$ipv6_direct_fallback"
+}
+
+delete_service_route() {
+    local rule_tag="$1"
+    apply_warp_route_update '
+      .route.rules = [
+        .route.rules[]? |
+        if ((.rule_set? | type) == "array") then .rule_set -= [$tag] else . end |
+        select(((.rule_set? | type) != "array") or ((.rule_set | length) > 0))
+      ]
+    ' --arg tag "$rule_tag"
+}
+
+set_global_route() {
+    local selected_out="$1"
+    apply_warp_route_update '.route.rules = [] | .route.final = $out' --arg out "$selected_out"
+}
+
+restore_direct_route() {
+    apply_warp_route_update '.route.rules = [] | .route.final = "direct"'
+}
+
+native_ipv6_available() {
+    local native_ipv6
+    native_ipv6=$(get_public_ipv6 2>/dev/null || true)
+    [ -n "$native_ipv6" ]
+}
+
 # WARP 分流管理
 warp_manage() {
     check_singbox &>/dev/null
@@ -3249,15 +3529,22 @@ warp_manage() {
 
     echo ""
     green "=== WARP 分流管理 ===\n"
+    if jq -e '.endpoints[]? | select(.tag == "wireguard-out" and .type == "wireguard")' \
+       "${conf_dir}/endpoints.json" >/dev/null 2>&1; then
+        green "内置 WARP 出站: ready（不修改系统默认路由）"
+    else
+        yellow "内置 WARP 出站: 未初始化（首次设置分流时自动创建）"
+    fi
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
-        echo -e " - ${skyblue}$tag${re}"
+    jq -r '.route.rules[] | select(.rule_set != null) | "\(.rule_set[]?) -> \(.outbound // "unknown")\(if .ip_version == 6 then " (IPv6)" else "" end)"' \
+        "$route_file" 2>/dev/null | sort -u | while read -r mapping; do
+        echo -e " - ${skyblue}${mapping}${re}"
     done || echo "  无"
     green "\n已添加的socks/http代理出站:"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
     echo ""
-    green "1. 设置分流服务 (未添加socks/http直接设置则使用WARP)"
+    green "1. 设置分流服务 (内置WARP或已添加的socks/http)"
     skyblue "----------------------"
     red "2. 删除分流服务"
     skyblue "--------------"
@@ -3293,9 +3580,10 @@ add_rule_menu() {
     green "7.  YouTube"
     green "8.  Netflix"
     green "9.  Telegram"
+    green "10. 常见流媒体（聚合规则）"
     skyblue "-----------------------------"
-    green "10. 设置全局代理出站 (所有流量走指定代理)"
-    green "11. 恢复服务器原IP出站 (所有流量走服务器ip)"
+    green "11. 设置全局代理出站 (所有流量走指定代理)"
+    green "12. 恢复服务器原IP出站 (所有流量走服务器ip)"
     skyblue "-----------------------------"
     purple "0.  返回上级菜单"
     skyblue "-----------------------------"
@@ -3310,11 +3598,17 @@ add_rule_menu() {
         7)  rule_tag="youtube"  ;;
         8)  rule_tag="netflix"  ;;
         9)  rule_tag="telegram" ;;
-        10) set_global_outbound; return ;;
-        11) restore_direct_outbound; return ;;
+        10) rule_tag="streaming" ;;
+        11) set_global_outbound; return ;;
+        12) restore_direct_outbound; return ;;
         0)  warp_manage; return ;;
         *)  red "无效选项"; sleep 1; add_rule_menu; return ;;
     esac
+
+    if ! ensure_warp_prerequisites; then
+        red "无法初始化 WARP endpoint 或分流规则集。"
+        sleep 2; warp_manage; return
+    fi
 
     if jq -e --arg tag "$rule_tag" \
         '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
@@ -3322,20 +3616,21 @@ add_rule_menu() {
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    jq 'if (.route.rules | length) == 1 and (.route.rules[0].rule_set | length) == 0
-        then .route.rules = []
-        else . end' \
-        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-
-    local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
-    if [ ${#out_tags[@]} -eq 0 ]; then
+    local -a proxy_tags out_tags
+    mapfile -t proxy_tags < <(jq -r '.outbounds[]? | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null)
+    if [ ${#proxy_tags[@]} -eq 0 ]; then
         selected_out="wireguard-out"
         yellow "未找到其他出站，将自动使用 wireguard-out。"
     else
+        out_tags=("wireguard-out" "${proxy_tags[@]}")
         echo ""
         green "请选择分流流量要走的出站:"
         for i in "${!out_tags[@]}"; do
-            echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
+            if [ "${out_tags[$i]}" = "wireguard-out" ]; then
+                echo -e "  ${green}$((i+1)). ${skyblue}wireguard-out [内置WARP]${re}"
+            else
+                echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
+            fi
         done
         reading "请输入编号: " out_choice
         if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
@@ -3346,25 +3641,26 @@ add_rule_menu() {
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
-    jq --arg tag "$rule_tag" --arg out "$selected_out" '
-        if (.route.rules | length) == 0 then
-            .route.rules = [{"rule_set": [$tag], "outbound": $out}]
-        else
-            (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
-            | if $existing then
-                .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
-              else
-                .route.rules += [{"rule_set": [$tag], "outbound": $out}]
-              end
-        end
-    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    local ipv6_direct_fallback=false
+    if [ "$selected_out" = "wireguard-out" ] && native_ipv6_available; then
+        ipv6_direct_fallback=true
+        yellow "检测到原生 IPv6：该服务 IPv6 直连，IPv4 使用 WARP，避免 WARP IPv6 不可用。"
+    fi
 
-    restart_singbox
-    green "'${rule_tag}' 已分流至出站 '${selected_out}'"
+    if add_service_route "$rule_tag" "$selected_out" "$ipv6_direct_fallback"; then
+        green "'${rule_tag}' 已分流至出站 '${selected_out}'"
+    else
+        red "'${rule_tag}' 分流设置失败，原配置已保留。"
+    fi
     sleep 1; warp_manage
 }
 # 设置全局代理出站
 set_global_outbound() {
+    if ! ensure_warp_prerequisites; then
+        red "无法校验分流前置配置。"
+        sleep 2; add_rule_menu; return
+    fi
+
     # 检查是否存在 socks5/http 代理出站（排除 direct 和 wireguard-out）
     local proxy_tags
     proxy_tags=($(jq -r '.outbounds[] | select(.tag != "direct" and .tag != "wireguard-out") | .tag' \
@@ -3390,74 +3686,23 @@ set_global_outbound() {
     fi
     local selected_out="${proxy_tags[$((out_choice-1))]}"
 
-    # 从 outbounds.json 中删除 direct 出站，防止流量绕过代理
-    jq 'del(.outbounds[] | select(.tag == "direct"))' \
-        "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    rm -rf ${route_file} ${conf_dir}/endpoints.json
-    restart_singbox
-    green "\n已设置全局代理出站：${purple}${selected_out}${re}"
-    yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
+    if set_global_route "$selected_out"; then
+        green "\n已设置全局代理出站：${purple}${selected_out}${re}"
+        yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
+    else
+        red "全局代理设置失败，原配置已保留。"
+    fi
     sleep 2; warp_manage
 }
-# 恢复服务器原IP出站（恢复默认 route.json）
+# 恢复服务器原IP出站
 restore_direct_outbound() {
     yellow "\n正在恢复默认路由配置...\n"
 
-    # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
-    if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
-        jq '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds' \
-            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    if ensure_warp_prerequisites && restore_direct_route; then
+        green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
+    else
+        red "恢复 direct 失败，原配置已保留。"
     fi
-
-    # 恢复默认 route.json
-    cat > "${route_file}" << 'EOF'
-{
-  "route": {
-    "rule_set": [
-      {"tag":"gemini","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/gemini.srs","download_detour":"direct"},
-      {"tag":"claude","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/claude.srs","download_detour":"direct"},
-      {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
-      {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
-      {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
-      {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
-      {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
-      {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
-      {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
-    ],
-    "rules": [{"rule_set": []}],
-    "final": "direct"
-  }
-}
-EOF
-
-    # 恢复默认 endpoints.json
-    cat > "${conf_dir}/endpoints.json" << EOF
-{
-  "endpoints": [
-    {
-      "type": "wireguard",
-      "tag": "wireguard-out",
-      "mtu": 1280,
-      "address": [
-        "172.16.0.2/32",
-        "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
-      ],
-      "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
-      "peers": [
-        {
-          "address": "engage.cloudflareclient.com",
-          "port": 2408,
-          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "reserved": [78, 135, 76]
-        }
-      ]
-    }
-  ]
-}
-EOF
-    restart_singbox
-    green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
     sleep 2; warp_manage
 }
 delete_rule_menu() {
@@ -3473,12 +3718,11 @@ delete_rule_menu() {
     if [ -z "$tag" ] || [ "$tag" == "null" ]; then
         red "无效的选择"; sleep 1; warp_manage; return
     fi
-    jq --arg tag "$tag" \
-       'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-        .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
-       "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-    restart_singbox
-    green "规则集 '${tag}' 已禁用。"
+    if delete_service_route "$tag"; then
+        green "规则集 '${tag}' 已禁用。"
+    else
+        red "规则集 '${tag}' 删除失败，原配置已保留。"
+    fi
     sleep 1; warp_manage
 }
 
@@ -3572,25 +3816,45 @@ add_socks5_proxy() {
 
     # 根据是否有账号密码，决定写入字段，避免空字符串导致 sing-box 报错
     if [ -n "$user" ] && [ -n "$password" ]; then
-        jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
-           --arg port "$port" --arg user "$user" --arg password "$password" \
-           '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+        if ! apply_jq_config "$outbound_file" \
+            --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
+            --arg port "$port" --arg user "$user" --arg password "$password" \
+            '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}]'; then
+            red "代理出站配置校验失败，未添加 '${tag}'。"
+            sleep 2; return
+        fi
     else
         # 无账号密码：不写 username/password 字段
-        jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
-           --arg port "$port" \
-           '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+        if ! apply_jq_config "$outbound_file" \
+            --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
+            --arg port "$port" \
+            '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}]'; then
+            red "代理出站配置校验失败，未添加 '${tag}'。"
+            sleep 2; return
+        fi
     fi
 
     if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
+        if apply_warp_route_update '
+          .route.rules = [
+            .route.rules[] |
+            if ((.rule_set? | type) == "array") then
+              .outbound = $tag | .action = "route"
+            else
+              .
+            end
+          ]
+        ' --arg tag "$tag"; then
+            yellow "已将现有分流规则出站切换为 '${tag}'。"
+        else
+            red "代理已添加，但现有分流规则切换失败。"
+            sleep 2; return
+        fi
+    elif ! restart_singbox_checked; then
+        red "代理已写入配置，但 sing-box 重启失败。"
+        sleep 2; return
     fi
 
-    restart_singbox
     green "\n${tag} 代理出站已添加\n"
     sleep 2; warp_manage
 }
