@@ -1171,35 +1171,48 @@ EOF
 }
 
 # nginx订阅配置
-add_nginx_conf() {
-    if ! command_exists nginx; then
-        red "nginx未安装,无法配置订阅服务"
-        return 1
-    else
-        manage_service "nginx" "stop" > /dev/null 2>&1
-        pkill nginx > /dev/null 2>&1
+render_nginx_subscription_location() {
+    local path="${1:-}"
+
+    is_valid_http_subscription_path "$path" || return 1
+    cat << EOF
+    location = ${path} {
+        alias /etc/sing-box/sub.txt;
+        default_type 'text/plain; charset=utf-8';
+        add_header Cache-Control "private, no-store";
+        add_header X-Content-Type-Options nosniff;
+        access_log off;
+        log_not_found off;
+    }
+EOF
+}
+
+render_nginx_subscription_server() {
+    local port="${1:-}"
+    local http_path="${2:-}"
+    local https_path="${3:-}"
+
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+    is_valid_http_subscription_path "$http_path" || return 1
+    if [ -n "$https_path" ]; then
+        is_valid_subscription_path "$https_path" || return 1
     fi
 
-    mkdir -p /etc/nginx/conf.d
-    [[ -f "/etc/nginx/conf.d/sing-box.conf" ]] && cp /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/sing-box.conf.bak.sb
-
-    cat > /etc/nginx/conf.d/sing-box.conf << EOF
+    cat << EOF
 server {
-    listen $nginx_port;
-    listen [::]:$nginx_port;
+    listen ${port};
+    listen [::]:${port};
     server_name _;
 
     add_header X-Frame-Options DENY;
     add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
-
-    location = /$password {
-        alias /etc/sing-box/sub.txt;
-        default_type 'text/plain; charset=utf-8';
-        add_header Cache-Control "no-cache, no-store, must-revalidate";
-        add_header Pragma "no-cache";
-        add_header Expires "0";
-    }
+EOF
+    render_nginx_subscription_location "$http_path" || return 1
+    if [ -n "$https_path" ] && [ "$https_path" != "$http_path" ]; then
+        render_nginx_subscription_location "$https_path" || return 1
+    fi
+    cat << 'EOF'
 
     location / { return 404; }
 
@@ -1208,11 +1221,90 @@ server {
         access_log off;
         log_not_found off;
     }
-}
+ }
 EOF
+}
+
+get_nginx_subscription_port() {
+    local config_file="${1:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
+    local port
+
+    [ -r "$config_file" ] || return 1
+    port=$(sed -n 's/^[[:space:]]*listen[[:space:]]\+\([0-9]\+\);.*/\1/p' "$config_file" | head -1)
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+    printf '%s\n' "$port"
+}
+
+get_nginx_subscription_paths() {
+    local config_file="${1:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
+    local path
+
+    [ -r "$config_file" ] || return 1
+    while IFS= read -r path; do
+        is_valid_http_subscription_path "$path" && printf '%s\n' "$path"
+    done < <(sed -n 's/^[[:space:]]*location = \(\/[^[:space:]]*\)[[:space:]]*{.*/\1/p' "$config_file")
+}
+
+apply_nginx_subscription_config() {
+    local port="${1:-}"
+    local http_path="${2:-}"
+    local https_path="${3:-}"
+    local config_file="${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"
+    local config_dir tmp_file backup_file had_config=0
+
+    command_exists nginx || { red "nginx未安装，无法配置订阅服务"; return 1; }
+    config_dir=$(dirname "$config_file")
+    mkdir -p "$config_dir" || return 1
+    tmp_file=$(mktemp "${config_dir}/.sing-box.conf.XXXXXX") || return 1
+    backup_file="${config_file}.bak.sb"
+
+    if ! render_nginx_subscription_server "$port" "$http_path" "$https_path" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    if [ -f "$config_file" ]; then
+        cp -p "$config_file" "$backup_file" || { rm -f "$tmp_file"; return 1; }
+        chmod 600 "$backup_file" 2>/dev/null || true
+        had_config=1
+    fi
+    mv -f "$tmp_file" "$config_file" || return 1
+
+    if ! nginx -t > /dev/null 2>&1; then
+        if [ "$had_config" = 1 ]; then
+            cp -p "$backup_file" "$config_file"
+        else
+            rm -f "$config_file"
+        fi
+        nginx -t > /dev/null 2>&1 || true
+        return 1
+    fi
+
+    if command_exists rc-service; then
+        if ! rc-service nginx reload > /dev/null 2>&1 && ! rc-service nginx restart > /dev/null 2>&1; then
+            [ "$had_config" = 1 ] && cp -p "$backup_file" "$config_file"
+            rc-service nginx restart > /dev/null 2>&1 || true
+            return 1
+        fi
+    elif ! nginx -s reload > /dev/null 2>&1 && ! start_nginx > /dev/null 2>&1; then
+        [ "$had_config" = 1 ] && cp -p "$backup_file" "$config_file"
+        restart_nginx > /dev/null 2>&1 || true
+        return 1
+    fi
+
+    return 0
+}
+
+add_nginx_conf() {
+    local http_end_line
+
+    command_exists nginx || { red "nginx未安装，无法配置订阅服务"; return 1; }
+    mkdir -p /etc/nginx/conf.d
 
     if [ -f "/etc/nginx/nginx.conf" ]; then
         cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.sb > /dev/null 2>&1
+        chmod 600 /etc/nginx/nginx.conf.bak.sb 2>/dev/null || true
         sed -i -e '15{/include \/etc\/nginx\/modules\/\*\.conf/d;}' \
                -e '18{/include \/etc\/nginx\/conf\.d\/\*\.conf/d;}' /etc/nginx/nginx.conf > /dev/null 2>&1
         if ! grep -q "include.*conf.d" /etc/nginx/nginx.conf; then
@@ -1238,16 +1330,11 @@ http {
 EOF
     fi
 
-    if nginx -t > /dev/null 2>&1; then
-        nginx -s reload > /dev/null 2>&1 || start_nginx > /dev/null 2>&1
+    if apply_nginx_subscription_config "$nginx_port" "/$password" ""; then
         green "nginx订阅配置已加载"
     else
-            yellow "nginx is not installed; skipping nginx purge."
-        restart_nginx > /dev/null 2>&1
-        if [ $? -ne 0 ]; then
-            [[ -f "/etc/nginx/nginx.conf.bak.sb" ]] && cp "/etc/nginx/nginx.conf.bak.sb" /etc/nginx/nginx.conf > /dev/null 2>&1
-            restart_nginx > /dev/null 2>&1
-        fi
+        red "nginx订阅配置测试失败，已保留或恢复原配置"
+        return 1
     fi
 }
 
@@ -1773,50 +1860,72 @@ disable_open_sub() {
     reading "请输入选择: " choice
     case "${choice}" in
         1)
-            if command -v nginx &>/dev/null; then
+            if command_exists nginx; then
                 if command_exists rc-service 2>/dev/null; then
                     rc-service nginx status | grep -q "started" && rc-service nginx stop || red "nginx not running"
                 else
                     [ "$(systemctl is-active nginx)" = "active" ] && systemctl stop nginx || red "nginx not running"
                 fi
             else
-            yellow "nginx is not installed; skipping nginx purge."
+                yellow "nginx未安装，节点订阅本来就未运行。"
             fi
-            green "\n已关闭节点订阅\n"
+            green "\n已关闭节点订阅；HTTP 与 Cloudflare HTTPS 订阅都会停止响应。\n"
             ;;
         2)
+            local config_file="/etc/nginx/conf.d/sing-box.conf"
+            local http_path link token
             server_ip=$(get_subscription_host)
-            password=$(tr -dc A-Za-z < /dev/urandom | head -c 32)
-            sed -i "s|\(location = /\)[^ ]*|\1$password|" /etc/nginx/conf.d/sing-box.conf
-            sub_port=$(grep -E 'listen [0-9]+;' "/etc/nginx/conf.d/sing-box.conf" | awk '{print $2}' | sed 's/;//' | head -1)
-            start_nginx
-            local link
-            [ "$sub_port" -eq 80 ] 2>/dev/null && link="http://$server_ip/$password" || link="http://$server_ip:$sub_port/$password"
-            green "\n已开启节点订阅\n新的节点订阅链接：$link\n"
+            sub_port=$(get_nginx_subscription_port "$config_file" 2>/dev/null || true)
+            http_path=$(get_nginx_subscription_paths "$config_file" 2>/dev/null | head -1)
+
+            if [ -n "$sub_port" ] && [ -n "$http_path" ]; then
+                start_nginx
+            else
+                token=$(generate_subscription_token) || { red "订阅密钥生成失败"; return 1; }
+                http_path="/$token"
+                sub_port=$(shuf -i 2000-65000 -n 1)
+                apply_nginx_subscription_config "$sub_port" "$http_path" "" || {
+                    red "节点订阅开启失败，原配置未改变"
+                    return 1
+                }
+                load_subscription_state
+                SUB_TOKEN="$token"
+                SUB_HTTP_PATH="$http_path"
+                save_subscription_state || true
+            fi
+
+            link=$(build_http_subscription_url "$server_ip" "$sub_port" "$http_path" 2>/dev/null || true)
+            green "\n已开启节点订阅\n节点订阅链接：${purple}${link}${re}\n"
             ;;
         3)
             reading "请输入新的订阅端口(1-65535,直接回车随机生成):" sub_port
             [ -z "$sub_port" ] && sub_port=$(shuf -i 2000-65000 -n 1)
+            until [[ "$sub_port" =~ ^[0-9]+$ ]] && [ "$sub_port" -ge 1 ] 2>/dev/null && [ "$sub_port" -le 65535 ] 2>/dev/null; do
+                red "端口必须是 1-65535 的整数"
+                reading "请输入新的订阅端口(1-65535):" sub_port
+            done
             until [[ -z $(lsof -iTCP:"$sub_port" -sTCP:LISTEN -t) ]]; do
                 echo -e "${red}端口 $sub_port 已被占用${re}"
                 reading "请输入新的订阅端口(1-65535):" sub_port
-                [[ -z $sub_port ]] && sub_port=$(shuf -i 2000-65000 -n 1)
+                until [[ "$sub_port" =~ ^[0-9]+$ ]] && [ "$sub_port" -ge 1 ] 2>/dev/null && [ "$sub_port" -le 65535 ] 2>/dev/null; do
+                    red "端口必须是 1-65535 的整数"
+                    reading "请输入新的订阅端口(1-65535):" sub_port
+                done
             done
             green "新的订阅端口为：${purple}${sub_port}${re}"
-            [ -f "/etc/nginx/conf.d/sing-box.conf" ] && \
-                cp "/etc/nginx/conf.d/sing-box.conf" "/etc/nginx/conf.d/sing-box.conf.bak.$(date +%Y%m%d)"
-            sed -i 's/listen [0-9]\+;/listen '$sub_port';/g' "/etc/nginx/conf.d/sing-box.conf"
-            sed -i 's/listen \[::\]:[0-9]\+;/listen [::]:'$sub_port';/g' "/etc/nginx/conf.d/sing-box.conf"
-            path=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
+            local -a current_paths
+            mapfile -t current_paths < <(get_nginx_subscription_paths "/etc/nginx/conf.d/sing-box.conf")
+            [ "${#current_paths[@]}" -gt 0 ] || { red "未找到有效的 Nginx 订阅路径"; return 1; }
+            local current_http_path="${current_paths[0]}"
+            local current_https_path=""
+            [ "${#current_paths[@]}" -gt 1 ] && current_https_path="${current_paths[1]}"
             server_ip=$(get_subscription_host)
             allow_port $sub_port/tcp > /dev/null 2>&1
-            if nginx -t > /dev/null 2>&1; then
-                nginx -s reload > /dev/null 2>&1 || restart_nginx
-                green "\n订阅端口更换成功\n新的订阅链接为：${purple}http://${server_ip}:${sub_port}/${path}${re}\n"
+            if apply_nginx_subscription_config "$sub_port" "$current_http_path" "$current_https_path"; then
+                link=$(build_http_subscription_url "$server_ip" "$sub_port" "$current_http_path" 2>/dev/null || true)
+                green "\n订阅端口更换成功\n新的订阅链接为：${purple}${link}${re}\n"
             else
-                red "nginx配置测试失败，正在恢复..."
-                latest_backup=$(ls -t /etc/nginx/conf.d/sing-box.conf.bak.* 2>/dev/null | head -1)
-                [ -n "$latest_backup" ] && cp "$latest_backup" "/etc/nginx/conf.d/sing-box.conf"
+                red "nginx配置测试失败，已恢复原配置"
                 return 1
             fi
             ;;
