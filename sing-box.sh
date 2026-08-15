@@ -45,6 +45,8 @@ export SUB_HOST=${SUB_HOST:-''}
 export SUB_ADDR_FAMILY=${SUB_ADDR_FAMILY:-'ipv4'}
 export PURGE_NGINX=${PURGE_NGINX:-'0'}
 ARGO_FIXED_READY=0
+subscription_state_file="${work_dir}/subscription.conf"
+subscription_token_alphabet='0123456789abcdefghjkmnpqrstvwxyz'
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
@@ -70,6 +72,131 @@ atomic_write_file() {
     fi
     chmod "$mode" "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$target_file"
+}
+
+is_valid_subscription_token() {
+    [[ "${1:-}" =~ ^[0123456789abcdefghjkmnpqrstvwxyz]{32}$ ]]
+}
+
+generate_subscription_token() {
+    od -An -N32 -tu1 /dev/urandom | awk \
+        -v alphabet='0123456789abcdefghjkmnpqrstvwxyz' '
+        {
+            for (i = 1; i <= NF; i++) {
+                printf "%s", substr(alphabet, ($i % 32) + 1, 1)
+            }
+        }
+        END { print "" }
+    '
+}
+
+is_valid_subscription_domain() {
+    local domain label
+    local -a labels
+
+    domain=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+    [[ ${#domain} -le 253 ]] || return 1
+    [[ "$domain" =~ ^[a-z0-9.-]+$ ]] || return 1
+    [[ "$domain" == *.* && "$domain" != .* && "$domain" != *. && "$domain" != *..* ]] || return 1
+
+    IFS='.' read -r -a labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [[ -n "$label" && ${#label} -le 63 ]] || return 1
+        [[ "$label" != -* && "$label" != *- ]] || return 1
+    done
+}
+
+is_valid_subscription_path() {
+    [[ "${1:-}" =~ ^/(sub/)?[0123456789abcdefghjkmnpqrstvwxyz]{32}$ ]]
+}
+
+reset_subscription_state() {
+    SUB_TOKEN=''
+    SUB_HTTP_PATH=''
+    SUB_HTTPS_ENABLED=0
+    SUB_HTTPS_DOMAIN=''
+    SUB_HTTPS_DOMAIN_MODE=''
+    SUB_HTTPS_PATH=''
+    SUB_TUNNEL_MODE=''
+    SUB_HTTPS_VERIFIED_AT=''
+}
+
+load_subscription_state() {
+    local key value
+
+    reset_subscription_state
+    [ -r "$subscription_state_file" ] || return 0
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            SUB_TOKEN)
+                is_valid_subscription_token "$value" && SUB_TOKEN="$value"
+                ;;
+            SUB_HTTP_PATH)
+                is_valid_subscription_path "$value" && SUB_HTTP_PATH="$value"
+                ;;
+            SUB_HTTPS_ENABLED)
+                [[ "$value" == 0 || "$value" == 1 ]] && SUB_HTTPS_ENABLED="$value"
+                ;;
+            SUB_HTTPS_DOMAIN)
+                value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+                is_valid_subscription_domain "$value" && SUB_HTTPS_DOMAIN="$value"
+                ;;
+            SUB_HTTPS_DOMAIN_MODE)
+                [[ "$value" == reuse || "$value" == separate ]] && SUB_HTTPS_DOMAIN_MODE="$value"
+                ;;
+            SUB_HTTPS_PATH)
+                is_valid_subscription_path "$value" && SUB_HTTPS_PATH="$value"
+                ;;
+            SUB_TUNNEL_MODE)
+                [[ "$value" == local || "$value" == remote ]] && SUB_TUNNEL_MODE="$value"
+                ;;
+            SUB_HTTPS_VERIFIED_AT)
+                [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && \
+                    SUB_HTTPS_VERIFIED_AT="$value"
+                ;;
+        esac
+    done < "$subscription_state_file"
+
+    if [ "$SUB_HTTPS_ENABLED" = 1 ]; then
+        if ! is_valid_subscription_token "$SUB_TOKEN" || \
+           ! is_valid_subscription_path "$SUB_HTTP_PATH" || \
+           ! is_valid_subscription_domain "$SUB_HTTPS_DOMAIN" || \
+           ! is_valid_subscription_path "$SUB_HTTPS_PATH" || \
+           [[ "$SUB_HTTPS_DOMAIN_MODE" != reuse && "$SUB_HTTPS_DOMAIN_MODE" != separate ]] || \
+           [[ "$SUB_TUNNEL_MODE" != local && "$SUB_TUNNEL_MODE" != remote ]] || \
+           [ -z "$SUB_HTTPS_VERIFIED_AT" ]; then
+            SUB_HTTPS_ENABLED=0
+            SUB_HTTPS_VERIFIED_AT=''
+        fi
+    fi
+}
+
+save_subscription_state() {
+    if [ -n "${SUB_TOKEN:-}" ] && ! is_valid_subscription_token "$SUB_TOKEN"; then
+        return 1
+    fi
+    if [ -n "${SUB_HTTP_PATH:-}" ] && ! is_valid_subscription_path "$SUB_HTTP_PATH"; then
+        return 1
+    fi
+    if [ "${SUB_HTTPS_ENABLED:-0}" = 1 ]; then
+        is_valid_subscription_domain "${SUB_HTTPS_DOMAIN:-}" || return 1
+        is_valid_subscription_path "${SUB_HTTPS_PATH:-}" || return 1
+        [[ "${SUB_HTTPS_DOMAIN_MODE:-}" == reuse || "${SUB_HTTPS_DOMAIN_MODE:-}" == separate ]] || return 1
+        [[ "${SUB_TUNNEL_MODE:-}" == local || "${SUB_TUNNEL_MODE:-}" == remote ]] || return 1
+        [ -n "${SUB_HTTPS_VERIFIED_AT:-}" ] || return 1
+    fi
+
+    {
+        printf 'SUB_TOKEN=%s\n' "${SUB_TOKEN:-}"
+        printf 'SUB_HTTP_PATH=%s\n' "${SUB_HTTP_PATH:-}"
+        printf 'SUB_HTTPS_ENABLED=%s\n' "${SUB_HTTPS_ENABLED:-0}"
+        printf 'SUB_HTTPS_DOMAIN=%s\n' "${SUB_HTTPS_DOMAIN:-}"
+        printf 'SUB_HTTPS_DOMAIN_MODE=%s\n' "${SUB_HTTPS_DOMAIN_MODE:-}"
+        printf 'SUB_HTTPS_PATH=%s\n' "${SUB_HTTPS_PATH:-}"
+        printf 'SUB_TUNNEL_MODE=%s\n' "${SUB_TUNNEL_MODE:-}"
+        printf 'SUB_HTTPS_VERIFIED_AT=%s\n' "${SUB_HTTPS_VERIFIED_AT:-}"
+    } | atomic_write_file "$subscription_state_file" 600
 }
 
 download_binary() {
@@ -2931,5 +3058,4 @@ case "$1" in
         exit 1
         ;;
 esac
-
 
