@@ -76,6 +76,7 @@ for function_name in \
     port_is_listening \
     check_service_ports_available \
     get_listener_address \
+    generate_random_alphanumeric \
     load_install_settings \
     persist_install_settings \
     atomic_write_file \
@@ -84,12 +85,22 @@ for function_name in \
     update_sub \
     manage_packages \
     allow_port \
+    is_install_complete \
+    mark_install_complete \
+    clear_install_complete_marker \
     is_valid_subscription_path \
     is_valid_http_subscription_path \
     render_nginx_subscription_location \
     render_nginx_subscription_server \
     auto_install; do
     load_function "$function_name"
+done
+
+for _ in $(seq 1 20); do
+    generated_password="$(generate_random_alphanumeric 24)" || \
+        fail 'alphanumeric password generation failed under pipefail'
+    [[ "$generated_password" =~ ^[A-Za-z0-9]{24}$ ]] || \
+        fail "generated password is not exactly 24 alphanumeric characters: ${generated_password}"
 done
 
 assert_fail validate_port_value '' REALITY_PORT
@@ -212,7 +223,9 @@ for function_name in \
     render_argo_inbound \
     render_hysteria2_inbound \
     render_tuic_inbound \
-    render_inbounds_config; do
+    render_inbounds_config \
+    update_public_inbound_port \
+    get_uniform_inbound_port; do
     load_function "$function_name"
 done
 
@@ -253,6 +266,66 @@ if command -v jq >/dev/null 2>&1; then
     for rendered in "$inbounds_v4" "$inbounds_v6" "$inbounds_dual" "$inbounds_v6only"; do
         jq -e . >/dev/null <<< "$rendered" || fail 'rendered inbounds are not valid JSON'
     done
+
+    load_function apply_jq_config
+    validate_singbox_config() { :; }
+    dual_menu_fixture="${tmp_dir}/dual-menu"
+    command mkdir -p "${dual_menu_fixture}/conf"
+    conf_dir="${dual_menu_fixture}/conf"
+    cat > "${conf_dir}/fixture.json" <<'EOF'
+{"inbounds":[
+  {"type":"vless","tag":"vless-reality","listen_port":12000},
+  {"type":"vless","tag":"vless-reality-ipv6","listen_port":12000},
+  {"type":"hysteria2","tag":"hysteria2","listen_port":12002},
+  {"type":"hysteria2","tag":"hysteria2-ipv6","listen_port":12002},
+  {"type":"tuic","tag":"tuic","listen_port":12003},
+  {"type":"tuic","tag":"tuic-ipv6","listen_port":12003}
+]}
+EOF
+
+    run_dual_listener_port_update_case() {
+        local protocol="$1"
+        local new_port="$2"
+        local jq_selector
+        command cp "${conf_dir}/fixture.json" "${conf_dir}/inbounds.json"
+        assert_ok update_public_inbound_port "${conf_dir}/inbounds.json" "$protocol" "$new_port"
+        case "$protocol" in
+            reality) jq_selector='select(.tag == "vless-reality" or .tag == "vless-reality-ipv6")' ;;
+            *) jq_selector="select(.type == \"${protocol}\")" ;;
+        esac
+        jq -e --argjson port "$new_port" \
+            "[.inbounds[] | ${jq_selector}] | length == 2 and all(.[]; .listen_port == \$port)" \
+            "${conf_dir}/inbounds.json" >/dev/null || \
+            fail "${protocol} menu update did not synchronize both listeners"
+    }
+
+    run_dual_listener_port_update_case reality 31001
+    run_dual_listener_port_update_case hysteria2 31002
+    run_dual_listener_port_update_case tuic 31003
+
+    command cp "${conf_dir}/fixture.json" "${conf_dir}/inbounds.json"
+    assert_equal 12002 "$(get_uniform_inbound_port "${conf_dir}/inbounds.json" hysteria2)" \
+        'matching dual Hysteria2 listeners did not produce one hop destination'
+    jq '(.inbounds[] | select(.tag == "hysteria2-ipv6").listen_port) = 12004' \
+        "${conf_dir}/inbounds.json" > "${conf_dir}/mismatched.json"
+    assert_fail get_uniform_inbound_port "${conf_dir}/mismatched.json" hysteria2
+
+    change_config_source="$(sed -n '/^change_config() {/,/^configure_cf_https_subscription() {/p' "$script" | sed '$d')"
+    for expected_call in \
+        'update_public_inbound_port "$inbounds_file" reality "$new_port"' \
+        'update_public_inbound_port "$inbounds_file" hysteria2 "$new_port"' \
+        'update_public_inbound_port "$inbounds_file" tuic "$new_port"'; do
+        grep -Fq "$expected_call" <<< "$change_config_source" || \
+            fail "menu does not use synchronized port update: ${expected_call}"
+    done
+    uniform_line="$(grep -n 'get_uniform_inbound_port.*hysteria2' <<< "$change_config_source" | cut -d: -f1)"
+    nat_line="$(grep -nF -- '--to-destination :$listen_port' <<< "$change_config_source" | head -1 | cut -d: -f1)"
+    [[ -n "$uniform_line" && -n "$nat_line" && "$uniform_line" -lt "$nat_line" ]] || \
+        fail 'port hop changes firewall rules before validating listener equality'
+    assert_equal 2 "$(grep -Fc -- '--to-destination :$listen_port' <<< "$change_config_source")" \
+        'IPv4 and IPv6 hop rules do not share the validated listener port'
+    grep -Fq 'mport=$listen_port,$min_port-$max_port' <<< "$change_config_source" || \
+        fail 'port-hop subscription does not share the validated listener port'
 fi
 
 token='0123456789abcdefghjkmnpqrstvwxyz'
@@ -316,8 +389,8 @@ for FIREWALL_BACKEND in ufw firewall-cmd iptables ip6tables; do
     command_exists() {
         [[ "$1" == "$FIREWALL_BACKEND" ]]
     }
-    assert_ok allow_port 23001 tcp
-    assert_ok allow_port 23003/udp
+    assert_ok allow_port --families 1 1 23001 tcp
+    assert_ok allow_port --families 1 1 23003/udp
     if grep -Eq -- '--set-target|--set-policy|(^|[[:space:]])-P([[:space:]]|$)|default allow' "$CALL_LOG"; then
         fail "${FIREWALL_BACKEND} changed a global firewall policy"
     fi
@@ -345,6 +418,43 @@ for FIREWALL_BACKEND in ufw firewall-cmd iptables ip6tables; do
     esac
 done
 
+command_exists() {
+    [[ "$1" == iptables || "$1" == ip6tables ]]
+}
+iptables() {
+    printf 'iptables %s\n' "$*" >> "$CALL_LOG"
+    [[ "$FAMILY_CASE" != v6-only && "$FAMILY_CASE" != v4-fail ]] || return 1
+    [[ "${1:-}" != -C ]]
+}
+ip6tables() {
+    printf 'ip6tables %s\n' "$*" >> "$CALL_LOG"
+    [[ "$FAMILY_CASE" != v4-only && "$FAMILY_CASE" != v6-fail ]] || return 1
+    [[ "${1:-}" != -C ]]
+}
+
+: > "$CALL_LOG"
+FAMILY_CASE=v4-only
+assert_ok allow_port --families 1 0 24001/tcp
+grep -Fq 'iptables -I INPUT -p tcp --dport 24001 -j ACCEPT' "$CALL_LOG" || \
+    fail 'IPv4-only firewall update omitted the active iptables rule'
+if grep -Fq 'ip6tables ' "$CALL_LOG"; then
+    fail 'IPv4-only firewall update invoked ip6tables'
+fi
+
+: > "$CALL_LOG"
+FAMILY_CASE=v6-only
+assert_ok allow_port --families 0 1 24002/udp
+grep -Fq 'ip6tables -I INPUT -p udp --dport 24002 -j ACCEPT' "$CALL_LOG" || \
+    fail 'IPv6-only firewall update omitted the active ip6tables rule'
+if grep -Fq 'iptables ' "$CALL_LOG"; then
+    fail 'IPv6-only firewall update invoked iptables'
+fi
+
+FAMILY_CASE=v4-fail
+assert_fail allow_port --families 1 0 24003/tcp
+FAMILY_CASE=v6-fail
+assert_fail allow_port --families 0 1 24004/udp
+
 install_source="$(sed -n '/^install_singbox() {/,/^# debian\/ubuntu\/centos/p' "$script" | sed '$d')"
 [[ -n "$install_source" ]] || fail 'install_singbox is not implemented'
 resolve_line="$(grep -n 'resolve_service_ports' <<< "$install_source" | head -1 | cut -d: -f1)"
@@ -360,6 +470,10 @@ grep -Fq 'check_service_ports_available' <<< "$install_source" || \
     fail 'auto-install does not reject occupied service ports'
 grep -Fq 'render_inbounds_config "$has_v4" "$has_v6" "$bindv6only"' <<< "$install_source" || \
     fail 'sing-box inbounds do not use the stack-aware renderer'
+grep -Fq 'generate_random_alphanumeric 24' <<< "$install_source" || \
+    fail 'install_singbox bypasses the pipefail-safe password generator'
+grep -Fq 'allow_port --families "$has_v4" "$has_v6"' <<< "$install_source" || \
+    fail 'install_singbox does not pass detected address families to allow_port'
 if grep -Fq 'ping -c' <<< "$install_source"; then
     fail 'install_singbox still uses ping to select the network stack'
 fi
@@ -766,7 +880,9 @@ if [[ -x "$sing_box_bin" ]] && command -v openssl >/dev/null 2>&1; then
         fail 'sing-box rejected the bindv6only dual-listener fixture'
 fi
 
-check_singbox() { return 2; }
+check_singbox() {
+    [[ -n "${INSTALL_CALL_LOG:-}" && -s "$INSTALL_CALL_LOG" ]]
+}
 command_exists() { [[ "$1" == systemctl ]]; }
 systemctl() { return 0; }
 sleep() { :; }
@@ -794,9 +910,12 @@ load_function interactive_install
 run_install_failure_case() {
     local mode="$1"
     local stage="$2"
-    local output status expected_calls
+    local output status expected_calls calls_after_repair
+    work_dir="${tmp_dir}/install-${mode}-${stage}"
+    command rm -rf "$work_dir"
+    command mkdir -p "$work_dir"
     INSTALL_FAIL_STAGE="$stage"
-    INSTALL_CALL_LOG="${tmp_dir}/install-${mode}-${stage}.log"
+    INSTALL_CALL_LOG="${work_dir}/calls.log"
     : > "$INSTALL_CALL_LOG"
     set +e
     output="$(${mode}_install 2>&1)"
@@ -816,6 +935,28 @@ run_install_failure_case() {
         shortcut) expected_calls=$'packages\ninstall\nconfig\nservices\nnginx\ninfo\nshortcut' ;;
     esac
     assert_file_content "$expected_calls" "$INSTALL_CALL_LOG" "${mode}_install did not stop at ${stage} failure"
+    [[ ! -e "${work_dir}/.install-complete" ]] || \
+        fail "${mode}_install wrote a completion marker after ${stage} failure"
+
+    INSTALL_FAIL_STAGE=none
+    set +e
+    output="$(${mode}_install 2>&1)"
+    status=$?
+    set -e
+    [[ "$status" -eq 0 ]] || fail "${mode}_install could not repair ${stage} failure on retry"
+    [[ -f "${work_dir}/.install-complete" ]] || \
+        fail "${mode}_install retry after ${stage} failure was short-circuited by check_singbox"
+    assert_file_content complete "${work_dir}/.install-complete" \
+        "${mode}_install completion marker has unexpected content"
+    if [[ "$(uname -s)" != MINGW* ]]; then
+        assert_equal 600 "$(stat -c '%a' "${work_dir}/.install-complete")" \
+            "${mode}_install completion marker mode"
+    fi
+    calls_after_repair="$(command cat "$INSTALL_CALL_LOG")"
+
+    assert_ok "${mode}_install"
+    assert_file_content "$calls_after_repair" "$INSTALL_CALL_LOG" \
+        "${mode}_install did not skip an already complete installation"
 }
 
 for INSTALL_MODE in auto interactive; do

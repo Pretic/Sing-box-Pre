@@ -252,8 +252,45 @@ persist_install_settings() {
     chmod 600 "$settings_file"
 }
 
+is_install_complete() {
+    local marker_file="${INSTALL_COMPLETE_MARKER:-${work_dir}/.install-complete}"
+
+    [ -f "$marker_file" ] && [ "$(cat "$marker_file" 2>/dev/null)" = complete ]
+}
+
+mark_install_complete() {
+    local marker_file="${INSTALL_COMPLETE_MARKER:-${work_dir}/.install-complete}"
+
+    printf '%s\n' complete | atomic_write_file "$marker_file" 600 || return 1
+    chmod 600 "$marker_file"
+}
+
+clear_install_complete_marker() {
+    local marker_file="${INSTALL_COMPLETE_MARKER:-${work_dir}/.install-complete}"
+
+    rm -f "$marker_file"
+}
+
 is_valid_subscription_token() {
     [[ "${1:-}" =~ ^[0123456789abcdefghjkmnpqrstvwxyz]{32}$ ]]
+}
+
+generate_random_alphanumeric() {
+    local length="${1:-24}"
+    local value
+
+    [[ "$length" =~ ^[1-9][0-9]*$ ]] || return 1
+    value=$(LC_ALL=C od -An -N "$length" -tu1 /dev/urandom | awk \
+        -v alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789' '
+        {
+            for (i = 1; i <= NF; i++) {
+                printf "%s", substr(alphabet, ($i % 62) + 1, 1)
+            }
+        }
+        END { print "" }
+    ') || return 1
+    [[ ${#value} -eq $length && "$value" =~ ^[A-Za-z0-9]+$ ]] || return 1
+    printf '%s\n' "$value"
 }
 
 generate_subscription_token() {
@@ -1430,6 +1467,8 @@ remove_remote_tunnel_subscription_via_api() {
 
 # 处理防火墙
 allow_port() {
+    local has_v4=0
+    local has_v6=0
     local has_ufw=0
     local has_firewalld=0
     local has_iptables=0
@@ -1437,10 +1476,22 @@ allow_port() {
     local port proto rule
     local status=0
 
+    if [ "${1:-}" = --families ]; then
+        [ "$#" -ge 4 ] || return 1
+        has_v4="$2"
+        has_v6="$3"
+        shift 3
+        [[ "$has_v4" =~ ^[01]$ && "$has_v6" =~ ^[01]$ ]] || return 1
+    else
+        ipv4_stack_available && has_v4=1
+        ipv6_stack_available && has_v6=1
+    fi
+    [ "$has_v4" = 1 ] || [ "$has_v6" = 1 ] || return 1
+
     command_exists ufw && has_ufw=1
     command_exists firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1 && has_firewalld=1
-    command_exists iptables && has_iptables=1
-    command_exists ip6tables && has_ip6tables=1
+    [ "$has_v4" = 1 ] && command_exists iptables && has_iptables=1
+    [ "$has_v6" = 1 ] && command_exists ip6tables && has_ip6tables=1
 
     while [ "$#" -gt 0 ]; do
         rule="$1"
@@ -1715,13 +1766,15 @@ install_singbox() {
     chown root:root "${work_dir}" || return 1
 
     uuid=$(cat /proc/sys/kernel/random/uuid) || return 1
-    password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24) || return 1
+    password=$(generate_random_alphanumeric 24) || return 1
     output=$(/etc/sing-box/sing-box generate reality-keypair) || return 1
     private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
     public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
     [ -n "$uuid" ] && [ -n "$password" ] && [ -n "$private_key" ] && [ -n "$public_key" ] || return 1
 
-    allow_port "$vless_port/tcp" "$nginx_port/tcp" "$tuic_port/udp" "$hy2_port/udp" > /dev/null 2>&1 || return 1
+    allow_port --families "$has_v4" "$has_v6" \
+        "$vless_port/tcp" "$nginx_port/tcp" "$tuic_port/udp" "$hy2_port/udp" \
+        > /dev/null 2>&1 || return 1
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || return 1
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com" || return 1
@@ -2438,6 +2491,41 @@ apply_jq_config() {
     rm -f "$backup_file"
 }
 
+update_public_inbound_port() {
+    local target_file="$1"
+    local protocol="$2"
+    local port="$3"
+
+    validate_port_value "$port" "${protocol}_port" || return 1
+    case "$protocol" in
+        reality)
+            apply_jq_config "$target_file" --arg port "$port" \
+                '(.inbounds[] | select(.tag == "vless-reality" or .tag == "vless-reality-ipv6").listen_port) = ($port | tonumber)'
+            ;;
+        hysteria2|tuic)
+            apply_jq_config "$target_file" --arg protocol "$protocol" --arg port "$port" \
+                '(.inbounds[] | select(.type == $protocol).listen_port) = ($port | tonumber)'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+get_uniform_inbound_port() {
+    local target_file="$1"
+    local protocol="$2"
+    local port
+
+    port=$(jq -er --arg protocol "$protocol" '
+        [.inbounds[] | select(.type == $protocol) | .listen_port] as $ports |
+        if (($ports | length) > 0 and ($ports | unique | length) == 1)
+        then $ports[0]
+        else empty
+        end
+    ' "$target_file") || return 1
+    validate_port_value "$port" "${protocol}_port" || return 1
+    printf '%s\n' "$port"
+}
+
 purge_nginx_package() {
     local package="nginx"
     manage_packages uninstall "$package"
@@ -2519,6 +2607,10 @@ change_hosts() {
 
 # Fail-fast install orchestration shared by interactive and non-interactive paths.
 run_install_flow() {
+    clear_install_complete_marker || {
+        red "无法清除旧的安装完成标记，安装中止。"
+        return 1
+    }
     manage_packages install nginx jq tar openssl lsof coreutils || {
         red "依赖安装失败，安装中止。"
         return 1
@@ -2562,13 +2654,13 @@ run_install_flow() {
     add_nginx_conf || { red "Nginx 订阅配置失败，安装中止。"; return 1; }
     get_info || { red "节点信息生成失败，安装中止。"; return 1; }
     create_shortcut || { red "快捷指令创建失败，安装中止。"; return 1; }
+    mark_install_complete || { red "安装完成标记写入失败，安装中止。"; return 1; }
     green "\nsing-box 安装完成\n"
 }
 
 # 非交互静默安装（-i 参数）
 auto_install() {
-    check_singbox &>/dev/null
-    if [ $? -eq 0 ]; then
+    if check_singbox &>/dev/null && is_install_complete; then
         yellow "sing-box 已经安装，跳过安装流程。"
         return 0
     fi
@@ -2578,8 +2670,7 @@ auto_install() {
 }
 
 interactive_install() {
-    check_singbox &>/dev/null
-    if [ $? -eq 0 ]; then
+    if check_singbox &>/dev/null && is_install_complete; then
         yellow "sing-box 已经安装！\n"
         return 0
     fi
@@ -2685,10 +2776,9 @@ change_config() {
                 1)
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    apply_jq_config "$inbounds_file" --arg port "$new_port" \
-                       '(.inbounds[] | select(.tag == "vless-reality").listen_port) = ($port | tonumber)' || return
+                    update_public_inbound_port "$inbounds_file" reality "$new_port" || return
                     restart_singbox
-                    allow_port $new_port/tcp > /dev/null 2>&1
+                    allow_port "$new_port/tcp" > /dev/null 2>&1 || return
                     sed -i '/flow=xtls-rprx-vision/ s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
                     update_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
@@ -2697,10 +2787,9 @@ change_config() {
                 2)
                     reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    apply_jq_config "$inbounds_file" --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)' || return
+                    update_public_inbound_port "$inbounds_file" hysteria2 "$new_port" || return
                     restart_singbox
-                    allow_port $new_port/udp > /dev/null 2>&1
+                    allow_port "$new_port/udp" > /dev/null 2>&1 || return
                     sed -i 's/\(hysteria2:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
                     update_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
@@ -2709,10 +2798,9 @@ change_config() {
                 3)
                     reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    apply_jq_config "$inbounds_file" --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)' || return
+                    update_public_inbound_port "$inbounds_file" tuic "$new_port" || return
                     restart_singbox
-                    allow_port $new_port/udp > /dev/null 2>&1
+                    allow_port "$new_port/udp" > /dev/null 2>&1 || return
                     sed -i 's/\(tuic:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
                     update_sub
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
@@ -2782,7 +2870,10 @@ change_config() {
             reading "\n请输入跳跃结束端口 (需大于起始端口): " max_port
             [ -z "$max_port" ] && max_port=$(($min_port + 100))
             yellow "你的结束端口为：$max_port\n"
-            listen_port=$(jq -r '.inbounds[] | select(.type == "hysteria2").listen_port' "${conf_dir}/inbounds.json")
+            listen_port=$(get_uniform_inbound_port "${conf_dir}/inbounds.json" hysteria2) || {
+                red "Hysteria2 监听端口不一致，无法配置端口跳跃。"
+                return 1
+            }
             iptables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             command -v ip6tables &> /dev/null && ip6tables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             if command_exists rc-service 2>/dev/null; then
