@@ -323,14 +323,32 @@ EOF
         grep -Fq "$expected_call" <<< "$change_config_source" || \
             fail "menu does not use synchronized port update: ${expected_call}"
     done
-    uniform_line="$(grep -n 'get_uniform_inbound_port.*hysteria2' <<< "$change_config_source" | cut -d: -f1)"
-    nat_line="$(grep -nF 'add_hy2_port_hopping "$min_port" "$max_port" "$listen_port"' \
-        <<< "$change_config_source" | head -1 | cut -d: -f1 || true)"
-    subscription_line="$(grep -nF 'mport=$listen_port,$min_port-$max_port' \
-        <<< "$change_config_source" | head -1 | cut -d: -f1 || true)"
-    [[ -n "$uniform_line" && -n "$nat_line" && -n "$subscription_line" && \
-       "$uniform_line" -lt "$nat_line" && "$nat_line" -lt "$subscription_line" ]] || \
-        fail 'port-hop menu does not validate listeners, apply owned NAT, then mutate subscription in order'
+    hop_enable_source="$(sed -n '/purple "端口跳跃需确保/,/^        5)/p' <<< "$change_config_source" || true)"
+    hop_disable_source="$(sed -n '/^        5)/,/^        6)/p' <<< "$change_config_source" || true)"
+    [[ -n "$hop_enable_source" ]] || fail 'Hysteria2 port-hop option 4 block is missing'
+    [[ -n "$hop_disable_source" ]] || fail 'Hysteria2 port-hop option 5 block is missing'
+
+    enable_line="$(grep -nF 'if ! enable_hy2_port_hopping_transaction "$min_port" "$max_port"; then' \
+        <<< "$hop_enable_source" | head -1 | cut -d: -f1 || true)"
+    enable_success_line="$(grep -nF 'hysteria2端口跳跃已开启' \
+        <<< "$hop_enable_source" | head -1 | cut -d: -f1 || true)"
+    [[ -n "$enable_line" ]] || \
+        fail 'Hysteria2 port-hop option 4 does not call the enable transaction helper'
+    [[ -n "$enable_success_line" ]] || \
+        fail 'Hysteria2 port-hop option 4 success display is missing'
+    [[ "$enable_line" -lt "$enable_success_line" ]] || \
+        fail 'Hysteria2 port-hop option 4 displays success before the enable transaction commits'
+
+    disable_line="$(grep -nF 'if ! disable_hy2_port_hopping_transaction; then' \
+        <<< "$hop_disable_source" | head -1 | cut -d: -f1 || true)"
+    disable_success_line="$(grep -nF '端口跳跃已删除' \
+        <<< "$hop_disable_source" | head -1 | cut -d: -f1 || true)"
+    [[ -n "$disable_line" ]] || \
+        fail 'Hysteria2 port-hop option 5 does not call the disable transaction helper'
+    [[ -n "$disable_success_line" ]] || \
+        fail 'Hysteria2 port-hop option 5 success display is missing'
+    [[ "$disable_line" -lt "$disable_success_line" ]] || \
+        fail 'Hysteria2 port-hop option 5 displays success before the disable transaction commits'
 fi
 
 token='0123456789abcdefghjkmnpqrstvwxyz'
