@@ -7,6 +7,7 @@
 # =========================
 
 export LANG=en_US.UTF-8
+umask 077
 # 定义颜色
 re="\033[0m"
 red="\033[1;91m"
@@ -20,6 +21,13 @@ yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue() { echo -e "\e[1;36m$1\033[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
+reading_secret() {
+    local prompt="$1"
+    local variable_name="$2"
+
+    read -rs -p "$(red "$prompt")" "$variable_name"
+    printf '\n'
+}
 
 validate_port_value() {
     local value="${1:-}"
@@ -235,6 +243,143 @@ atomic_write_file() {
     fi
     chmod "$mode" "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$target_file"
+}
+
+atomic_write_secret_file() {
+    local target_file="$1"
+
+    (
+        umask 077
+        local target_dir target_name tmp_file
+        target_dir=$(dirname "$target_file") || exit 1
+        target_name=$(basename "$target_file") || exit 1
+        mkdir -p "$target_dir" || exit 1
+        tmp_file=$(mktemp "${target_dir}/.tmp.${target_name}.XXXXXX") || exit 1
+        if ! cat > "$tmp_file"; then
+            rm -f "$tmp_file"
+            exit 1
+        fi
+        if ! chmod 600 "$tmp_file" || ! mv -f "$tmp_file" "$target_file"; then
+            rm -f "$tmp_file"
+            exit 1
+        fi
+    )
+}
+
+harden_runtime_secret_permissions() {
+    local install_root="${1:-}"
+    local singbox_dir="${install_root}/etc/sing-box"
+    local secret_file
+
+    for secret_file in \
+        "${singbox_dir}/conf/inbounds.json" \
+        "${singbox_dir}/conf/outbounds.json" \
+        "${singbox_dir}/tunnel.json" \
+        "${singbox_dir}/tunnel.yml" \
+        "${singbox_dir}/argo.env"; do
+        [ -e "$secret_file" ] || [ -L "$secret_file" ] || continue
+        [ -f "$secret_file" ] && [ ! -L "$secret_file" ] || return 1
+        chmod 600 "$secret_file" || return 1
+    done
+}
+
+write_fixed_argo_credentials() {
+    local credential_type="${1:-}"
+    local credential_value="${2:-}"
+    local install_root="${3:-}"
+    local singbox_dir="${install_root}/etc/sing-box"
+
+    case "$credential_type" in
+        token)
+            [[ "$credential_value" =~ ^[A-Za-z0-9._=-]+$ ]] || return 1
+            printf 'TUNNEL_TOKEN=%s\n' "$credential_value" | \
+                atomic_write_secret_file "${singbox_dir}/argo.env" || return 1
+            ;;
+        json)
+            [ -n "$credential_value" ] || return 1
+            printf '%s\n' "$credential_value" | \
+                atomic_write_secret_file "${singbox_dir}/tunnel.json" || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+write_argo_systemd_service() {
+    local tunnel_mode="${1:-quick}"
+    local install_root="${2:-}"
+    local unit_file="${install_root}/etc/systemd/system/argo.service"
+    local environment_file=""
+    local exec_start
+
+    case "$tunnel_mode" in
+        token)
+            environment_file='EnvironmentFile=-/etc/sing-box/argo.env'
+            exec_start='/etc/sing-box/argo tunnel --no-autoupdate run'
+            ;;
+        local)
+            exec_start='/etc/sing-box/argo tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run'
+            ;;
+        quick)
+            exec_start="/bin/sh -c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+            ;;
+        *) return 1 ;;
+    esac
+
+    {
+        printf '%s\n' \
+            '[Unit]' \
+            'Description=Cloudflare Tunnel' \
+            'After=network.target' \
+            '' \
+            '[Service]' \
+            'Type=simple' \
+            'NoNewPrivileges=yes' \
+            'TimeoutStartSec=0'
+        [ -z "$environment_file" ] || printf '%s\n' "$environment_file"
+        printf 'ExecStart=%s\n' "$exec_start"
+        printf '%s\n' \
+            'Restart=on-failure' \
+            'RestartSec=5s' \
+            '' \
+            '[Install]' \
+            'WantedBy=multi-user.target'
+    } | atomic_write_secret_file "$unit_file" || return 1
+    chmod 644 "$unit_file"
+}
+
+write_argo_openrc_service() {
+    local tunnel_mode="${1:-quick}"
+    local install_root="${2:-}"
+    local init_file="${install_root}/etc/init.d/argo"
+    local command_args
+
+    case "$tunnel_mode" in
+        token) command_args='tunnel --no-autoupdate run' ;;
+        local) command_args='tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run' ;;
+        quick) command_args="tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2" ;;
+        *) return 1 ;;
+    esac
+
+    {
+        printf '%s\n' \
+            '#!/sbin/openrc-run' \
+            'description="Cloudflare Tunnel"' \
+            'command="/etc/sing-box/argo"' \
+            "command_args=\"${command_args}\"" \
+            'command_background=true' \
+            'pidfile="/var/run/argo.pid"' \
+            'output_log="/etc/sing-box/argo.log"' \
+            'error_log="/etc/sing-box/argo.log"'
+        if [ "$tunnel_mode" = token ]; then
+            printf '%s\n' \
+                'start_pre() {' \
+                '    [ -r /etc/sing-box/argo.env ] || return 1' \
+                '    . /etc/sing-box/argo.env' \
+                '    export TUNNEL_TOKEN' \
+                '}'
+        fi
+    } | atomic_write_secret_file "$init_file" || return 1
+    chmod 700 "$init_file"
 }
 
 persist_install_settings() {
@@ -988,11 +1133,27 @@ detect_argo_tunnel_mode() {
         printf 'quick\n'
     elif grep -Eq -- 'tunnel[^[:cntrl:]]*--config[[:space:]]+[^[:space:]]+' "$service_file"; then
         printf 'local\n'
-    elif grep -Eq -- 'tunnel[^[:cntrl:]]*(run[[:space:]]+)?--token[[:space:]]+[^[:space:]]+' "$service_file"; then
+    elif grep -Eq -- 'EnvironmentFile=-?/etc/sing-box/argo\.env|[.][[:space:]]+/etc/sing-box/argo\.env|tunnel[^[:cntrl:]]*(run[[:space:]]+)?--token[[:space:]]+[^[:space:]]+' "$service_file"; then
         printf 'remote\n'
     else
         return 1
     fi
+}
+
+refresh_quick_argo() {
+    local service_file="${1:-}"
+    local tunnel_mode
+
+    tunnel_mode=$(detect_argo_tunnel_mode "$service_file" 2>/dev/null) || {
+        red "无法识别当前 Argo Tunnel 类型，未执行刷新。"
+        return 1
+    }
+    if [ "$tunnel_mode" != quick ]; then
+        red "当前使用固定 Argo Tunnel，不能刷新临时域名。"
+        return 1
+    fi
+    get_quick_tunnel || return 1
+    change_argo_domain
 }
 
 strip_local_tunnel_subscription_rule() {
@@ -1775,6 +1936,7 @@ install_singbox() {
     local has_v6=0
     local bindv6only=0
     local dns_strategy
+    local inbounds_json
 
     clear
     purple "正在安装sing-box中，请稍后..."
@@ -1875,9 +2037,11 @@ EOF
 }
 EOF
 
-    render_inbounds_config "$has_v4" "$has_v6" "$bindv6only" > "${conf_dir}/inbounds.json" || return 1
+    inbounds_json=$(render_inbounds_config "$has_v4" "$has_v6" "$bindv6only") || return 1
+    printf '%s\n' "$inbounds_json" | \
+        atomic_write_secret_file "${conf_dir}/inbounds.json" || return 1
 
-    cat > "${conf_dir}/outbounds.json" << EOF || return 1
+    atomic_write_secret_file "${conf_dir}/outbounds.json" << EOF || return 1
 {
   "outbounds": [
     {
@@ -1940,7 +2104,7 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
 
-    local argo_exec=""
+    local argo_mode=""
     local tunnel_id=""
     local fixed_argo_requested=0
     ARGO_FIXED_READY=0
@@ -1951,8 +2115,8 @@ EOF
         elif [[ "$ARGO_AUTH" =~ TunnelSecret ]]; then
             tunnel_id=$(extract_argo_tunnel_id "$ARGO_AUTH")
             if [ -n "$tunnel_id" ]; then
-                echo "$ARGO_AUTH" > "${work_dir}/tunnel.json" || return 1
-                cat > "${work_dir}/tunnel.yml" << EOF || return 1
+                write_fixed_argo_credentials json "$ARGO_AUTH" || return 1
+                atomic_write_secret_file "${work_dir}/tunnel.yml" << EOF || return 1
 tunnel: ${tunnel_id}
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
@@ -1962,42 +2126,27 @@ ingress:
     service: http://127.0.0.1:${ARGO_PORT}
   - service: http_status:404
 EOF
-                argo_exec="ExecStart=/bin/sh -c \"/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run > /etc/sing-box/argo.log 2>&1\""
+                argo_mode=local
                 ARGO_FIXED_READY=1
             else
                 yellow "ARGO_AUTH 未解析到 TunnelID，改用临时 Argo 隧道"
             fi
         elif is_argo_tunnel_token "$ARGO_AUTH"; then
-            argo_exec="ExecStart=/bin/sh -c \"/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH} > /etc/sing-box/argo.log 2>&1\""
+            write_fixed_argo_credentials token "$ARGO_AUTH" || return 1
+            argo_mode=token
             ARGO_FIXED_READY=1
         else
             yellow "ARGO_AUTH 格式不匹配，改用临时 Argo 隧道"
         fi
     fi
-    if [ -z "$argo_exec" ]; then
+    if [ -z "$argo_mode" ]; then
         if [ "$fixed_argo_requested" -eq 1 ]; then
             use_quick_argo_fallback
             yellow "固定 Argo 隧道配置未生效，已改用临时 Argo 隧道"
         fi
-        argo_exec="ExecStart=/bin/sh -c \"/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1\""
+        argo_mode=quick
     fi
-
-    cat > /etc/systemd/system/argo.service << EOF || return 1
-[Unit]
-Description=Cloudflare Tunnel
-After=network.target
-
-[Service]
-Type=simple
-NoNewPrivileges=yes
-TimeoutStartSec=0
-${argo_exec}
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    write_argo_systemd_service "$argo_mode" || return 1
     if [ -f /etc/centos-release ]; then
         yum install -y chrony || return 1
         systemctl start chronyd || return 1
@@ -2024,7 +2173,7 @@ command_background=true
 pidfile="/var/run/sing-box.pid"
 EOF
 
-    local argo_command_args=""
+    local argo_mode=""
     local tunnel_id=""
     local fixed_argo_requested=0
     ARGO_FIXED_READY=0
@@ -2035,8 +2184,8 @@ EOF
         elif [[ "$ARGO_AUTH" =~ TunnelSecret ]]; then
             tunnel_id=$(extract_argo_tunnel_id "$ARGO_AUTH")
             if [ -n "$tunnel_id" ]; then
-                echo "$ARGO_AUTH" > "${work_dir}/tunnel.json" || return 1
-                cat > "${work_dir}/tunnel.yml" << EOF || return 1
+                write_fixed_argo_credentials json "$ARGO_AUTH" || return 1
+                atomic_write_secret_file "${work_dir}/tunnel.yml" << EOF || return 1
 tunnel: ${tunnel_id}
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
@@ -2046,34 +2195,27 @@ ingress:
     service: http://127.0.0.1:${ARGO_PORT}
   - service: http_status:404
 EOF
-                argo_command_args="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run > /etc/sing-box/argo.log 2>&1'"
+                argo_mode=local
                 ARGO_FIXED_READY=1
             else
                 yellow "ARGO_AUTH 未解析到 TunnelID，改用临时 Argo 隧道"
             fi
         elif is_argo_tunnel_token "$ARGO_AUTH"; then
-            argo_command_args="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH} > /etc/sing-box/argo.log 2>&1'"
+            write_fixed_argo_credentials token "$ARGO_AUTH" || return 1
+            argo_mode=token
             ARGO_FIXED_READY=1
         else
             yellow "ARGO_AUTH 格式不匹配，改用临时 Argo 隧道"
         fi
     fi
-    if [ -z "$argo_command_args" ]; then
+    if [ -z "$argo_mode" ]; then
         if [ "$fixed_argo_requested" -eq 1 ]; then
             use_quick_argo_fallback
             yellow "固定 Argo 隧道配置未生效，已改用临时 Argo 隧道"
         fi
-        argo_command_args="-c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+        argo_mode=quick
     fi
-
-    cat > /etc/init.d/argo << EOF || return 1
-#!/sbin/openrc-run
-description="Cloudflare Tunnel"
-command="/bin/sh"
-command_args="${argo_command_args}"
-command_background=true
-pidfile="/var/run/argo.pid"
-EOF
+    write_argo_openrc_service "$argo_mode" || return 1
     chmod +x /etc/init.d/sing-box || return 1
     chmod +x /etc/init.d/argo || return 1
     rc-update add sing-box default > /dev/null 2>&1 || return 1
@@ -2620,28 +2762,37 @@ uninstall_singbox() {
 
 # 创建快捷指令
 create_shortcut() {
-    local shortcut_root="${SHORTCUT_ROOT:-}"
+    local shortcut_root="${1:-${SHORTCUT_ROOT:-}}"
     local local_bin_dir="${shortcut_root}/usr/local/bin"
     local usr_bin_dir="${shortcut_root}/usr/bin"
+    local wrapper_dir="${shortcut_root}/etc/sing-box"
+    local wrapper_file="${wrapper_dir}/sb.sh"
+    local manager_dir="${shortcut_root}/usr/local/lib/sing-box-pre"
+    local manager_file="${manager_dir}/sing-box.sh"
+    local manager_source="${MANAGER_SOURCE_SCRIPT:-${BASH_SOURCE[0]}}"
+    local wrapper_target='/etc/sing-box/sb.sh'
     local local_sb="${local_bin_dir}/sb"
     local usr_sb="${usr_bin_dir}/sb"
     local singbox_link="${local_bin_dir}/sing-box"
 
-    if [ ! -d "$work_dir" ]; then
-        mkdir -p "$work_dir" || return 1
-    fi
-    cat > "$work_dir/sb.sh" << 'EOF' || return 1
-#!/usr/bin/env bash
-exec bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) "$@"
+    [ -r "$manager_source" ] || return 1
+    bash -n "$manager_source" || return 1
+    mkdir -p "$wrapper_dir" "$manager_dir" "$local_bin_dir" "$usr_bin_dir" || return 1
+    install -m 700 "$manager_source" "$manager_file" || return 1
+    atomic_write_secret_file "$wrapper_file" << 'EOF' || return 1
+#!/bin/bash
+set -e
+exec /usr/local/lib/sing-box-pre/sing-box.sh "$@"
 EOF
-    chmod +x "$work_dir/sb.sh" || return 1
-    mkdir -p "$local_bin_dir" "$usr_bin_dir" || return 1
-    ln -sf "$work_dir/sb.sh" "$local_sb" || return 1
-    ln -sf "$work_dir/sb.sh" "$usr_sb" || return 1
-    if [ ! -e "$singbox_link" ]; then
-        ln -sf "$work_dir/sb.sh" "$singbox_link" || return 1
-    fi
-    if [ -s "$local_sb" ] && [ -s "$usr_sb" ]; then
+    chmod 700 "$wrapper_file" || return 1
+    [ -z "$shortcut_root" ] || wrapper_target="$wrapper_file"
+    ln -sfn "$wrapper_target" "$local_sb" || return 1
+    ln -sfn "$wrapper_target" "$usr_sb" || return 1
+    ln -sfn '/etc/sing-box/sing-box' "$singbox_link" || return 1
+    if [ -x "$manager_file" ] && [ -x "$wrapper_file" ] && \
+       [ "$(readlink "$local_sb" 2>/dev/null)" = "$wrapper_target" ] && \
+       [ "$(readlink "$usr_sb" 2>/dev/null)" = "$wrapper_target" ] && \
+       [ "$(readlink "$singbox_link" 2>/dev/null)" = '/etc/sing-box/sing-box' ]; then
         green "\n快捷指令 sb 创建成功\n"
         return 0
     else
@@ -2650,9 +2801,40 @@ EOF
     fi
 }
 
+update_local_manager() {
+    local install_root="${1:-}"
+    local update_url="${2:-https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh}"
+    local manager_dir="${install_root}/usr/local/lib/sing-box-pre"
+    local manager_file="${manager_dir}/sing-box.sh"
+    local previous_file="${manager_file}.previous"
+    local tmp_file
+
+    mkdir -p "$manager_dir" || return 1
+    tmp_file=$(mktemp "${manager_dir}/.sing-box.sh.new.XXXXXX") || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 60 "$update_url" -o "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    if ! bash -n "$tmp_file" || ! chmod 700 "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    if [ -e "$manager_file" ]; then
+        cp -p "$manager_file" "$previous_file" || { rm -f "$tmp_file"; return 1; }
+        chmod 700 "$previous_file" || { rm -f "$tmp_file"; return 1; }
+    fi
+    if ! mv -f "$tmp_file" "$manager_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+}
+
 update_shortcut() {
-    create_shortcut
-    green "已更新 sb 快捷命令；不会修改已有节点、订阅、端口或服务配置。\n"
+    if ! update_local_manager; then
+        red "sb 本地管理脚本更新失败，已保留当前版本。"
+        return 1
+    fi
+    green "已更新 sb 本地管理脚本；不会修改已有节点、订阅、端口或服务配置。\n"
 }
 
 # 适配alpine
@@ -3531,14 +3713,17 @@ manage_argo() {
             fi
             ArgoDomain=$argo_domain
             ARGO_DOMAIN="$argo_domain"
-            reading "\n请输入你的argo密钥(token或json): " argo_auth
+            reading_secret "\n请输入你的argo密钥(token或json): " argo_auth
             if [[ $argo_auth =~ TunnelSecret ]]; then
                 tunnel_id=$(extract_argo_tunnel_id "$argo_auth")
                 [ -z "$tunnel_id" ] && { yellow "ARGO_AUTH 未解析到 TunnelID，请重新输入"; manage_argo; return; }
                 ARGO_AUTH="$argo_auth"
                 ARGO_FIXED_READY=1
-                echo "$argo_auth" > "${work_dir}/tunnel.json"
-                cat > ${work_dir}/tunnel.yml << EOF
+                write_fixed_argo_credentials json "$argo_auth" || {
+                    yellow "固定 Tunnel JSON 保存失败"
+                    return 1
+                }
+                atomic_write_secret_file "${work_dir}/tunnel.yml" << EOF || return 1
 tunnel: ${tunnel_id}
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
@@ -3551,18 +3736,22 @@ ingress:
   - service: http_status:404
 EOF
                 if command_exists rc-service 2>/dev/null; then
-                    sed -i '/^command_args=/c\command_args="-c '\''/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run > /etc/sing-box/argo.log 2>&1'\''"' /etc/init.d/argo
+                    write_argo_openrc_service local || return 1
                 else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run > /etc/sing-box/argo.log 2>&1"' /etc/systemd/system/argo.service
+                    write_argo_systemd_service local || return 1
                 fi
                 restart_argo; sleep 1; change_argo_domain
             elif is_argo_tunnel_token "$argo_auth"; then
                 ARGO_AUTH="$argo_auth"
                 ARGO_FIXED_READY=1
+                write_fixed_argo_credentials token "$argo_auth" || {
+                    yellow "固定 Tunnel token 保存失败"
+                    return 1
+                }
                 if command_exists rc-service 2>/dev/null; then
-                    sed -i "/^command_args=/c\command_args=\"-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth > /etc/sing-box/argo.log 2>&1'\"" /etc/init.d/argo
+                    write_argo_openrc_service token || return 1
                 else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' > /etc/sing-box/argo.log 2>&1"' /etc/systemd/system/argo.service
+                    write_argo_systemd_service token || return 1
                 fi
                 restart_argo; sleep 1; change_argo_domain
             else
@@ -3588,13 +3777,7 @@ EOF
             get_quick_tunnel; change_argo_domain
             ;;
         6)
-            if command_exists rc-service 2>/dev/null; then
-                grep -Eq -- '--url http://(127\.0\.0\.1|localhost)' "/etc/init.d/argo" && get_quick_tunnel && change_argo_domain || \
-                    { yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2; menu; }
-            else
-                grep -Eq 'ExecStart=.*--url http://(127\.0\.0\.1|localhost)' "/etc/systemd/system/argo.service" && get_quick_tunnel && change_argo_domain || \
-                    { yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2; menu; }
-            fi
+            refresh_quick_argo || { sleep 2; return 1; }
             ;;
         0) menu ;;
         *) red "无效的选项！" ;;
@@ -4946,6 +5129,13 @@ delete_rule_menu() {
     sleep 1; warp_manage
 }
 
+probe_proxy_url() {
+    local proxy_url="$1"
+
+    curl -fsS --proxy "$proxy_url" --connect-timeout 5 --max-time 10 \
+        https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+}
+
 add_socks5_proxy() {
     clear
     reading "请输入代理URL (支持socks://,socks5://,http:// 支持v2rayN导出的节点链接): " proxy_url
@@ -4998,36 +5188,24 @@ add_socks5_proxy() {
     [ -n "$user" ] && [ -n "$password" ] && proxy_auth="${user}:${password}@" || \
         { [ -n "$user" ] && proxy_auth="${user}@"; }
 
+    local curl_proxy_url="${check_proto}://${proxy_auth}${server}:${port}"
     if [ "$is_local" = true ]; then
-        # 本地代理：直接用 curl 通过代理访问外网测试连通性
-        yellow "检测到本地代理 ${check_proto}://${server}:${port}，跳过外部API检测，正在用curl测试连通性..."
-        local curl_proxy_url="${check_proto}://${proxy_auth}${server}:${port}"
-        local test_result
-        test_result=$(curl -s --max-time 8 --proxy "$curl_proxy_url" "https://api.ip.sb/ip" 2>/dev/null)
-        if [ -z "$test_result" ]; then
+        yellow "检测到本地代理 ${check_proto}://${server}:${port}，正在测试连通性..."
+        if ! probe_proxy_url "$curl_proxy_url" 2>/dev/null; then
             yellow "警告：通过本地代理访问外网失败，请确认代理服务正在运行。"
             reading "是否仍然添加此代理？(y/n): " force_add
             [[ ! "$force_add" =~ ^[yY]$ ]] && { yellow "已取消"; sleep 1; return; }
         else
-            green "本地代理可用，出口IP: $test_result"
+            green "本地代理可用"
         fi
     else
-        # 远程代理：调用外部 API 检测
         yellow "正在测试代理 ${check_proto}://${server}:${port} ..."
-        local api_response
-        api_response=$(curl -s --max-time 8 -G \
-            --data-urlencode "proxy=${check_proto}://${proxy_auth}${server}:${port}" \
-            "https://check.socks5.cmliussss.net/check" 2>/dev/null)
-        [ -z "$api_response" ] && { red "API 请求失败"; sleep 2; return; }
-
-        success=$(echo "$api_response" | jq -r '.success')
-        if [ "$success" != "true" ]; then
-            error_msg=$(echo "$api_response" | jq -r '.error // "未知错误"')
-            red "代理不可用: $error_msg"; sleep 2; return
+        if ! probe_proxy_url "$curl_proxy_url" 2>/dev/null; then
+            red "代理不可用或健康检查失败"
+            sleep 2
+            return
         fi
-        exit_ip=$(echo "$api_response" | jq -r '.exit.ip // empty')
         green "代理可用"
-        [ -n "$exit_ip" ] && green "出口 IP: $exit_ip"
     fi
 
     [ -n "$tag_from_url" ] && tag="$tag_from_url" || tag="${outbound_type}-${server}-${port}"
@@ -5649,6 +5827,13 @@ menu() {
     # ← 去掉 reading，只负责显示
 }
 
+# Harden legacy installations before any management action can expose or
+# rewrite credential-bearing configuration.
+harden_runtime_secret_permissions || {
+    red "无法收紧 sing-box 凭据文件权限，操作中止。"
+    exit 1
+}
+
 # 捕获 Ctrl+C
 trap 'stop_warp_candidate_proxy 2>/dev/null || true; red "\n强制退出"; exit' INT TERM
 
@@ -5660,7 +5845,7 @@ case "$1" in
         ;;
     --update | --upgrade)
         update_shortcut
-        exit 0
+        exit $?
         ;;
     -u | --uninstall)
         auto_uninstall
@@ -5676,16 +5861,15 @@ case "$1" in
         exit 0
         ;;
     -r | --restart)
-        get_quick_tunnel
-        change_argo_domain
-        exit 0
+        refresh_quick_argo
+        exit $?
         ;;
     -h | --help)
         echo ""
         green "用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)"
         echo ""
         green "  -i, --install     无交互安装sing-box"
-        green "      --update      仅更新 sb 快捷命令，不修改已有节点"
+        green "      --update      显式更新本地 sb 管理脚本，不修改已有节点"
         green "  -c, --check       查看节点信息和订阅链接"
         green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
         green "  -u, --uninstall   uninstall sing-box and keep nginx"

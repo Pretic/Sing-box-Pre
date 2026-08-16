@@ -80,6 +80,7 @@ for function_name in \
     load_install_settings \
     persist_install_settings \
     atomic_write_file \
+    atomic_write_secret_file \
     write_base64_subscription \
     sync_combined_subscription \
     update_sub \
@@ -818,6 +819,7 @@ run_shortcut_case() {
     command rm -rf "$fixture"
     command mkdir -p "${fixture}/etc/sing-box"
     SHORTCUT_ROOT="$fixture"
+    MANAGER_SOURCE_SCRIPT="$script"
     work_dir="${fixture}/etc/sing-box"
     SHORTCUT_FAIL_STAGE="$stage"
 
@@ -857,6 +859,7 @@ run_shortcut_case() {
         assert_fail create_shortcut
     fi
     unset -f cat chmod mkdir ln
+    unset MANAGER_SOURCE_SCRIPT
 }
 
 for SHORTCUT_FAILURE in write chmod mkdir ln missing_second; do
