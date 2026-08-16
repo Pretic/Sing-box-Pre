@@ -174,4 +174,32 @@ manage_argo "$quick_service"
 assert_equal $'restart\nparse\nchange' "$(cat "$refresh_log")" \
     'manage_argo quick Tunnel call sequence'
 
+# Every CLI alias must return the status from the action it dispatches. Unique
+# mock statuses prove both handler selection and exact propagation.
+auto_install() { return 41; }
+update_shortcut() { return 42; }
+auto_uninstall() { return 43; }
+check_nodes() { return 44; }
+refresh_quick_argo() { return 45; }
+
+assert_dispatch_status() {
+    local expected="$1"
+    local action="$2"
+    local actual
+
+    set +e
+    dispatch_cli_action "$action" "${tmp_dir}/unused-service" >/dev/null 2>&1
+    actual=$?
+    set -e
+    assert_equal "$expected" "$actual" "${action} dispatcher status"
+}
+
+for action in -i --install; do assert_dispatch_status 41 "$action"; done
+for action in --update --upgrade; do assert_dispatch_status 42 "$action"; done
+for action in -u --uninstall --purge-nginx; do assert_dispatch_status 43 "$action"; done
+for action in -c --check; do assert_dispatch_status 44 "$action"; done
+for action in -r --restart; do assert_dispatch_status 45 "$action"; done
+for action in -h --help; do assert_dispatch_status 0 "$action"; done
+assert_dispatch_status 1 --unknown-action
+
 printf 'Uninstall and dispatcher tests passed.\n'

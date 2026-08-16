@@ -5827,16 +5827,13 @@ dispatch_cli_action() {
         --update|--upgrade) update_shortcut ;;
         -u|--uninstall)
             auto_uninstall
-            return 0
             ;;
         --purge-nginx)
             PURGE_NGINX=1
             auto_uninstall
-            return 0
             ;;
         -c|--check)
             check_nodes
-            return 0
             ;;
         -r|--restart) refresh_quick_argo "$service_file" ;;
         -h|--help)

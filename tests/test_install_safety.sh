@@ -1143,9 +1143,14 @@ for INSTALL_MODE in auto interactive; do
     done
 done
 
-install_case="$(sed -n '/^    -i | --install)/,/^        ;;/p' "$script")"
-grep -Fq 'exit $?' <<< "$install_case" || \
-    fail 'the --install command-line path masks auto_install failures'
+load_function dispatch_cli_action
+auto_install() { return 37; }
+set +e
+dispatch_cli_action --install
+install_dispatch_status=$?
+set -e
+assert_equal 37 "$install_dispatch_status" \
+    'the --install command-line path masks auto_install failures'
 
 interactive_case="$(sed -n '/^                1)/,/^                    ;;/p' "$script")"
 grep -Fq 'interactive_install' <<< "$interactive_case" || \
