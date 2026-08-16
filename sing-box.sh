@@ -1156,6 +1156,16 @@ refresh_quick_argo() {
     change_argo_domain
 }
 
+dispatch_argo_menu_action() {
+    local choice="${1:-}"
+    local service_file="${2:-}"
+
+    case "$choice" in
+        6) dispatch_cli_action -r "$service_file" ;;
+        *) return 2 ;;
+    esac
+}
+
 strip_local_tunnel_subscription_rule() {
     local input_file="${1:-}"
     local output_file="${2:-}"
@@ -2730,6 +2740,20 @@ purge_nginx_package() {
     manage_packages uninstall "$package"
 }
 
+remove_managed_singbox_link() {
+    local install_root="${1:-}"
+    local singbox_link="${install_root}/usr/local/bin/sing-box"
+    local link_target
+
+    [ -L "$singbox_link" ] || return 0
+    link_target=$(readlink "$singbox_link" 2>/dev/null) || return 0
+    case "$link_target" in
+        /etc/sing-box/sb.sh|/etc/sing-box/sing-box)
+            rm -f "$singbox_link"
+            ;;
+    esac
+}
+
 # 卸载 sing-box（交互式）
 uninstall_singbox() {
     reading "确定要卸载 sing-box 吗? (y/n): " choice
@@ -2935,6 +2959,8 @@ interactive_install() {
 
 # Non-interactive uninstall (-u); keeps nginx unless PURGE_NGINX=1 or --purge-nginx is used.
 auto_uninstall() {
+    local uninstall_root="${1:-}"
+
     green "Starting non-interactive sing-box uninstall..."
 
     if command_exists rc-service; then
@@ -2942,26 +2968,25 @@ auto_uninstall() {
         rc-service argo stop      > /dev/null 2>&1
         rc-update del sing-box default > /dev/null 2>&1
         rc-update del argo default     > /dev/null 2>&1
-        rm -f /etc/init.d/sing-box /etc/init.d/argo
+        rm -f "${uninstall_root}/etc/init.d/sing-box" "${uninstall_root}/etc/init.d/argo"
     elif command_exists systemctl; then
         systemctl stop    sing-box > /dev/null 2>&1
         systemctl stop    argo     > /dev/null 2>&1
         systemctl disable sing-box > /dev/null 2>&1
         systemctl disable argo     > /dev/null 2>&1
         systemctl daemon-reload    > /dev/null 2>&1
-        rm -f /etc/systemd/system/sing-box.service \
-              /etc/systemd/system/argo.service
+        rm -f "${uninstall_root}/etc/systemd/system/sing-box.service" \
+              "${uninstall_root}/etc/systemd/system/argo.service"
     fi
 
     rm -rf "${work_dir}"
-    rm -f /usr/bin/sb /usr/local/bin/sb
-    if [ -L /usr/local/bin/sing-box ] && [ "$(readlink /usr/local/bin/sing-box 2>/dev/null)" = "${work_dir}/sb.sh" ]; then
-        rm -f /usr/local/bin/sing-box
-    fi
+    rm -f "${uninstall_root}/usr/bin/sb" "${uninstall_root}/usr/local/bin/sb"
+    remove_managed_singbox_link "$uninstall_root"
 
-    rm -f /etc/nginx/conf.d/sing-box.conf
-    [ -f /etc/nginx/nginx.conf.bak.sb ] && \
-        mv /etc/nginx/nginx.conf.bak.sb /etc/nginx/nginx.conf > /dev/null 2>&1
+    rm -f "${uninstall_root}/etc/nginx/conf.d/sing-box.conf"
+    [ -f "${uninstall_root}/etc/nginx/nginx.conf.bak.sb" ] && \
+        mv "${uninstall_root}/etc/nginx/nginx.conf.bak.sb" \
+           "${uninstall_root}/etc/nginx/nginx.conf" > /dev/null 2>&1
 
     if [ "${PURGE_NGINX}" = "1" ]; then
         if command_exists nginx; then
@@ -3671,6 +3696,7 @@ manage_singbox() {
 
 # Argo 管理
 manage_argo() {
+    local service_file="${1:-}"
     local argo_status=$(check_argo 2>/dev/null)
     clear; echo ""
     green "=== Argo 隧道管理 ===\n"
@@ -3777,7 +3803,7 @@ EOF
             get_quick_tunnel; change_argo_domain
             ;;
         6)
-            refresh_quick_argo || { sleep 2; return 1; }
+            dispatch_argo_menu_action "$choice" "$service_file" || { sleep 2; return 1; }
             ;;
         0) menu ;;
         *) red "无效的选项！" ;;
@@ -5791,6 +5817,52 @@ manage_protocols() {
     manage_protocols
 }
 
+# 可测试的命令行参数分发
+dispatch_cli_action() {
+    local action="${1:-}"
+    local service_file="${2:-}"
+
+    case "$action" in
+        -i|--install) auto_install ;;
+        --update|--upgrade) update_shortcut ;;
+        -u|--uninstall)
+            auto_uninstall
+            return 0
+            ;;
+        --purge-nginx)
+            PURGE_NGINX=1
+            auto_uninstall
+            return 0
+            ;;
+        -c|--check)
+            check_nodes
+            return 0
+            ;;
+        -r|--restart) refresh_quick_argo "$service_file" ;;
+        -h|--help)
+            echo ""
+            green "用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)"
+            echo ""
+            green "  -i, --install     无交互安装sing-box"
+            green "      --update      显式更新本地 sb 管理脚本，不修改已有节点"
+            green "  -c, --check       查看节点信息和订阅链接"
+            green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
+            green "  -u, --uninstall   uninstall sing-box and keep nginx"
+            green "      --purge-nginx  uninstall sing-box and remove nginx"
+            green "  -h, --help        显示此帮助信息"
+            echo ""
+            green "  不带参数          进入交互式主菜单"
+            echo ""
+            ;;
+        *)
+            red "未知参数: $action"
+            echo ""
+            green "用法: sb [参数],相关参数:[-i|-u|-c|-r|-h], 首次安装：bash脚本 -i(前面可带环境变量)"
+            return 1
+            ;;
+    esac
+}
+
 # 主菜单
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
@@ -5838,51 +5910,12 @@ harden_runtime_secret_permissions || {
 trap 'stop_warp_candidate_proxy 2>/dev/null || true; red "\n强制退出"; exit' INT TERM
 
 # ---- 参数解析入口 ----
-case "$1" in
-    -i | --install)
-        auto_install
-        exit $?
-        ;;
-    --update | --upgrade)
-        update_shortcut
-        exit $?
-        ;;
-    -u | --uninstall)
-        auto_uninstall
-        exit 0
-        ;;
-    --purge-nginx)
-        PURGE_NGINX=1
-        auto_uninstall
-        exit 0
-        ;;
-    -c | --check)
-        check_nodes
-        exit 0
-        ;;
-    -r | --restart)
-        refresh_quick_argo
-        exit $?
-        ;;
-    -h | --help)
-        echo ""
-        green "用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)"
-        echo ""
-        green "  -i, --install     无交互安装sing-box"
-        green "      --update      显式更新本地 sb 管理脚本，不修改已有节点"
-        green "  -c, --check       查看节点信息和订阅链接"
-        green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
-        green "  -u, --uninstall   uninstall sing-box and keep nginx"
-        green "      --purge-nginx  uninstall sing-box and remove nginx"
-        green "  -h, --help        显示此帮助信息"
-        echo ""
-        green "  不带参数          进入交互式主菜单"
-        echo ""
-        exit 0
-        ;;
-    "")
-        # 无参数：进入交互式主菜单
-        while true; do
+if [ -n "${1:-}" ]; then
+    dispatch_cli_action "$1"
+    exit $?
+else
+    # 无参数：进入交互式主菜单
+    while true; do
             menu
             reading "请输入选择(0-10): " choice
             echo ""
@@ -5911,12 +5944,5 @@ case "$1" in
                     ;;
             esac
             [ "$need_pause" = true ] && read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
-        done
-        ;;
-    *)
-        red "未知参数: $1"
-        echo ""
-        green "用法: sb [参数],相关参数:[-i|-u|-c|-r|-h], 首次安装：bash脚本 -i(前面可带环境变量)"
-        exit 1
-        ;;
-esac
+    done
+fi

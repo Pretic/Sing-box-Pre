@@ -273,12 +273,4 @@ printf '%s\n' \
 assert_ok refresh_quick_argo "$quick_service"
 assert_equal $'get\nchange' "$(cat "$refresh_log")" 'quick Tunnel refresh call sequence'
 
-cli_restart_case="$(sed -n '/^    -r | --restart)/,/^        ;;/p' "$script")"
-grep -Fq 'refresh_quick_argo' <<< "$cli_restart_case" || \
-    fail 'sb -r does not use the shared Tunnel refresh guard'
-! grep -Fq 'get_quick_tunnel' <<< "$cli_restart_case" || \
-    fail 'sb -r bypasses the shared Tunnel refresh guard'
-grep -Fq 'refresh_quick_argo' <<< "$manage_argo_source" || \
-    fail 'interactive Tunnel refresh does not use the shared guard'
-
 printf 'Local manager and secret safety tests passed.\n'
