@@ -145,11 +145,11 @@ grep -Fq 'resolve_installed_subscription_source_url' <<< "$status_source" || {
     exit 1
 }
 
-auto_source="$(extract_function auto_install)"
-add_line="$(grep -n 'add_nginx_conf' <<< "$auto_source" | head -1 | cut -d: -f1)"
-info_line="$(grep -n 'get_info' <<< "$auto_source" | head -1 | cut -d: -f1)"
+install_flow_source="$(extract_function run_install_flow)"
+add_line="$(grep -n 'add_nginx_conf' <<< "$install_flow_source" | head -1 | cut -d: -f1)"
+info_line="$(grep -n 'get_info' <<< "$install_flow_source" | head -1 | cut -d: -f1)"
 [[ -n "$add_line" && -n "$info_line" && "$add_line" -lt "$info_line" ]] || {
-    echo 'FAIL: auto install prints subscription links before nginx configuration exists' >&2
+    echo 'FAIL: shared install flow prints subscription links before nginx configuration exists' >&2
     exit 1
 }
 

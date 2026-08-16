@@ -1972,6 +1972,8 @@ EOF
 
 # 生成节点和订阅链接
 get_info() {
+    local url_file tmp_url_file
+
     yellow "\nip检测中,请稍等...\n"
     server_ipv4=$(get_public_ipv4 2>/dev/null || true)
     server_ipv6=$(get_public_ipv6 2>/dev/null || true)
@@ -2031,18 +2033,34 @@ get_info() {
     reality_v6_name="${isp}-vless-reality-ipv6"
     argo_name="${isp}-vless-ws-tls-argo"
 
-    : > ${work_dir}/url.txt
+    url_file="${client_dir:-${work_dir}/url.txt}"
+    tmp_url_file=$(mktemp "${work_dir}/.tmp.url.txt.XXXXXX") || return 1
+    if ! : > "$tmp_url_file"; then
+        rm -f "$tmp_url_file"
+        return 1
+    fi
     if [ -n "$server_ipv4" ]; then
-        cat >> ${work_dir}/url.txt << EOF
+        if ! cat >> "$tmp_url_file" << EOF
 vless://${uuid}@${server_ipv4}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${reality_v4_name}
 EOF
+        then
+            rm -f "$tmp_url_file"
+            return 1
+        fi
     fi
 
     if [ -n "$server_ipv6" ]; then
-        [ -s "${work_dir}/url.txt" ] && echo "" >> "${work_dir}/url.txt"
-        cat >> ${work_dir}/url.txt << EOF
+        if [ -s "$tmp_url_file" ] && ! printf '\n' >> "$tmp_url_file"; then
+            rm -f "$tmp_url_file"
+            return 1
+        fi
+        if ! cat >> "$tmp_url_file" << EOF
 vless://${uuid}@${server_ipv6}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${reality_v6_name}
 EOF
+        then
+            rm -f "$tmp_url_file"
+            return 1
+        fi
     fi
 
     if [ -n "$argodomain" ]; then
@@ -2052,29 +2070,45 @@ EOF
             if [ "$argo_address_role" = "preferred" ]; then
                 argo_client_name="${argo_name}-preferred"
             fi
-            [ -s "${work_dir}/url.txt" ] && echo "" >> "${work_dir}/url.txt"
-            cat >> ${work_dir}/url.txt << EOF
+            if [ -s "$tmp_url_file" ] && ! printf '\n' >> "$tmp_url_file"; then
+                rm -f "$tmp_url_file"
+                return 1
+            fi
+            if ! cat >> "$tmp_url_file" << EOF
 vless://${uuid}@${argo_client_address}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo#${argo_client_name}
 EOF
+            then
+                rm -f "$tmp_url_file"
+                return 1
+            fi
         done < <(list_argo_client_addresses "$CFIP" "$argodomain" "$ARGO_FIXED_READY")
     fi
 
     if [ "${INCLUDE_UDP_LINKS}" = "1" ]; then
-        cat >> ${work_dir}/url.txt << EOF
+        if ! cat >> "$tmp_url_file" << EOF
 
 hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}
 
 tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}
 EOF
+        then
+            rm -f "$tmp_url_file"
+            return 1
+        fi
     fi
 
     if [ -n "$extra_lines" ]; then
-        echo "" >> "${work_dir}/url.txt"
-        echo "$extra_lines" >> "${work_dir}/url.txt"
+        if ! printf '\n%s\n' "$extra_lines" >> "$tmp_url_file"; then
+            rm -f "$tmp_url_file"
+            return 1
+        fi
     fi
 
+    chmod 644 "$tmp_url_file" 2>/dev/null || { rm -f "$tmp_url_file"; return 1; }
+    mv -f "$tmp_url_file" "$url_file" || { rm -f "$tmp_url_file"; return 1; }
+
     echo ""
-    while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
+    while IFS= read -r line; do echo -e "${purple}$line"; done < "$url_file"
     update_sub || return 1
     chmod 644 "${work_dir}/sub.txt" || return 1
     yellow "\n温馨提醒:"
@@ -2483,15 +2517,8 @@ change_hosts() {
     sed -i '2s/.*/::1         localhost/' /etc/hosts
 }
 
-# 非交互静默安装（-i 参数）
-auto_install() {
-    check_singbox &>/dev/null
-    if [ $? -eq 0 ]; then
-        yellow "sing-box 已经安装，跳过安装流程。"
-        return 0
-    fi
-
-    green "Starting non-interactive sing-box install..."
+# Fail-fast install orchestration shared by interactive and non-interactive paths.
+run_install_flow() {
     manage_packages install nginx jq tar openssl lsof coreutils || {
         red "依赖安装失败，安装中止。"
         return 1
@@ -2536,6 +2563,28 @@ auto_install() {
     get_info || { red "节点信息生成失败，安装中止。"; return 1; }
     create_shortcut || { red "快捷指令创建失败，安装中止。"; return 1; }
     green "\nsing-box 安装完成\n"
+}
+
+# 非交互静默安装（-i 参数）
+auto_install() {
+    check_singbox &>/dev/null
+    if [ $? -eq 0 ]; then
+        yellow "sing-box 已经安装，跳过安装流程。"
+        return 0
+    fi
+
+    green "Starting non-interactive sing-box install..."
+    run_install_flow
+}
+
+interactive_install() {
+    check_singbox &>/dev/null
+    if [ $? -eq 0 ]; then
+        yellow "sing-box 已经安装！\n"
+        return 0
+    fi
+
+    run_install_flow
 }
 
 # Non-interactive uninstall (-u); keeps nginx unless PURGE_NGINX=1 or --purge-nginx is used.
@@ -4919,19 +4968,23 @@ write_base64_subscription() {
     tmp_file=$(mktemp "${sub_dir}/.tmp.${sub_name}.XXXXXX") || return 1
 
     if [ ! -s "$source_file" ]; then
-        : > "$tmp_file"
+        if ! : > "$tmp_file"; then
+            rm -f "$tmp_file"
+            return 1
+        fi
     elif ! base64 -w0 "$source_file" > "$tmp_file" 2>/dev/null; then
-        if ! base64 "$source_file" | tr -d '\n\r' > "$tmp_file"; then
+        if ! (set -o pipefail; base64 "$source_file" | tr -d '\n\r' > "$tmp_file"); then
             rm -f "$tmp_file"
             return 1
         fi
     fi
 
-    chmod 644 "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$sub_file"
+    chmod 644 "$tmp_file" 2>/dev/null || { rm -f "$tmp_file"; return 1; }
+    mv -f "$tmp_file" "$sub_file" || { rm -f "$tmp_file"; return 1; }
 }
 sync_combined_subscription() {
     local tmp_file cfy_file cfy_sub_file combined_sub_file
+    local tmp_cfy_sub_file='' tmp_combined_sub_file='' tmp_sub_file=''
     cfy_file="${work_dir}/cfy-url.txt"
     cfy_sub_file="${work_dir}/cfy-sub.txt"
     combined_sub_file="${work_dir}/all-sub.txt"
@@ -4939,20 +4992,64 @@ sync_combined_subscription() {
     mkdir -p "${work_dir}" || return 1
     tmp_file=$(mktemp "${work_dir}/.tmp.all-url.XXXXXX") || return 1
 
-    [ -s "$client_dir" ] && sed '/^[[:space:]]*$/d' "$client_dir" > "$tmp_file"
+    if [ -s "$client_dir" ] && ! sed '/^[[:space:]]*$/d' "$client_dir" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
     if [ -s "$cfy_file" ]; then
-        [ -s "$tmp_file" ] && printf '\n' >> "$tmp_file"
-        sed '/^[[:space:]]*$/d' "$cfy_file" >> "$tmp_file"
-        write_base64_subscription "$cfy_file" "$cfy_sub_file" || { rm -f "$tmp_file"; return 1; }
+        if [ -s "$tmp_file" ] && ! printf '\n' >> "$tmp_file"; then
+            rm -f "$tmp_file"
+            return 1
+        fi
+        if ! sed '/^[[:space:]]*$/d' "$cfy_file" >> "$tmp_file"; then
+            rm -f "$tmp_file"
+            return 1
+        fi
+        tmp_cfy_sub_file=$(mktemp "${work_dir}/.tmp.cfy-sub.txt.XXXXXX") || { rm -f "$tmp_file"; return 1; }
+        write_base64_subscription "$cfy_file" "$tmp_cfy_sub_file" || {
+            rm -f "$tmp_file" "$tmp_cfy_sub_file"
+            return 1
+        }
     fi
 
     if [ -s "$tmp_file" ]; then
-        chmod 644 "$tmp_file" 2>/dev/null || true
-        mv -f "$tmp_file" "$combined_client_dir" || { rm -f "$tmp_file"; return 1; }
-        write_base64_subscription "$combined_client_dir" "$combined_sub_file" || return 1
-        write_base64_subscription "$combined_client_dir" "${work_dir}/sub.txt" || return 1
+        chmod 644 "$tmp_file" 2>/dev/null || {
+            rm -f "$tmp_file" "$tmp_cfy_sub_file"
+            return 1
+        }
+        tmp_combined_sub_file=$(mktemp "${work_dir}/.tmp.all-sub.txt.XXXXXX") || {
+            rm -f "$tmp_file" "$tmp_cfy_sub_file"
+            return 1
+        }
+        tmp_sub_file=$(mktemp "${work_dir}/.tmp.sub.txt.XXXXXX") || {
+            rm -f "$tmp_file" "$tmp_cfy_sub_file" "$tmp_combined_sub_file"
+            return 1
+        }
+        write_base64_subscription "$tmp_file" "$tmp_combined_sub_file" || {
+            rm -f "$tmp_file" "$tmp_cfy_sub_file" "$tmp_combined_sub_file" "$tmp_sub_file"
+            return 1
+        }
+        write_base64_subscription "$tmp_file" "$tmp_sub_file" || {
+            rm -f "$tmp_file" "$tmp_cfy_sub_file" "$tmp_combined_sub_file" "$tmp_sub_file"
+            return 1
+        }
+        mv -f "$tmp_file" "$combined_client_dir" || {
+            rm -f "$tmp_file" "$tmp_cfy_sub_file" "$tmp_combined_sub_file" "$tmp_sub_file"
+            return 1
+        }
+        mv -f "$tmp_combined_sub_file" "$combined_sub_file" || {
+            rm -f "$tmp_cfy_sub_file" "$tmp_combined_sub_file" "$tmp_sub_file"
+            return 1
+        }
+        mv -f "$tmp_sub_file" "${work_dir}/sub.txt" || {
+            rm -f "$tmp_cfy_sub_file" "$tmp_sub_file"
+            return 1
+        }
+        if [ -n "$tmp_cfy_sub_file" ]; then
+            mv -f "$tmp_cfy_sub_file" "$cfy_sub_file" || { rm -f "$tmp_cfy_sub_file"; return 1; }
+        fi
     else
-        rm -f "$tmp_file"
+        rm -f "$tmp_file" "$tmp_cfy_sub_file"
         printf '' | atomic_write_file "$combined_client_dir" 644 || return 1
         printf '' | atomic_write_file "$combined_sub_file" 644 || return 1
         printf '' | atomic_write_file "${work_dir}/sub.txt" 644 || return 1
@@ -5444,27 +5541,7 @@ case "$1" in
             need_pause=true
             case "${choice}" in
                 1)
-                    check_singbox &>/dev/null; singbox_check=$?
-                    if [ ${singbox_check} -eq 0 ]; then
-                        yellow "sing-box 已经安装！\n"
-                    else
-                        manage_packages install nginx jq tar openssl lsof coreutils
-                        install_singbox
-                        if command_exists systemctl; then
-                            main_systemd_services
-                        elif command_exists rc-update; then
-                            alpine_openrc_services
-                            change_hosts
-                            rc-service sing-box restart
-                            rc-service argo restart
-                        else
-                            echo "Unsupported init system"; exit 1
-                        fi
-                        sleep 5
-                        add_nginx_conf
-                        get_info
-                        create_shortcut
-                    fi
+                    interactive_install
                     ;;
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;

@@ -52,6 +52,24 @@ assert_count() {
     assert_equal "$expected" "$actual" "$description"
 }
 
+assert_file_content() {
+    local expected="$1"
+    local path="$2"
+    local description="$3"
+    local actual
+    actual="$(command cat "$path")"
+    assert_equal "$expected" "$actual" "$description"
+}
+
+assert_no_temp_files() {
+    local directory="$1"
+    local pattern="$2"
+    local description="$3"
+    if compgen -G "${directory}/${pattern}" >/dev/null; then
+        fail "$description"
+    fi
+}
+
 for function_name in \
     validate_port_value \
     resolve_service_ports \
@@ -347,11 +365,126 @@ if grep -Fq 'ping -c' <<< "$install_source"; then
 fi
 
 subscription_root="${tmp_dir}/subscription-failures"
-command mkdir -p "$subscription_root"
-work_dir="$subscription_root"
-client_dir="${work_dir}/url.txt"
-combined_client_dir="${work_dir}/all-url.txt"
-printf '%s\n' 'vless://fixture' > "$client_dir"
+setup_subscription_fixture() {
+    command rm -rf "$subscription_root"
+    command mkdir -p "$subscription_root"
+    work_dir="$subscription_root"
+    client_dir="${work_dir}/url.txt"
+    combined_client_dir="${work_dir}/all-url.txt"
+    builtin printf '%s\n' 'vless://fixture' > "$client_dir"
+    builtin printf '%s\n' 'cfy://fixture' > "${work_dir}/cfy-url.txt"
+    builtin printf '%s\n' 'old-base-sub' > "${work_dir}/base-sub.txt"
+    builtin printf '%s\n' 'old-cfy-sub' > "${work_dir}/cfy-sub.txt"
+    builtin printf '%s\n' 'old-all-url' > "$combined_client_dir"
+    builtin printf '%s\n' 'old-all-sub' > "${work_dir}/all-sub.txt"
+    builtin printf '%s\n' 'old-sub' > "${work_dir}/sub.txt"
+}
+
+assert_subscription_publications_unchanged() {
+    assert_file_content 'old-cfy-sub' "${work_dir}/cfy-sub.txt" 'cfy subscription changed after a failed sync'
+    assert_file_content 'old-all-url' "$combined_client_dir" 'combined URL publication changed after a failed sync'
+    assert_file_content 'old-all-sub' "${work_dir}/all-sub.txt" 'combined base64 publication changed after a failed sync'
+    assert_file_content 'old-sub' "${work_dir}/sub.txt" 'main subscription changed after a failed sync'
+}
+
+setup_subscription_fixture
+BASE64_PRIMARY_CALLS=0
+BASE64_PIPELINE_FAILURE=0
+base64() {
+    if [[ "${1:-}" == '-w0' ]]; then
+        BASE64_PRIMARY_CALLS=$((BASE64_PRIMARY_CALLS + 1))
+        BASE64_PIPELINE_FAILURE=1
+        return 1
+    fi
+    builtin printf 'partial-base64'
+    [[ "$BASE64_PIPELINE_FAILURE" != 1 ]]
+}
+set +o pipefail
+if write_base64_subscription "$client_dir" "${work_dir}/base-sub.txt" >/dev/null 2>&1; then
+    fail 'write_base64_subscription ignored a failed fallback base64 producer without caller pipefail'
+fi
+set -o pipefail
+unset -f base64
+assert_file_content 'old-base-sub' "${work_dir}/base-sub.txt" 'failed base64 generation replaced the published subscription'
+assert_no_temp_files "$work_dir" '.tmp.base-sub.txt.*' 'failed base64 generation left a temporary file'
+
+setup_subscription_fixture
+WRITE_STAGE_LOG="${work_dir}/write-stage.log"
+mktemp() {
+    builtin printf '%s\n' "${work_dir}/missing/.tmp.base-sub.txt.injected"
+}
+chmod() {
+    builtin printf '%s\n' chmod >> "$WRITE_STAGE_LOG"
+    return 0
+}
+mv() {
+    builtin printf '%s\n' mv >> "$WRITE_STAGE_LOG"
+    return 0
+}
+assert_fail write_base64_subscription "${work_dir}/missing-source.txt" "${work_dir}/base-sub.txt"
+[[ ! -e "$WRITE_STAGE_LOG" ]] || fail 'write_base64_subscription continued after its empty-file truncate failed'
+unset -f mktemp chmod mv
+assert_file_content 'old-base-sub' "${work_dir}/base-sub.txt" 'failed empty subscription write replaced the published subscription'
+
+setup_subscription_fixture
+chmod() {
+    [[ "${2:-}" != "${work_dir}/.tmp.base-sub.txt."* ]]
+}
+assert_fail write_base64_subscription "$client_dir" "${work_dir}/base-sub.txt"
+unset -f chmod
+assert_file_content 'old-base-sub' "${work_dir}/base-sub.txt" 'chmod failure replaced the published subscription'
+assert_no_temp_files "$work_dir" '.tmp.base-sub.txt.*' 'chmod failure left a temporary subscription file'
+
+setup_subscription_fixture
+mv() {
+    local target=''
+    for target in "$@"; do :; done
+    [[ "$target" != "${work_dir}/base-sub.txt" ]] || return 1
+    command mv "$@"
+}
+assert_fail write_base64_subscription "$client_dir" "${work_dir}/base-sub.txt"
+unset -f mv
+assert_file_content 'old-base-sub' "${work_dir}/base-sub.txt" 'mv failure replaced the published subscription'
+assert_no_temp_files "$work_dir" '.tmp.base-sub.txt.*' 'mv failure left a temporary subscription file'
+
+run_combined_generation_failure() {
+    local stage="$1"
+    setup_subscription_fixture
+    COMBINED_FAIL_STAGE="$stage"
+    sed() {
+        local source_file="${*: -1}"
+        if [[ "$COMBINED_FAIL_STAGE" == sed_client && "$source_file" == "$client_dir" ]]; then
+            return 1
+        fi
+        if [[ "$COMBINED_FAIL_STAGE" == sed_cfy && "$source_file" == "${work_dir}/cfy-url.txt" ]]; then
+            return 1
+        fi
+        command sed "$@"
+    }
+    printf() {
+        if [[ "$COMBINED_FAIL_STAGE" == separator && "$#" -eq 1 && "$1" == '\n' ]]; then
+            return 1
+        fi
+        builtin printf "$@"
+    }
+    chmod() {
+        if [[ "$COMBINED_FAIL_STAGE" == chmod && "${2:-}" == "${work_dir}/.tmp.all-url."* ]]; then
+            return 1
+        fi
+        command chmod "$@"
+    }
+
+    assert_fail sync_combined_subscription
+    unset -f sed printf chmod
+    assert_subscription_publications_unchanged
+    assert_no_temp_files "$work_dir" '.tmp.all-url.*' "${stage} failure left a combined-subscription temporary file"
+}
+
+for COMBINED_GENERATION_FAILURE in sed_client sed_cfy separator chmod; do
+    run_combined_generation_failure "$COMBINED_GENERATION_FAILURE"
+done
+
+setup_subscription_fixture
 SUBSCRIPTION_MV_FAIL_TARGET="${work_dir}/base-sub.txt"
 mv() {
     local target=''
@@ -429,7 +562,59 @@ setup_get_info_fixture() {
     re=''
     purple=''
     INFO_FAIL_STAGE="$1"
+    builtin printf '%s\n' 'custom://preserved' > "$client_dir"
 }
+
+run_get_info_generation_failure() {
+    local stage="$1"
+    setup_get_info_fixture "$stage"
+    INFO_CAT_CALLS=0
+    INFO_UPDATE_CALLED=0
+    mktemp() {
+        if [[ "$INFO_FAIL_STAGE" == truncate && "${1:-}" == "${work_dir}/.tmp.url.txt."* ]]; then
+            builtin printf '%s\n' "${work_dir}/missing/.tmp.url.txt.injected"
+            return 0
+        fi
+        command mktemp "$@"
+    }
+    cat() {
+        if [[ "$#" -eq 0 ]]; then
+            INFO_CAT_CALLS=$((INFO_CAT_CALLS + 1))
+            if [[ "$INFO_FAIL_STAGE" == heredoc && "$INFO_CAT_CALLS" -eq 1 ]]; then
+                return 1
+            fi
+            if [[ "$INFO_FAIL_STAGE" == append && "$INFO_CAT_CALLS" -eq 2 ]]; then
+                return 1
+            fi
+        fi
+        command cat "$@"
+    }
+    mv() {
+        local target=''
+        for target in "$@"; do :; done
+        if [[ "$INFO_FAIL_STAGE" == mv && "$target" == "$client_dir" ]]; then
+            return 1
+        fi
+        command mv "$@"
+    }
+    update_sub() {
+        INFO_UPDATE_CALLED=1
+        return 0
+    }
+    chmod() { command chmod "$@"; }
+
+    assert_fail get_info
+    unset -f mktemp cat mv update_sub chmod
+    assert_file_content 'custom://preserved' "$client_dir" "${stage} failure replaced url.txt"
+    [[ "$INFO_UPDATE_CALLED" -eq 0 ]] || fail "${stage} failure still called update_sub"
+    assert_no_temp_files "$work_dir" '.tmp.url.txt.*' "${stage} failure left a url.txt temporary file"
+}
+
+for INFO_GENERATION_FAILURE in truncate heredoc append mv; do
+    run_get_info_generation_failure "$INFO_GENERATION_FAILURE"
+done
+
+source <(printf '%s\n' "$(extract_function update_sub)")
 mv() {
     local target=''
     for target in "$@"; do :; done
@@ -583,35 +768,68 @@ fi
 
 check_singbox() { return 2; }
 command_exists() { [[ "$1" == systemctl ]]; }
-systemctl() { [[ "$AUTO_FAIL_STAGE" != services ]]; }
+systemctl() { return 0; }
 sleep() { :; }
-main_systemd_services() { [[ "$AUTO_FAIL_STAGE" != services ]]; }
-alpine_openrc_services() { [[ "$AUTO_FAIL_STAGE" != services ]]; }
+record_install_stage() {
+    builtin printf '%s\n' "$1" >> "$INSTALL_CALL_LOG"
+    [[ "$INSTALL_FAIL_STAGE" != "$1" ]]
+}
+main_systemd_services() { record_install_stage services; }
+alpine_openrc_services() { record_install_stage services; }
 change_hosts() { :; }
 rc-service() { :; }
-manage_packages() { [[ "$AUTO_FAIL_STAGE" != packages ]]; }
-install_singbox() { [[ "$AUTO_FAIL_STAGE" != install ]]; }
-validate_singbox_config() { [[ "$AUTO_FAIL_STAGE" != config ]]; }
-add_nginx_conf() { [[ "$AUTO_FAIL_STAGE" != nginx ]]; }
-get_info() { [[ "$AUTO_FAIL_STAGE" != info ]]; }
-create_shortcut() { [[ "$AUTO_FAIL_STAGE" != shortcut ]]; }
+manage_packages() { record_install_stage packages; }
+install_singbox() { record_install_stage install; }
+validate_singbox_config() { record_install_stage config; }
+add_nginx_conf() { record_install_stage nginx; }
+get_info() { record_install_stage info; }
+create_shortcut() { record_install_stage shortcut; }
 green() { printf '%s\n' "$*"; }
 yellow() { printf '%s\n' "$*"; }
 red() { printf '%s\n' "$*"; }
 
-for AUTO_FAIL_STAGE in packages install config services nginx info shortcut; do
+load_function run_install_flow
+load_function interactive_install
+
+run_install_failure_case() {
+    local mode="$1"
+    local stage="$2"
+    local output status expected_calls
+    INSTALL_FAIL_STAGE="$stage"
+    INSTALL_CALL_LOG="${tmp_dir}/install-${mode}-${stage}.log"
+    : > "$INSTALL_CALL_LOG"
     set +e
-    auto_output="$(auto_install 2>&1)"
-    auto_status=$?
+    output="$(${mode}_install 2>&1)"
+    status=$?
     set -e
-    [[ "$auto_status" -ne 0 ]] || fail "auto_install ignored ${AUTO_FAIL_STAGE} failure"
-    if grep -Fq 'sing-box 安装完成' <<< "$auto_output"; then
-        fail "auto_install reported success after ${AUTO_FAIL_STAGE} failure"
+    [[ "$status" -ne 0 ]] || fail "${mode}_install ignored ${stage} failure"
+    if grep -Fq 'sing-box 安装完成' <<< "$output"; then
+        fail "${mode}_install reported success after ${stage} failure"
     fi
+    case "$stage" in
+        packages) expected_calls=$'packages' ;;
+        install) expected_calls=$'packages\ninstall' ;;
+        config) expected_calls=$'packages\ninstall\nconfig' ;;
+        services) expected_calls=$'packages\ninstall\nconfig\nservices' ;;
+        nginx) expected_calls=$'packages\ninstall\nconfig\nservices\nnginx' ;;
+        info) expected_calls=$'packages\ninstall\nconfig\nservices\nnginx\ninfo' ;;
+        shortcut) expected_calls=$'packages\ninstall\nconfig\nservices\nnginx\ninfo\nshortcut' ;;
+    esac
+    assert_file_content "$expected_calls" "$INSTALL_CALL_LOG" "${mode}_install did not stop at ${stage} failure"
+}
+
+for INSTALL_MODE in auto interactive; do
+    for INSTALL_FAILURE in packages install config services nginx info shortcut; do
+        run_install_failure_case "$INSTALL_MODE" "$INSTALL_FAILURE"
+    done
 done
 
 install_case="$(sed -n '/^    -i | --install)/,/^        ;;/p' "$script")"
 grep -Fq 'exit $?' <<< "$install_case" || \
     fail 'the --install command-line path masks auto_install failures'
+
+interactive_case="$(sed -n '/^                1)/,/^                    ;;/p' "$script")"
+grep -Fq 'interactive_install' <<< "$interactive_case" || \
+    fail 'the interactive install path does not use the fail-fast install orchestrator'
 
 echo 'Install safety tests passed.'
