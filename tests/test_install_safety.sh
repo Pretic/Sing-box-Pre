@@ -324,13 +324,13 @@ EOF
             fail "menu does not use synchronized port update: ${expected_call}"
     done
     uniform_line="$(grep -n 'get_uniform_inbound_port.*hysteria2' <<< "$change_config_source" | cut -d: -f1)"
-    nat_line="$(grep -nF -- '--to-destination :$listen_port' <<< "$change_config_source" | head -1 | cut -d: -f1)"
-    [[ -n "$uniform_line" && -n "$nat_line" && "$uniform_line" -lt "$nat_line" ]] || \
-        fail 'port hop changes firewall rules before validating listener equality'
-    assert_equal 2 "$(grep -Fc -- '--to-destination :$listen_port' <<< "$change_config_source")" \
-        'IPv4 and IPv6 hop rules do not share the validated listener port'
-    grep -Fq 'mport=$listen_port,$min_port-$max_port' <<< "$change_config_source" || \
-        fail 'port-hop subscription does not share the validated listener port'
+    nat_line="$(grep -nF 'add_hy2_port_hopping "$min_port" "$max_port" "$listen_port"' \
+        <<< "$change_config_source" | head -1 | cut -d: -f1 || true)"
+    subscription_line="$(grep -nF 'mport=$listen_port,$min_port-$max_port' \
+        <<< "$change_config_source" | head -1 | cut -d: -f1 || true)"
+    [[ -n "$uniform_line" && -n "$nat_line" && -n "$subscription_line" && \
+       "$uniform_line" -lt "$nat_line" && "$nat_line" -lt "$subscription_line" ]] || \
+        fail 'port-hop menu does not validate listeners, apply owned NAT, then mutate subscription in order'
 fi
 
 token='0123456789abcdefghjkmnpqrstvwxyz'
