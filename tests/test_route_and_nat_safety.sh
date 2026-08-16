@@ -452,6 +452,9 @@ source /dev/stdin <<< "$validate_port_source"
 
 nat_state="$tmp_root/nat.state"
 nat_log="$tmp_root/nat.log"
+work_dir="$tmp_root/nat-work"
+HY2_NAT_STATE_FILE="$work_dir/hy2-nat.state"
+mkdir -p "$work_dir"
 HAS_IPV4=1
 HAS_IPV6=1
 
@@ -511,11 +514,13 @@ printf '%s\n' 'ip6tables|-t nat -A PREROUTING -p tcp --dport 8443 -j ACCEPT' >> 
 
 add_hy2_port_hopping 50000 50100 8443
 add_hy2_port_hopping 50000 50100 8443
-[[ "$(grep -Fxc 'iptables|-t nat -A PREROUTING -p udp -m comment --comment prenet-hy2 -j PRENET_HY2' "$nat_state")" -eq 1 ]] || \
-    fail 'IPv4 HY2 jump was not idempotent'
-[[ "$(grep -Fxc 'ip6tables|-t nat -A PREROUTING -p udp -m comment --comment prenet-hy2 -j PRENET_HY2' "$nat_state")" -eq 1 ]] || \
-    fail 'IPv6 HY2 jump was not idempotent'
-[[ "$(grep -Fc -- '--dport 50000:50100 -m comment --comment prenet-hy2 -j DNAT --to-destination :8443' "$nat_state")" -eq 2 ]] || \
+[[ "$(wc -l < "$HY2_NAT_STATE_FILE" | tr -d ' ')" -eq 2 ]] || \
+    fail 'HY2 ownership state was not idempotent per address family'
+[[ "$(grep -Ec '^iptables\|SBHY2_4_' "$HY2_NAT_STATE_FILE")" -eq 1 ]] || \
+    fail 'IPv4 HY2 owned chain was not recorded once'
+[[ "$(grep -Ec '^ip6tables\|SBHY2_6_' "$HY2_NAT_STATE_FILE")" -eq 1 ]] || \
+    fail 'IPv6 HY2 owned chain was not recorded once'
+[[ "$(grep -Fc -- '--dport 50000:50100' "$nat_state")" -eq 2 ]] || \
     fail 'HY2 DNAT rules were not idempotent per address family'
 
 remove_hy2_port_hopping
@@ -527,9 +532,10 @@ grep -Fxq 'ip6tables|-t nat -A PREROUTING -p tcp --dport 8443 -j ACCEPT' "$nat_s
 if grep -Eq -- '(^| )-F PREROUTING($| )|(^| )-P (PREROUTING|INPUT|FORWARD|OUTPUT)($| )' "$nat_log"; then
     fail 'HY2 cleanup flushed a built-in chain or changed a policy'
 fi
-if grep -Eq 'PRENET_HY2|prenet-hy2' "$nat_state"; then
+if grep -Eq 'SBHY2_|sb-hy2-' "$nat_state"; then
     fail 'HY2 cleanup left an owned jump, rule, or chain'
 fi
+[[ ! -e "$HY2_NAT_STATE_FILE" ]] || fail 'HY2 cleanup left ownership state'
 
 : > "$nat_state"
 : > "$nat_log"

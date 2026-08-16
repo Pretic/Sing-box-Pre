@@ -1779,42 +1779,200 @@ configure_hy2_nat_family() {
     local min_port="${2:-}"
     local max_port="${3:-}"
     local listen_port="${4:-}"
-    local chain='PRENET_HY2'
-    local comment='prenet-hy2'
+    local family_suffix attempt chain comment=''
 
     command_exists "$firewall_cmd" || return 1
-    "$firewall_cmd" -t nat -N "$chain" >/dev/null 2>&1 || true
-    "$firewall_cmd" -t nat -C "$chain" -p udp --dport "${min_port}:${max_port}" \
-        -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 ||
-        "$firewall_cmd" -t nat -A "$chain" -p udp --dport "${min_port}:${max_port}" \
-            -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || return 1
-    "$firewall_cmd" -t nat -C PREROUTING -p udp -m comment --comment "$comment" \
-        -j "$chain" >/dev/null 2>&1 ||
-        "$firewall_cmd" -t nat -A PREROUTING -p udp -m comment --comment "$comment" \
-            -j "$chain" >/dev/null 2>&1 || return 1
+    case "$firewall_cmd" in
+        iptables) family_suffix=4 ;;
+        ip6tables) family_suffix=6 ;;
+        *) return 1 ;;
+    esac
+
+    if adopt_legacy_hy2_nat_family "$firewall_cmd" "$min_port" "$max_port" "$listen_port"; then
+        return 0
+    fi
+
+    chain=''
+    for attempt in $(seq 1 32); do
+        # Linux limits iptables chain names to 28 characters.  Never reuse a
+        # colliding name: a failed -N can mean an administrator owns it.
+        printf -v chain 'SBHY2_%s_%x_%02d' "$family_suffix" "${BASHPID:-$$}" "$attempt"
+        [ "${#chain}" -le 28 ] || return 1
+        if "$firewall_cmd" -t nat -N "$chain" >/dev/null 2>&1; then
+            break
+        fi
+        chain=''
+    done
+    [ -n "$chain" ] || return 1
+    comment="sb-hy2-${chain}"
+
+    if ! "$firewall_cmd" -t nat -A "$chain" -p udp --dport "${min_port}:${max_port}" \
+        -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1; then
+        "$firewall_cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! "$firewall_cmd" -t nat -A PREROUTING -p udp -m comment --comment "$comment" \
+        -j "$chain" >/dev/null 2>&1; then
+        "$firewall_cmd" -t nat -D "$chain" -p udp --dport "${min_port}:${max_port}" \
+            -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || true
+        "$firewall_cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    HY2_NAT_CONFIGURED_RECORD="${firewall_cmd}|${chain}|${comment}|${min_port}|${max_port}|${listen_port}"
+}
+
+adopt_legacy_hy2_nat_family() {
+    local firewall_cmd="${1:-}"
+    local min_port="${2:-}"
+    local max_port="${3:-}"
+    local listen_port="${4:-}"
+    local chain='PRENET_HY2'
+    local comment='prenet-hy2'
+    local expected_dnat expected_jump chain_rules prerouting_rules
+
+    expected_dnat="-A ${chain} -p udp --dport ${min_port}:${max_port} -m comment --comment ${comment} -j DNAT --to-destination :${listen_port}"
+    expected_jump="-A PREROUTING -p udp -m comment --comment ${comment} -j ${chain}"
+    chain_rules=$("$firewall_cmd" -t nat -S "$chain" 2>/dev/null) || return 1
+    prerouting_rules=$("$firewall_cmd" -t nat -S PREROUTING 2>/dev/null) || return 1
+
+    [ "$(printf '%s\n' "$chain_rules" | grep -c '^-A ')" -eq 1 ] || return 1
+    printf '%s\n' "$chain_rules" | grep -Fqx -- "$expected_dnat" || return 1
+    [ "$(printf '%s\n' "$prerouting_rules" | grep -Fxc -- "$expected_jump")" -eq 1 ] || return 1
+    HY2_NAT_CONFIGURED_RECORD="${firewall_cmd}|${chain}|${comment}|${min_port}|${max_port}|${listen_port}"
 }
 
 remove_hy2_nat_family() {
     local firewall_cmd="${1:-}"
-    local chain='PRENET_HY2'
-    local comment='prenet-hy2'
+    local chain="${2:-}"
+    local comment="${3:-}"
+    local min_port="${4:-}"
+    local max_port="${5:-}"
+    local listen_port="${6:-}"
+    local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
+    local family saved_chain saved_comment saved_min saved_max saved_listen
 
     command_exists "$firewall_cmd" || return 0
-    while "$firewall_cmd" -t nat -C PREROUTING -p udp -m comment --comment "$comment" \
-        -j "$chain" >/dev/null 2>&1; do
-        "$firewall_cmd" -t nat -D PREROUTING -p udp -m comment --comment "$comment" \
+
+    if [ -z "$chain" ]; then
+        [ -r "$state_file" ] || return 0
+        while IFS='|' read -r family saved_chain saved_comment saved_min saved_max saved_listen; do
+            [ "$family" = "$firewall_cmd" ] || continue
+            chain="$saved_chain"
+            comment="$saved_comment"
+            min_port="$saved_min"
+            max_port="$saved_max"
+            listen_port="$saved_listen"
+            break
+        done < "$state_file"
+    fi
+    [ -n "$chain" ] && [ -n "$comment" ] && [ -n "$min_port" ] && \
+        [ -n "$max_port" ] && [ -n "$listen_port" ] || return 0
+
+    "$firewall_cmd" -t nat -C PREROUTING -p udp -m comment --comment "$comment" \
+        -j "$chain" >/dev/null 2>&1 || return 1
+    "$firewall_cmd" -t nat -C "$chain" -p udp --dport "${min_port}:${max_port}" \
+        -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || return 1
+
+    "$firewall_cmd" -t nat -D PREROUTING -p udp -m comment --comment "$comment" \
+        -j "$chain" >/dev/null 2>&1 || return 1
+    if ! "$firewall_cmd" -t nat -D "$chain" -p udp --dport "${min_port}:${max_port}" \
+        -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1; then
+        "$firewall_cmd" -t nat -A PREROUTING -p udp -m comment --comment "$comment" \
+            -j "$chain" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! "$firewall_cmd" -t nat -X "$chain" >/dev/null 2>&1; then
+        "$firewall_cmd" -t nat -A "$chain" -p udp --dport "${min_port}:${max_port}" \
+            -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || true
+        "$firewall_cmd" -t nat -A PREROUTING -p udp -m comment --comment "$comment" \
+            -j "$chain" >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+restore_hy2_nat_record() {
+    local record="${1:-}"
+    local firewall_cmd chain comment min_port max_port listen_port
+
+    IFS='|' read -r firewall_cmd chain comment min_port max_port listen_port <<< "$record"
+    command_exists "$firewall_cmd" || return 1
+    if ! "$firewall_cmd" -t nat -S "$chain" >/dev/null 2>&1; then
+        "$firewall_cmd" -t nat -N "$chain" >/dev/null 2>&1 || return 1
+    fi
+    "$firewall_cmd" -t nat -C "$chain" -p udp --dport "${min_port}:${max_port}" \
+        -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
+        "$firewall_cmd" -t nat -A "$chain" -p udp --dport "${min_port}:${max_port}" \
+            -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || return 1
+    "$firewall_cmd" -t nat -C PREROUTING -p udp -m comment --comment "$comment" \
+        -j "$chain" >/dev/null 2>&1 || \
+        "$firewall_cmd" -t nat -A PREROUTING -p udp -m comment --comment "$comment" \
             -j "$chain" >/dev/null 2>&1 || return 1
+}
+
+remove_hy2_nat_records() {
+    local -a records=("$@")
+    local index record family chain comment min_port max_port listen_port restore_index
+
+    for ((index = 0; index < ${#records[@]}; index++)); do
+        record="${records[$index]}"
+        IFS='|' read -r family chain comment min_port max_port listen_port <<< "$record"
+        if ! remove_hy2_nat_family "$family" "$chain" "$comment" "$min_port" "$max_port" "$listen_port"; then
+            for ((restore_index = index - 1; restore_index >= 0; restore_index--)); do
+                restore_hy2_nat_record "${records[$restore_index]}" || true
+            done
+            return 1
+        fi
     done
-    "$firewall_cmd" -t nat -F "$chain" >/dev/null 2>&1 || true
-    "$firewall_cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
+}
+
+restore_hy2_nat_records() {
+    local record
+    for record in "$@"; do
+        restore_hy2_nat_record "$record" || return 1
+    done
+}
+
+rollback_new_hy2_nat_records() {
+    local -a records=("$@")
+    local index record family chain comment min_port max_port listen_port
+
+    for ((index = ${#records[@]} - 1; index >= 0; index--)); do
+        record="${records[$index]}"
+        IFS='|' read -r family chain comment min_port max_port listen_port <<< "$record"
+        remove_hy2_nat_family "$family" "$chain" "$comment" "$min_port" "$max_port" "$listen_port" || true
+    done
+}
+
+write_hy2_nat_state_records() {
+    local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
+    local state_dir tmp_file record
+
+    state_dir=$(dirname "$state_file") || return 1
+    [ ! -L "$state_file" ] || return 1
+    mkdir -p "$state_dir" || return 1
+    tmp_file=$(mktemp "${state_dir}/.hy2-nat.state.XXXXXX") || return 1
+    chmod 600 "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    for record in "$@"; do
+        printf '%s\n' "$record" >> "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    done
+    mv -f -- "$tmp_file" "$state_file" || { rm -f -- "$tmp_file"; return 1; }
+    chmod 600 "$state_file"
 }
 
 persist_hy2_nat_rules() {
+    local status=0
+
     if command_exists netfilter-persistent; then
         netfilter-persistent save >/dev/null 2>&1
     elif command_exists service; then
-        command_exists iptables && service iptables save >/dev/null 2>&1 || true
-        command_exists ip6tables && service ip6tables save >/dev/null 2>&1 || true
+        if command_exists iptables; then
+            service iptables save >/dev/null 2>&1 || status=1
+        fi
+        if command_exists ip6tables; then
+            service ip6tables save >/dev/null 2>&1 || status=1
+        fi
+        return "$status"
     fi
 }
 
@@ -1824,45 +1982,369 @@ add_hy2_port_hopping() {
     local listen_port="${3:-}"
     local configured=0
     local -a configured_families=()
+    local -a configured_records=()
+    local -a old_records=()
+    local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
+    local same_configuration=1 record family chain comment old_min old_max old_listen
 
     validate_port_value "$min_port" hy2_hop_min_port || return 1
     validate_port_value "$max_port" hy2_hop_max_port || return 1
     validate_port_value "$listen_port" hy2_listen_port || return 1
     [ "$min_port" -lt "$max_port" ] || return 1
 
+    if [ -s "$state_file" ]; then
+        mapfile -t old_records < "$state_file" || return 1
+        [ "${#old_records[@]}" -gt 0 ] || return 1
+        for record in "${old_records[@]}"; do
+            IFS='|' read -r family chain comment old_min old_max old_listen <<< "$record"
+            case "$family" in iptables|ip6tables) ;; *) return 1 ;; esac
+            [ -n "$chain" ] && [ -n "$comment" ] || return 1
+            validate_port_value "$old_min" hy2_state_min_port >/dev/null 2>&1 || return 1
+            validate_port_value "$old_max" hy2_state_max_port >/dev/null 2>&1 || return 1
+            validate_port_value "$old_listen" hy2_state_listen_port >/dev/null 2>&1 || return 1
+            if [ "$old_min" != "$min_port" ] || [ "$old_max" != "$max_port" ] || \
+                [ "$old_listen" != "$listen_port" ]; then
+                same_configuration=0
+            fi
+        done
+        if [ "$same_configuration" -eq 1 ]; then
+            persist_hy2_nat_rules
+            return $?
+        fi
+    fi
+
     if ipv4_stack_available && command_exists iptables; then
         if ! configure_hy2_nat_family iptables "$min_port" "$max_port" "$listen_port"; then
             return 1
         fi
         configured_families+=(iptables)
+        configured_records+=("$HY2_NAT_CONFIGURED_RECORD")
         configured=1
     fi
     if ipv6_stack_available && command_exists ip6tables; then
         if ! configure_hy2_nat_family ip6tables "$min_port" "$max_port" "$listen_port"; then
-            local configured_family
-            for configured_family in "${configured_families[@]}"; do
-                remove_hy2_nat_family "$configured_family" || true
+            local rollback_index rollback_record rollback_family rollback_chain rollback_comment
+            local rollback_min rollback_max rollback_listen
+            for ((rollback_index = ${#configured_records[@]} - 1; rollback_index >= 0; rollback_index--)); do
+                rollback_record="${configured_records[$rollback_index]}"
+                IFS='|' read -r rollback_family rollback_chain rollback_comment \
+                    rollback_min rollback_max rollback_listen <<< "$rollback_record"
+                remove_hy2_nat_family "$rollback_family" "$rollback_chain" "$rollback_comment" \
+                    "$rollback_min" "$rollback_max" "$rollback_listen" || true
             done
             return 1
         fi
         configured_families+=(ip6tables)
+        configured_records+=("$HY2_NAT_CONFIGURED_RECORD")
         configured=1
     fi
     [ "$configured" -eq 1 ] || return 1
-    persist_hy2_nat_rules
+    if ! persist_hy2_nat_rules; then
+        rollback_new_hy2_nat_records "${configured_records[@]}"
+        return 1
+    fi
+    if ! write_hy2_nat_state_records "${configured_records[@]}"; then
+        rollback_new_hy2_nat_records "${configured_records[@]}"
+        persist_hy2_nat_rules >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if [ "${#old_records[@]}" -gt 0 ]; then
+        if ! remove_hy2_nat_records "${old_records[@]}"; then
+            rollback_new_hy2_nat_records "${configured_records[@]}"
+            write_hy2_nat_state_records "${old_records[@]}" >/dev/null 2>&1 || true
+            persist_hy2_nat_rules >/dev/null 2>&1 || true
+            return 1
+        fi
+        if ! persist_hy2_nat_rules; then
+            restore_hy2_nat_records "${old_records[@]}" || true
+            rollback_new_hy2_nat_records "${configured_records[@]}"
+            write_hy2_nat_state_records "${old_records[@]}" >/dev/null 2>&1 || true
+            persist_hy2_nat_rules >/dev/null 2>&1 || true
+            return 1
+        fi
+    fi
 }
 
 remove_hy2_port_hopping() {
     local status=0
+    local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
+    local -a records=()
+    local record family chain comment min_port max_port listen_port
 
-    if command_exists iptables; then
-        remove_hy2_nat_family iptables || status=1
+    [ -r "$state_file" ] || return 0
+    mapfile -t records < "$state_file" || return 1
+
+    remove_hy2_nat_records "${records[@]}" || return 1
+    if ! persist_hy2_nat_rules; then
+        restore_hy2_nat_records "${records[@]}" || true
+        persist_hy2_nat_rules >/dev/null 2>&1 || true
+        return 1
     fi
-    if command_exists ip6tables; then
-        remove_hy2_nat_family ip6tables || status=1
+    if ! rm -f -- "$state_file"; then
+        restore_hy2_nat_records "${records[@]}" || true
+        persist_hy2_nat_rules >/dev/null 2>&1 || true
+        return 1
     fi
-    persist_hy2_nat_rules || status=1
     return "$status"
+}
+
+get_hy2_certificate_fingerprint() {
+    local fingerprint
+
+    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" 2>/dev/null) || return 1
+    fingerprint=${fingerprint#*=}
+    fingerprint=${fingerprint//:/%3A}
+    [[ "$fingerprint" =~ ^[0-9A-Fa-f%]+$ ]] || return 1
+    printf '%s\n' "$fingerprint"
+}
+
+get_hy2_node_label() {
+    local label
+
+    label=$(curl -fsm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" 2>/dev/null | \
+        tr -d '\n' | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
+        sed 's/ /_/g') || true
+    [ -n "$label" ] || label="${hostname:-sing-box}"
+    label=$(printf '%s' "$label" | tr -cd 'A-Za-z0-9._~-')
+    [ -n "$label" ] || return 1
+    printf '%s\n' "$label"
+}
+
+stage_hy2_client_file() {
+    local mode="${1:-}"
+    local min_port="${2:-}"
+    local max_port="${3:-}"
+    local listen_port="${4:-}"
+    local server_ip="${5:-}"
+    local fingerprint="${6:-}"
+    local node_label="${7:-}"
+    local line_count uuid url_host replacement staged_file
+
+    [ -f "$client_dir" ] || return 1
+    line_count=$(grep -c '^hysteria2://' "$client_dir" 2>/dev/null || true)
+    [ "$line_count" -eq 1 ] || return 1
+    staged_file=$(mktemp "$(dirname "$client_dir")/.hy2-client.XXXXXX") || return 1
+
+    case "$mode" in
+        enable)
+            validate_port_value "$min_port" hy2_hop_min_port >/dev/null 2>&1 || { rm -f -- "$staged_file"; return 1; }
+            validate_port_value "$max_port" hy2_hop_max_port >/dev/null 2>&1 || { rm -f -- "$staged_file"; return 1; }
+            validate_port_value "$listen_port" hy2_listen_port >/dev/null 2>&1 || { rm -f -- "$staged_file"; return 1; }
+            [ "$min_port" -lt "$max_port" ] || { rm -f -- "$staged_file"; return 1; }
+            uuid=$(sed -n 's#^hysteria2://\([^@]*\)@.*#\1#p' "$client_dir")
+            [[ "$uuid" =~ ^[A-Za-z0-9-]+$ ]] || { rm -f -- "$staged_file"; return 1; }
+            [[ "$fingerprint" =~ ^[0-9A-Fa-f%]+$ ]] || { rm -f -- "$staged_file"; return 1; }
+            [[ "$node_label" =~ ^[A-Za-z0-9._~-]+$ ]] || { rm -f -- "$staged_file"; return 1; }
+            if [[ "$server_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                url_host="$server_ip"
+            elif [[ "$server_ip" =~ ^\[[0-9A-Fa-f:]+\]$ ]]; then
+                url_host="$server_ip"
+            elif [[ "$server_ip" =~ ^[0-9A-Fa-f:]+$ && "$server_ip" == *:* ]]; then
+                url_host="[$server_ip]"
+            else
+                rm -f -- "$staged_file"
+                return 1
+            fi
+            replacement="hysteria2://${uuid}@${url_host}:${listen_port}?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=${listen_port},${min_port}-${max_port}#${node_label}"
+            awk -v replacement="$replacement" \
+                '/^hysteria2:\/\// { print replacement; next } { print }' "$client_dir" > "$staged_file" || {
+                rm -f -- "$staged_file"
+                return 1
+            }
+            ;;
+        disable)
+            sed '/^hysteria2:/s/&mport=[^#&]*//g' "$client_dir" > "$staged_file" || {
+                rm -f -- "$staged_file"
+                return 1
+            }
+            ;;
+        *)
+            rm -f -- "$staged_file"
+            return 1
+            ;;
+    esac
+
+    chmod 600 "$staged_file" || { rm -f -- "$staged_file"; return 1; }
+    HY2_STAGED_CLIENT_FILE="$staged_file"
+}
+
+atomic_replace_hy2_client() {
+    local staged_file="${1:-}"
+    local target_file="${2:-}"
+
+    [ -f "$staged_file" ] && [ -n "$target_file" ] || return 1
+    mv -f -- "$staged_file" "$target_file"
+}
+
+backup_hy2_menu_transaction() {
+    local backup_dir="${1:-}"
+    local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
+    local -a files=(
+        "$client_dir"
+        "${work_dir}/base-sub.txt"
+        "$combined_client_dir"
+        "${work_dir}/all-sub.txt"
+        "${work_dir}/sub.txt"
+        "${work_dir}/cfy-sub.txt"
+    )
+    local index path
+
+    [ -d "$backup_dir" ] || return 1
+    if [ -f "$state_file" ]; then
+        cp -p -- "$state_file" "${backup_dir}/nat.state" || return 1
+        : > "${backup_dir}/nat.present" || return 1
+    fi
+    for ((index = 0; index < ${#files[@]}; index++)); do
+        path="${files[$index]}"
+        if [ -f "$path" ]; then
+            cp -p -- "$path" "${backup_dir}/file.${index}" || return 1
+            : > "${backup_dir}/present.${index}" || return 1
+        fi
+    done
+}
+
+restore_hy2_menu_files() {
+    local backup_dir="${1:-}"
+    local -a files=(
+        "$client_dir"
+        "${work_dir}/base-sub.txt"
+        "$combined_client_dir"
+        "${work_dir}/all-sub.txt"
+        "${work_dir}/sub.txt"
+        "${work_dir}/cfy-sub.txt"
+    )
+    local index path tmp_file
+
+    for ((index = 0; index < ${#files[@]}; index++)); do
+        path="${files[$index]}"
+        if [ -e "${backup_dir}/present.${index}" ]; then
+            tmp_file=$(mktemp "$(dirname "$path")/.hy2-restore.XXXXXX") || return 1
+            cp -p -- "${backup_dir}/file.${index}" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+            mv -f -- "$tmp_file" "$path" || { rm -f -- "$tmp_file"; return 1; }
+        else
+            rm -f -- "$path" || return 1
+        fi
+    done
+}
+
+restore_hy2_nat_snapshot() {
+    local backup_dir="${1:-}"
+    local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
+    local -a current_records=() old_records=()
+
+    if [ -s "$state_file" ]; then
+        mapfile -t current_records < "$state_file" || return 1
+        remove_hy2_nat_records "${current_records[@]}" || return 1
+    fi
+    if [ -e "${backup_dir}/nat.present" ]; then
+        mapfile -t old_records < "${backup_dir}/nat.state" || return 1
+        restore_hy2_nat_records "${old_records[@]}" || return 1
+        persist_hy2_nat_rules || return 1
+        write_hy2_nat_state_records "${old_records[@]}" || return 1
+    else
+        persist_hy2_nat_rules || return 1
+        rm -f -- "$state_file" || return 1
+    fi
+}
+
+restore_hy2_service_state() {
+    local was_active="${1:-0}"
+
+    if [ "$was_active" -eq 1 ]; then
+        singbox_service_is_active && return 0
+        restart_singbox || return 1
+        singbox_service_is_active
+    else
+        if singbox_service_is_active; then
+            stop_singbox || return 1
+        fi
+        ! singbox_service_is_active
+    fi
+}
+
+rollback_hy2_menu_transaction() {
+    local backup_dir="${1:-}"
+    local was_active="${2:-0}"
+    local status=0
+
+    restore_hy2_nat_snapshot "$backup_dir" || status=1
+    restore_hy2_menu_files "$backup_dir" || status=1
+    restore_hy2_service_state "$was_active" || status=1
+    return "$status"
+}
+
+enable_hy2_port_hopping_transaction() {
+    local min_port="${1:-}"
+    local max_port="${2:-}"
+    local listen_port server_ip fingerprint node_label backup_dir staged_file was_active=0
+
+    validate_port_value "$min_port" hy2_hop_min_port || return 1
+    validate_port_value "$max_port" hy2_hop_max_port || return 1
+    [ "$min_port" -lt "$max_port" ] || return 1
+    listen_port=$(get_uniform_inbound_port "${conf_dir}/inbounds.json" hysteria2) || return 1
+    validate_port_value "$listen_port" hy2_listen_port || return 1
+    server_ip=$(get_realip) || return 1
+    [ -n "$server_ip" ] || return 1
+    fingerprint=$(get_hy2_certificate_fingerprint) || return 1
+    node_label=$(get_hy2_node_label) || return 1
+    stage_hy2_client_file enable "$min_port" "$max_port" "$listen_port" \
+        "$server_ip" "$fingerprint" "$node_label" || return 1
+    staged_file="$HY2_STAGED_CLIENT_FILE"
+
+    backup_dir=$(mktemp -d "$(dirname "$client_dir")/.hy2-menu.XXXXXX") || {
+        rm -f -- "$staged_file"
+        return 1
+    }
+    chmod 700 "$backup_dir" || { rm -f -- "$staged_file"; rm -rf -- "$backup_dir"; return 1; }
+    backup_hy2_menu_transaction "$backup_dir" || {
+        rm -f -- "$staged_file"
+        rm -rf -- "$backup_dir"
+        return 1
+    }
+    singbox_service_is_active && was_active=1
+
+    if ! add_hy2_port_hopping "$min_port" "$max_port" "$listen_port" ||
+       ! atomic_replace_hy2_client "$staged_file" "$client_dir" ||
+       { [ "$was_active" -eq 1 ] && ! restart_singbox; } ||
+       ! update_sub; then
+        rollback_hy2_menu_transaction "$backup_dir" "$was_active" || true
+        rm -f -- "$staged_file"
+        rm -rf -- "$backup_dir"
+        return 1
+    fi
+
+    rm -rf -- "$backup_dir"
+}
+
+disable_hy2_port_hopping_transaction() {
+    local backup_dir staged_file was_active=0
+
+    stage_hy2_client_file disable || return 1
+    staged_file="$HY2_STAGED_CLIENT_FILE"
+    backup_dir=$(mktemp -d "$(dirname "$client_dir")/.hy2-menu.XXXXXX") || {
+        rm -f -- "$staged_file"
+        return 1
+    }
+    chmod 700 "$backup_dir" || { rm -f -- "$staged_file"; rm -rf -- "$backup_dir"; return 1; }
+    backup_hy2_menu_transaction "$backup_dir" || {
+        rm -f -- "$staged_file"
+        rm -rf -- "$backup_dir"
+        return 1
+    }
+    singbox_service_is_active && was_active=1
+
+    if ! remove_hy2_port_hopping ||
+       ! atomic_replace_hy2_client "$staged_file" "$client_dir" ||
+       { [ "$was_active" -eq 1 ] && ! restart_singbox; } ||
+       ! update_sub; then
+        rollback_hy2_menu_transaction "$backup_dir" "$was_active" || true
+        rm -f -- "$staged_file"
+        rm -rf -- "$backup_dir"
+        return 1
+    fi
+
+    rm -rf -- "$backup_dir"
 }
 
 render_vless_reality_inbound() {
@@ -2706,40 +3188,74 @@ get_current_uuid() {
 manage_service() {
     local service_name="$1"
     local action="$2"
+    local service_file='' status='' check_status=0 action_status=1
 
     if [ -z "$service_name" ] || [ -z "$action" ]; then
         red "缺少服务名或操作参数\n"; return 1
     fi
 
-    local status=$(check_service "$service_name" 2>/dev/null)
+    case "$service_name" in
+        sing-box) service_file="${work_dir}/${server_name:-sing-box}" ;;
+        argo) service_file="${work_dir}/argo" ;;
+        nginx) service_file=$(command -v nginx 2>/dev/null || true) ;;
+    esac
+    status=$(check_service "$service_name" "$service_file" 2>/dev/null) || check_status=$?
 
     case "$action" in
         "start")
-            [ "$status" == "running" ] && { yellow "${service_name} 正在运行\n"; return 0; }
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装!\n"; return 1; }
+            [ "$check_status" -eq 2 ] && { yellow "${service_name} 尚未安装!\n"; return 1; }
+            case "$status" in
+                *"not running"*) ;;
+                *"running"*) yellow "${service_name} 正在运行\n"; return 0 ;;
+            esac
             yellow "正在启动 ${service_name} 服务\n"
-            if command_exists rc-service; then rc-service "$service_name" start
-            elif command_exists systemctl; then systemctl daemon-reload && systemctl start "$service_name"; fi
-            [ $? -eq 0 ] && green "${service_name} 服务已成功启动\n" || red "${service_name} 服务启动失败\n"
+            if command_exists rc-service; then
+                rc-service "$service_name" start
+                action_status=$?
+            elif command_exists systemctl; then
+                if systemctl daemon-reload; then
+                    systemctl start "$service_name"
+                    action_status=$?
+                fi
+            fi
             ;;
         "stop")
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 2; }
-            [ "$status" == "not running" ]   && { yellow "${service_name} 未运行\n"; return 1; }
+            [ "$check_status" -eq 2 ] && { yellow "${service_name} 尚未安装！\n"; return 2; }
+            case "$status" in
+                *"not running"*) yellow "${service_name} 未运行\n"; return 1 ;;
+            esac
             yellow "正在停止 ${service_name} 服务\n"
-            if command_exists rc-service; then rc-service "$service_name" stop
-            elif command_exists systemctl; then systemctl stop "$service_name"; fi
-            [ $? -eq 0 ] && green "${service_name} 服务已成功停止\n" || red "${service_name} 服务停止失败\n"
+            if command_exists rc-service; then
+                rc-service "$service_name" stop
+                action_status=$?
+            elif command_exists systemctl; then
+                systemctl stop "$service_name"
+                action_status=$?
+            fi
             ;;
         "restart")
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
+            [ "$check_status" -eq 2 ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
             yellow "正在重启 ${service_name} 服务\n"
-            if command_exists rc-service; then rc-service "$service_name" restart
-            elif command_exists systemctl; then systemctl daemon-reload && systemctl restart "$service_name"; fi
-            [ $? -eq 0 ] && green "${service_name} 服务已成功重启\n" || red "${service_name} 服务重启失败\n"
+            if command_exists rc-service; then
+                rc-service "$service_name" restart
+                action_status=$?
+            elif command_exists systemctl; then
+                if systemctl daemon-reload; then
+                    systemctl restart "$service_name"
+                    action_status=$?
+                fi
+            fi
             ;;
         *)
             red "无效的操作: $action\n"; return 1 ;;
     esac
+
+    if [ "$action_status" -eq 0 ]; then
+        green "${service_name} 服务已成功${action}\n"
+        return 0
+    fi
+    red "${service_name} 服务${action}失败\n"
+    return "$action_status"
 }
 start_singbox()  { manage_service "sing-box" "start"; }
 stop_singbox()   { manage_service "sing-box" "stop"; }
@@ -3438,34 +3954,18 @@ change_config() {
             reading "\n请输入跳跃结束端口 (需大于起始端口): " max_port
             [ -z "$max_port" ] && max_port=$(($min_port + 100))
             yellow "你的结束端口为：$max_port\n"
-            listen_port=$(get_uniform_inbound_port "${conf_dir}/inbounds.json" hysteria2) || {
-                red "Hysteria2 监听端口不一致，无法配置端口跳跃。"
-                return 1
-            }
-            if ! add_hy2_port_hopping "$min_port" "$max_port" "$listen_port"; then
-                red "Hysteria2 端口跳跃规则添加失败，未修改订阅。"
+            if ! enable_hy2_port_hopping_transaction "$min_port" "$max_port"; then
+                red "Hysteria2 端口跳跃启用失败，原配置已保留或恢复。"
                 return 1
             fi
-            restart_singbox
-            ip=$(get_realip)
-            fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-            uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
-            line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
-            isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
-                awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
-            sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
-            update_sub
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
             ;;
         5)
-            if ! remove_hy2_port_hopping; then
-                red "Hysteria2 端口跳跃规则删除失败，未修改订阅。"
+            if ! disable_hy2_port_hopping_transaction; then
+                red "Hysteria2 端口跳跃删除失败，原配置已保留或恢复。"
                 return 1
             fi
-            sed -i '/hysteria2/s/&mport=[^#&]*//g' /etc/sing-box/url.txt
-            update_sub
             green "\n端口跳跃已删除\n"
             ;;
         6) change_cfip ;;
