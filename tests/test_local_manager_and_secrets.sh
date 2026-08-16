@@ -57,8 +57,12 @@ for function_name in \
     write_fixed_argo_credentials \
     write_argo_systemd_service \
     write_argo_openrc_service \
+    write_local_manager_wrapper \
+    is_legacy_raw_manager_wrapper \
+    migrate_legacy_manager_shortcuts \
     create_shortcut \
     update_local_manager \
+    update_shortcut \
     probe_proxy_url \
     detect_argo_tunnel_mode \
     refresh_quick_argo; do
@@ -73,29 +77,189 @@ red() { printf '%s\n' "$*" >&2; }
 yellow() { printf '%s\n' "$*" >&2; }
 
 # The normal installation path must keep a syntax-checked local manager and
-# create only local wrappers. It must not need GitHub for routine `sb` use.
+# create only local wrappers. Prove the user-visible behavior by running `sb`
+# with a curl executable that fails if routine management attempts a download.
 shortcut_root="${tmp_dir}/shortcut"
 manager_source="${tmp_dir}/manager-source.sh"
-mkdir -p "${shortcut_root}/etc/sing-box"
-printf '%s\n' '#!/bin/bash' 'printf "fixture manager\\n"' > "$manager_source"
+offline_bin="${tmp_dir}/offline-bin"
+offline_curl_log="${tmp_dir}/offline-curl.log"
+mkdir -p "${shortcut_root}/etc/sing-box" "$offline_bin"
+printf '%s\n' '#!/bin/bash' 'printf "fixture manager:%s\\n" "$*"' > "$manager_source"
+printf '%s\n' '#!/bin/bash' 'exit 0' > "${shortcut_root}/etc/sing-box/sing-box"
+chmod 700 "${shortcut_root}/etc/sing-box/sing-box"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'printf "curl invoked\\n" >> "$OFFLINE_CURL_LOG"' \
+    'exit 99' > "${offline_bin}/curl"
+chmod 700 "${offline_bin}/curl"
 MANAGER_SOURCE_SCRIPT="$manager_source"
 work_dir="${shortcut_root}/etc/sing-box"
-assert_ok create_shortcut "$shortcut_root"
+if ! create_shortcut "$shortcut_root"; then
+    ls -l "${shortcut_root}/usr/local/bin" "${shortcut_root}/usr/bin" \
+        "${shortcut_root}/etc/sing-box" "${shortcut_root}/usr/local/lib/sing-box-pre" >&2 || true
+    for shortcut_path in \
+        "${shortcut_root}/usr/local/bin/sb" \
+        "${shortcut_root}/usr/bin/sb" \
+        "${shortcut_root}/usr/local/bin/sing-box"; do
+        printf 'shortcut diagnostic: %s -> %s\n' "$shortcut_path" \
+            "$(readlink "$shortcut_path" 2>/dev/null || printf '<not-a-link>')" >&2
+    done
+    fail 'create_shortcut failed for the isolated install root'
+fi
 
 local_manager="${shortcut_root}/usr/local/lib/sing-box-pre/sing-box.sh"
 wrapper="${shortcut_root}/etc/sing-box/sb.sh"
 [[ -f "$local_manager" ]] || fail 'create_shortcut did not install the local manager'
 assert_mode 700 "$local_manager"
-assert_equal $'#!/bin/bash\nset -e\nexec /usr/local/lib/sing-box-pre/sing-box.sh "$@"' \
-    "$(cat "$wrapper")" 'unexpected sb wrapper content'
-! grep -Eq 'raw\.githubusercontent\.com.*sing-box\.sh' "$wrapper" || \
-    fail 'routine sb wrapper still downloads the manager'
 assert_equal "${shortcut_root}/etc/sing-box/sb.sh" \
     "$(readlink "${shortcut_root}/usr/local/bin/sb")" 'local sb link target'
 assert_equal "${shortcut_root}/etc/sing-box/sb.sh" \
     "$(readlink "${shortcut_root}/usr/bin/sb")" 'usr sb link target'
-assert_equal '/etc/sing-box/sing-box' \
+assert_equal "${shortcut_root}/etc/sing-box/sing-box" \
     "$(readlink "${shortcut_root}/usr/local/bin/sing-box")" 'sing-box binary link target'
+shortcut_output="$(OFFLINE_CURL_LOG="$offline_curl_log" PATH="${offline_bin}:$PATH" \
+    "${shortcut_root}/usr/local/bin/sb" --offline-check)" || \
+    fail 'locally installed sb did not run offline'
+assert_equal 'fixture manager:--offline-check' "$shortcut_output" \
+    'locally installed sb output'
+[[ ! -e "$offline_curl_log" ]] || fail 'routine sb execution attempted a download'
+
+# The historical baseline wrapper downloaded Raw GitHub on every invocation,
+# and all three shortcuts pointed at that wrapper. A real explicit update must
+# migrate only those managed targets, preserve a custom shortcut, and leave sb
+# runnable with the network disabled.
+legacy_root="${tmp_dir}/legacy-update"
+legacy_wrapper="${legacy_root}/etc/sing-box/sb.sh"
+legacy_manager="${legacy_root}/usr/local/lib/sing-box-pre/sing-box.sh"
+mkdir -p "${legacy_root}/etc/sing-box" \
+    "${legacy_root}/usr/local/bin" "${legacy_root}/usr/bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'exec bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) "$@"' \
+    > "$legacy_wrapper"
+chmod 700 "$legacy_wrapper"
+ln -s "$legacy_wrapper" "${legacy_root}/usr/local/bin/sb"
+ln -s '/opt/custom/sb-manager' "${legacy_root}/usr/bin/sb"
+ln -s "$legacy_wrapper" "${legacy_root}/usr/local/bin/sing-box"
+
+curl_log="${tmp_dir}/curl-update.log"
+active_update_root="$legacy_root"
+download_body='#!/bin/bash
+printf "updated manager:%s\\n" "$*"
+'
+curl() {
+    local output='' argument
+    : > "$curl_log"
+    while [[ "$#" -gt 0 ]]; do
+        argument="$1"
+        printf '%s\n' "$argument" >> "$curl_log"
+        shift
+        if [[ "$argument" == -o ]]; then
+            [[ "$#" -gt 0 ]] || return 2
+            output="$1"
+            printf '%s\n' "$1" >> "$curl_log"
+            shift
+        fi
+    done
+    [[ -n "$output" && "$output" == "${active_update_root}/"* ]] || return 2
+    printf '%s' "$download_body" > "$output"
+}
+
+assert_ok update_shortcut "$legacy_root" 'https://updates.example.test/sing-box.sh'
+grep -Fqx 'https://updates.example.test/sing-box.sh' "$curl_log" || \
+    fail 'legacy explicit update did not use the requested manager URL'
+assert_equal "$legacy_wrapper" "$(readlink "${legacy_root}/usr/local/bin/sb")" \
+    'legacy managed sb link target after migration'
+assert_equal '/opt/custom/sb-manager' "$(readlink "${legacy_root}/usr/bin/sb")" \
+    'custom sb link was replaced during migration'
+assert_equal "${legacy_root}/etc/sing-box/sing-box" \
+    "$(readlink "${legacy_root}/usr/local/bin/sing-box")" \
+    'legacy sing-box link target after migration'
+legacy_output="$(OFFLINE_CURL_LOG="$offline_curl_log" PATH="${offline_bin}:$PATH" \
+    "${legacy_root}/usr/local/bin/sb" --migrated-check)" || \
+    fail 'migrated legacy sb did not run offline'
+assert_equal 'updated manager:--migrated-check' "$legacy_output" \
+    'migrated legacy sb output'
+[[ ! -e "$offline_curl_log" ]] || fail 'migrated legacy sb still attempted a download'
+assert_mode 700 "$legacy_manager"
+
+run_legacy_migration_rollback_case() {
+    local failure_stage="$1"
+    local fixture="${tmp_dir}/legacy-rollback-${failure_stage}"
+    local wrapper_file="${fixture}/etc/sing-box/sb.sh"
+    local manager_file="${fixture}/usr/local/lib/sing-box-pre/sing-box.sh"
+    local previous_file="${manager_file}.previous"
+    local local_sb="${fixture}/usr/local/bin/sb"
+    local usr_sb="${fixture}/usr/bin/sb"
+    local singbox_link="${fixture}/usr/local/bin/sing-box"
+    local old_wrapper old_manager old_previous
+    local old_local_sb old_usr_sb old_singbox_link
+    local failure_marker="${fixture}/failure-triggered"
+
+    mkdir -p "${fixture}/etc/sing-box" \
+        "${fixture}/usr/local/lib/sing-box-pre" \
+        "${fixture}/usr/local/bin" "${fixture}/usr/bin"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'exec bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) "$@"' \
+        > "$wrapper_file"
+    printf '%s\n' '#!/bin/bash' 'printf "working manager\\n"' > "$manager_file"
+    printf '%s\n' '#!/bin/bash' 'printf "older manager\\n"' > "$previous_file"
+    chmod 700 "$wrapper_file" "$manager_file" "$previous_file"
+    ln -s "$wrapper_file" "$local_sb"
+    ln -s "$wrapper_file" "$usr_sb"
+    ln -s "$wrapper_file" "$singbox_link"
+
+    old_wrapper="$(cat "$wrapper_file")"
+    old_manager="$(cat "$manager_file")"
+    old_previous="$(cat "$previous_file")"
+    old_local_sb="$(readlink "$local_sb")"
+    old_usr_sb="$(readlink "$usr_sb")"
+    old_singbox_link="$(readlink "$singbox_link")"
+    active_update_root="$fixture"
+    rm -f "$failure_marker"
+
+    mv() {
+        local destination=''
+        for destination in "$@"; do :; done
+        if [[ "$failure_stage" == wrapper && ! -e "$failure_marker" && \
+              "$destination" == "$wrapper_file" ]]; then
+            : > "$failure_marker"
+            return 1
+        fi
+        if [[ "$failure_stage" == link && ! -e "$failure_marker" && \
+              "$destination" == "$singbox_link" ]]; then
+            : > "$failure_marker"
+            return 1
+        fi
+        command mv "$@"
+    }
+    ln() {
+        local destination=''
+        for destination in "$@"; do :; done
+        command ln "$@"
+    }
+
+    assert_fail update_shortcut "$fixture" 'https://updates.example.test/sing-box.sh'
+    [[ -e "$failure_marker" ]] || fail "${failure_stage} migration fault was not reached"
+    assert_equal "$old_manager" "$(cat "$manager_file")" \
+        "${failure_stage} migration failure changed the current manager"
+    assert_equal "$old_previous" "$(cat "$previous_file")" \
+        "${failure_stage} migration failure changed the existing previous manager"
+    assert_equal "$old_wrapper" "$(cat "$wrapper_file")" \
+        "${failure_stage} migration failure changed the legacy wrapper"
+    assert_equal "$old_local_sb" "$(readlink "$local_sb")" \
+        "${failure_stage} migration failure changed the local sb link"
+    assert_equal "$old_usr_sb" "$(readlink "$usr_sb")" \
+        "${failure_stage} migration failure changed the usr sb link"
+    assert_equal "$old_singbox_link" "$(readlink "$singbox_link")" \
+        "${failure_stage} migration failure changed the sing-box link"
+    unset -f mv ln
+}
+
+run_legacy_migration_rollback_case wrapper
+run_legacy_migration_rollback_case link
+unset -f curl
 
 # Explicit update is the only manager path that downloads. It validates first,
 # preserves the previous version, and atomically installs mode 0700.
@@ -105,7 +269,7 @@ mkdir -p "$(dirname "$update_manager")"
 printf '%s\n' '#!/bin/bash' 'printf "old manager\\n"' > "$update_manager"
 chmod 700 "$update_manager"
 old_manager_content="$(cat "$update_manager")"
-curl_log="${tmp_dir}/curl-update.log"
+curl_log="${tmp_dir}/curl-manager-update.log"
 download_body='#!/bin/bash
 printf "new manager\\n"
 '
@@ -144,6 +308,80 @@ assert_equal "$current_content" "$(cat "$update_manager")" \
     'invalid explicit update replaced the working manager'
 assert_equal "$previous_content" "$(cat "${update_manager}.previous")" \
     'invalid explicit update replaced the previous backup'
+
+run_atomic_previous_failure_case() {
+    local failure_stage="$1"
+    local fixture="${tmp_dir}/atomic-previous-${failure_stage}"
+    local manager_dir="${fixture}/usr/local/lib/sing-box-pre"
+    local manager_file="${manager_dir}/sing-box.sh"
+    local previous_file="${manager_file}.previous"
+    local failure_marker="${fixture}/failure-triggered"
+    local old_manager old_previous source_path destination_path
+
+    mkdir -p "$manager_dir"
+    printf '%s\n' '#!/bin/bash' 'printf "stable current manager\\n"' > "$manager_file"
+    printf '%s\n' '#!/bin/bash' 'printf "stable older manager\\n"' > "$previous_file"
+    chmod 700 "$manager_file" "$previous_file"
+    old_manager="$(cat "$manager_file")"
+    old_previous="$(cat "$previous_file")"
+    download_body=$'#!/bin/bash\nprintf "candidate manager\\n"\n'
+    rm -f "$failure_marker"
+
+    cp() {
+        source_path="${@: -2:1}"
+        destination_path="${@: -1}"
+        if [[ "$failure_stage" == partial-copy && ! -e "$failure_marker" && \
+              "$source_path" == "$manager_file" && \
+              "$destination_path" == "${manager_dir}/.sing-box.sh.previous."* ]]; then
+            printf 'partial backup' > "$destination_path"
+            : > "$failure_marker"
+            return 1
+        fi
+        command cp "$@"
+    }
+    chmod() {
+        destination_path="${@: -1}"
+        if [[ "$failure_stage" == previous-chmod && ! -e "$failure_marker" && \
+              "$destination_path" == "${manager_dir}/.sing-box.sh.previous."* ]]; then
+            : > "$failure_marker"
+            return 1
+        fi
+        command chmod "$@"
+    }
+    mv() {
+        source_path="${@: -2:1}"
+        destination_path="${@: -1}"
+        if [[ "$failure_stage" == previous-mv && ! -e "$failure_marker" && \
+              "$source_path" == "${manager_dir}/.sing-box.sh.previous."* && \
+              "$destination_path" == "$previous_file" ]]; then
+            : > "$failure_marker"
+            return 1
+        fi
+        if [[ "$failure_stage" == manager-mv && ! -e "$failure_marker" && \
+              "$source_path" == "${manager_dir}/.sing-box.sh.new."* && \
+              "$destination_path" == "$manager_file" ]]; then
+            : > "$failure_marker"
+            return 1
+        fi
+        command mv "$@"
+    }
+
+    assert_fail update_local_manager "$fixture" 'https://updates.example.test/fault.sh'
+    [[ -e "$failure_marker" ]] || fail "${failure_stage} update fault was not reached"
+    assert_equal "$old_manager" "$(cat "$manager_file")" \
+        "${failure_stage} changed the current manager"
+    assert_equal "$old_previous" "$(cat "$previous_file")" \
+        "${failure_stage} changed the existing previous manager"
+    if find "$manager_dir" -maxdepth 1 -type f -name '.sing-box.sh.*' -print -quit | grep -q .; then
+        fail "${failure_stage} left a manager update temporary file"
+    fi
+    unset -f cp chmod mv
+}
+
+for previous_failure_stage in \
+    partial-copy previous-chmod previous-mv manager-mv; do
+    run_atomic_previous_failure_case "$previous_failure_stage"
+done
 unset -f curl
 
 # Secret writers must be safe even when invoked by code running with umask 022.
@@ -224,29 +462,68 @@ manage_argo_source="$(extract_function manage_argo)"
 grep -Fq 'reading_secret' <<< "$manage_argo_source" || \
     fail 'interactive fixed Tunnel credentials are not read without echo'
 
-# The health check may disclose a credentialed URL only to curl's --proxy
-# option; destination, output and logs must stay credential-free.
-proxy_log="${tmp_dir}/proxy-curl.log"
-proxy_url='http://alice:password@example.test:3128'
+# The health check must keep the credentialed proxy URL out of argv. Curl reads
+# it from a mode-0600 temporary config that is removed on success and failure.
+proxy_tmp_dir="${tmp_dir}/proxy-config"
+proxy_log="${tmp_dir}/proxy-curl-argv.log"
+proxy_config_capture="${tmp_dir}/proxy-curl-config.capture"
+proxy_config_path_log="${tmp_dir}/proxy-curl-config-path.log"
+proxy_config_mode_log="${tmp_dir}/proxy-curl-config-mode.log"
+proxy_url='http://alice:pa\"ss@example.test:3128'
+mkdir -p "$proxy_tmp_dir"
+PROXY_CURL_CONFIG_DIR="$proxy_tmp_dir"
+PROXY_CURL_STATUS=0
 curl() {
     printf '%s\n' "$@" > "$proxy_log"
+    local argument previous='' config_path=''
+    for argument in "$@"; do
+        if [[ "$previous" == --config ]]; then
+            config_path="$argument"
+        fi
+        previous="$argument"
+    done
+    if [[ -n "$config_path" ]]; then
+        printf '%s\n' "$config_path" > "$proxy_config_path_log"
+        stat -c '%a' "$config_path" > "$proxy_config_mode_log"
+        command cp "$config_path" "$proxy_config_capture"
+    fi
+    return "$PROXY_CURL_STATUS"
 }
 proxy_output="$(probe_proxy_url "$proxy_url" 2>&1)"
 assert_equal '' "$proxy_output" 'proxy health check output'
 mapfile -t proxy_args < "$proxy_log"
-proxy_count=0
-for index in "${!proxy_args[@]}"; do
-    if [[ "${proxy_args[$index]}" == "$proxy_url" ]]; then
-        proxy_count=$((proxy_count + 1))
-        [[ "$index" -gt 0 && "${proxy_args[$((index - 1))]}" == --proxy ]] || \
-            fail 'credentialed proxy URL was not confined to --proxy'
-    fi
+assert_equal 3 "${#proxy_args[@]}" 'proxy health check curl argv count'
+assert_equal '--config' "${proxy_args[0]}" 'proxy health check config option'
+assert_equal 'https://www.cloudflare.com/cdn-cgi/trace' "${proxy_args[2]}" \
+    'proxy health check destination'
+[[ "${proxy_args[*]}" != *"$proxy_url"* ]] || \
+    fail 'credentialed proxy URL leaked into curl argv'
+if [[ "$(uname -s)" != MINGW* ]]; then
+    assert_equal 600 "$(cat "$proxy_config_mode_log")" 'proxy curl config mode'
+fi
+grep -Fqx 'proxy = "http://alice:pa\\\"ss@example.test:3128"' "$proxy_config_capture" || \
+    fail 'proxy URL was not safely escaped in the curl config'
+grep -Fqx 'output = "/dev/null"' "$proxy_config_capture" || \
+    fail 'proxy health check response is not discarded by config'
+proxy_config_path="$(cat "$proxy_config_path_log")"
+[[ ! -e "$proxy_config_path" ]] || fail 'successful proxy check left its curl config'
+
+PROXY_CURL_STATUS=23
+assert_fail probe_proxy_url 'http://alice:password@example.test:3128'
+failed_proxy_config_path="$(cat "$proxy_config_path_log")"
+[[ ! -e "$failed_proxy_config_path" ]] || fail 'failed proxy check left its curl config'
+
+for malicious_proxy_url in \
+    $'http://alice:password@example.test:3128\nnext = "injected"' \
+    $'http://alice:password@example.test:3128\rnext = "injected"'; do
+    : > "$proxy_log"
+    assert_fail probe_proxy_url "$malicious_proxy_url"
+    [[ ! -s "$proxy_log" ]] || fail 'CRLF proxy URL reached curl'
 done
-assert_equal 1 "$proxy_count" 'credentialed proxy URL argument count'
-grep -Fqx 'https://www.cloudflare.com/cdn-cgi/trace' "$proxy_log" || \
-    fail 'proxy health check does not use the Cloudflare trace destination'
-grep -Fqx -- '-o' "$proxy_log" || fail 'proxy health check does not discard its response'
-grep -Fqx '/dev/null' "$proxy_log" || fail 'proxy health check response is not discarded'
+if find "$proxy_tmp_dir" -maxdepth 1 -type f -print -quit | grep -q .; then
+    fail 'proxy health checks left a temporary curl config'
+fi
+unset PROXY_CURL_CONFIG_DIR PROXY_CURL_STATUS
 unset -f curl
 
 # CLI and interactive refresh paths share one guard. A fixed Tunnel must fail

@@ -2793,6 +2793,118 @@ uninstall_singbox() {
     esac
 }
 
+# Write a local-only wrapper. An isolated install root uses rooted paths so the
+# installed command can be exercised without chroot; production keeps canonical
+# absolute paths.
+write_local_manager_wrapper() {
+    local wrapper_file="$1"
+    local manager_target="$2"
+
+    {
+        printf '%s\n' '#!/bin/bash' 'set -e'
+        printf 'exec %q "$@"\n' "$manager_target"
+    } | atomic_write_secret_file "$wrapper_file" || return 1
+    chmod 700 "$wrapper_file"
+}
+
+is_legacy_raw_manager_wrapper() {
+    local wrapper_file="$1"
+
+    [ -f "$wrapper_file" ] && [ ! -L "$wrapper_file" ] || return 1
+    grep -Eq 'curl[^[:cntrl:]]+raw\.githubusercontent\.com/[^[:space:]]+/sing-box\.sh' \
+        "$wrapper_file"
+}
+
+migrate_legacy_manager_shortcuts() {
+    local install_root="${1:-}"
+    local wrapper_file="${install_root}/etc/sing-box/sb.sh"
+    local manager_target='/usr/local/lib/sing-box-pre/sing-box.sh'
+    local wrapper_target='/etc/sing-box/sb.sh'
+    local singbox_target='/etc/sing-box/sing-box'
+    local wrapper_tmp wrapper_backup link_path link_target desired_target link_tmp
+    local wrapper_committed=0 committed_links=0 rollback_ok=1 index
+    local -a link_paths=() old_targets=() staged_links=()
+
+    is_legacy_raw_manager_wrapper "$wrapper_file" || return 0
+    if [ -n "$install_root" ]; then
+        manager_target="${install_root}/usr/local/lib/sing-box-pre/sing-box.sh"
+        wrapper_target="$wrapper_file"
+        singbox_target="${install_root}/etc/sing-box/sing-box"
+    fi
+
+    wrapper_tmp=$(mktemp "$(dirname "$wrapper_file")/.sb.sh.migrate.XXXXXX") || return 1
+    wrapper_backup=$(mktemp "$(dirname "$wrapper_file")/.sb.sh.rollback.XXXXXX") || {
+        rm -f "$wrapper_tmp"
+        return 1
+    }
+    if ! write_local_manager_wrapper "$wrapper_tmp" "$manager_target" || \
+       ! cp -p "$wrapper_file" "$wrapper_backup" || ! chmod 700 "$wrapper_backup"; then
+        rm -f "$wrapper_tmp" "$wrapper_backup"
+        return 1
+    fi
+
+    for link_path in \
+        "${install_root}/usr/local/bin/sb" \
+        "${install_root}/usr/bin/sb" \
+        "${install_root}/usr/local/bin/sing-box"; do
+        [ -L "$link_path" ] || continue
+        link_target=$(readlink "$link_path" 2>/dev/null) || continue
+        case "$link_target" in
+            /etc/sing-box/sb.sh|"$wrapper_file") ;;
+            *) continue ;;
+        esac
+        desired_target="$wrapper_target"
+        [ "$link_path" = "${install_root}/usr/local/bin/sing-box" ] && \
+            desired_target="$singbox_target"
+        link_tmp=$(mktemp "$(dirname "$link_path")/.shortcut.migrate.XXXXXX") || {
+            rm -f "$wrapper_tmp" "$wrapper_backup" "${staged_links[@]}"
+            return 1
+        }
+        rm -f "$link_tmp"
+        if ! ln -s "$desired_target" "$link_tmp"; then
+            rm -f "$wrapper_tmp" "$wrapper_backup" "$link_tmp" "${staged_links[@]}"
+            return 1
+        fi
+        link_paths+=("$link_path")
+        old_targets+=("$link_target")
+        staged_links+=("$link_tmp")
+    done
+
+    if ! mv -f "$wrapper_tmp" "$wrapper_file"; then
+        rm -f "$wrapper_tmp" "$wrapper_backup" "${staged_links[@]}"
+        return 1
+    fi
+    wrapper_committed=1
+    for index in "${!link_paths[@]}"; do
+        if ! mv -f "${staged_links[$index]}" "${link_paths[$index]}"; then
+            break
+        fi
+        committed_links=$((committed_links + 1))
+    done
+    if [ "$committed_links" -ne "${#link_paths[@]}" ]; then
+        for ((index = committed_links - 1; index >= 0; index--)); do
+            link_tmp=$(mktemp "$(dirname "${link_paths[$index]}")/.shortcut.rollback.XXXXXX") || {
+                rollback_ok=0
+                continue
+            }
+            rm -f "$link_tmp"
+            if ! ln -s "${old_targets[$index]}" "$link_tmp" || \
+               ! mv -f "$link_tmp" "${link_paths[$index]}"; then
+                rollback_ok=0
+                rm -f "$link_tmp"
+            fi
+        done
+        if [ "$wrapper_committed" -eq 1 ] && \
+           ! mv -f "$wrapper_backup" "$wrapper_file"; then
+            rollback_ok=0
+        fi
+        rm -f "$wrapper_tmp" "$wrapper_backup" "${staged_links[@]}"
+        [ "$rollback_ok" -eq 1 ] || red "旧版 sb 快捷方式回滚失败。"
+        return 1
+    fi
+    rm -f "$wrapper_backup"
+}
+
 # 创建快捷指令
 create_shortcut() {
     local shortcut_root="${1:-${SHORTCUT_ROOT:-}}"
@@ -2804,6 +2916,8 @@ create_shortcut() {
     local manager_file="${manager_dir}/sing-box.sh"
     local manager_source="${MANAGER_SOURCE_SCRIPT:-${BASH_SOURCE[0]}}"
     local wrapper_target='/etc/sing-box/sb.sh'
+    local manager_target='/usr/local/lib/sing-box-pre/sing-box.sh'
+    local singbox_target='/etc/sing-box/sing-box'
     local local_sb="${local_bin_dir}/sb"
     local usr_sb="${usr_bin_dir}/sb"
     local singbox_link="${local_bin_dir}/sing-box"
@@ -2812,20 +2926,19 @@ create_shortcut() {
     bash -n "$manager_source" || return 1
     mkdir -p "$wrapper_dir" "$manager_dir" "$local_bin_dir" "$usr_bin_dir" || return 1
     install -m 700 "$manager_source" "$manager_file" || return 1
-    atomic_write_secret_file "$wrapper_file" << 'EOF' || return 1
-#!/bin/bash
-set -e
-exec /usr/local/lib/sing-box-pre/sing-box.sh "$@"
-EOF
-    chmod 700 "$wrapper_file" || return 1
-    [ -z "$shortcut_root" ] || wrapper_target="$wrapper_file"
+    if [ -n "$shortcut_root" ]; then
+        manager_target="$manager_file"
+        wrapper_target="$wrapper_file"
+        singbox_target="${shortcut_root}/etc/sing-box/sing-box"
+    fi
+    write_local_manager_wrapper "$wrapper_file" "$manager_target" || return 1
     ln -sfn "$wrapper_target" "$local_sb" || return 1
     ln -sfn "$wrapper_target" "$usr_sb" || return 1
-    ln -sfn '/etc/sing-box/sing-box' "$singbox_link" || return 1
+    ln -sfn "$singbox_target" "$singbox_link" || return 1
     if [ -x "$manager_file" ] && [ -x "$wrapper_file" ] && \
        [ "$(readlink "$local_sb" 2>/dev/null)" = "$wrapper_target" ] && \
        [ "$(readlink "$usr_sb" 2>/dev/null)" = "$wrapper_target" ] && \
-       [ "$(readlink "$singbox_link" 2>/dev/null)" = '/etc/sing-box/sing-box' ]; then
+       [ "$(readlink "$singbox_link" 2>/dev/null)" = "$singbox_target" ]; then
         green "\n快捷指令 sb 创建成功\n"
         return 0
     else
@@ -2840,7 +2953,8 @@ update_local_manager() {
     local manager_dir="${install_root}/usr/local/lib/sing-box-pre"
     local manager_file="${manager_dir}/sing-box.sh"
     local previous_file="${manager_file}.previous"
-    local tmp_file
+    local tmp_file previous_tmp='' previous_rollback=''
+    local previous_existed=0 previous_replaced=0 rollback_ok=1
 
     mkdir -p "$manager_dir" || return 1
     tmp_file=$(mktemp "${manager_dir}/.sing-box.sh.new.XXXXXX") || return 1
@@ -2853,20 +2967,95 @@ update_local_manager() {
         return 1
     fi
     if [ -e "$manager_file" ]; then
-        cp -p "$manager_file" "$previous_file" || { rm -f "$tmp_file"; return 1; }
-        chmod 700 "$previous_file" || { rm -f "$tmp_file"; return 1; }
+        previous_tmp=$(mktemp "${manager_dir}/.sing-box.sh.previous.XXXXXX") || {
+            rm -f "$tmp_file"
+            return 1
+        }
+        if ! cp -p "$manager_file" "$previous_tmp" || ! chmod 700 "$previous_tmp"; then
+            rm -f "$tmp_file" "$previous_tmp"
+            return 1
+        fi
+        if [ -e "$previous_file" ]; then
+            previous_existed=1
+            previous_rollback=$(mktemp "${manager_dir}/.sing-box.sh.previous-rollback.XXXXXX") || {
+                rm -f "$tmp_file" "$previous_tmp"
+                return 1
+            }
+            if ! cp -p "$previous_file" "$previous_rollback"; then
+                rm -f "$tmp_file" "$previous_tmp" "$previous_rollback"
+                return 1
+            fi
+        fi
+        if ! mv -f "$previous_tmp" "$previous_file"; then
+            rm -f "$tmp_file" "$previous_tmp" "$previous_rollback"
+            return 1
+        fi
+        previous_replaced=1
     fi
     if ! mv -f "$tmp_file" "$manager_file"; then
-        rm -f "$tmp_file"
+        if [ "$previous_replaced" -eq 1 ]; then
+            if [ "$previous_existed" -eq 1 ]; then
+                mv -f "$previous_rollback" "$previous_file" || rollback_ok=0
+            else
+                rm -f "$previous_file" || rollback_ok=0
+            fi
+        fi
+        rm -f "$tmp_file" "$previous_tmp" "$previous_rollback"
+        [ "$rollback_ok" -eq 1 ] || red "旧版 sb 管理脚本备份回滚失败。"
         return 1
     fi
+    rm -f "$previous_tmp" "$previous_rollback"
 }
 
 update_shortcut() {
-    if ! update_local_manager; then
+    local install_root="${1:-}"
+    local update_url="${2:-https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh}"
+    local manager_dir="${install_root}/usr/local/lib/sing-box-pre"
+    local manager_file="${manager_dir}/sing-box.sh"
+    local previous_file="${manager_file}.previous"
+    local manager_backup='' previous_backup=''
+    local manager_existed=0 previous_existed=0 rollback_ok=1
+
+    mkdir -p "$manager_dir" || return 1
+    if [ -e "$manager_file" ]; then
+        manager_existed=1
+        manager_backup=$(mktemp "${manager_dir}/.sing-box.sh.update-rollback.XXXXXX") || return 1
+        cp -p "$manager_file" "$manager_backup" || { rm -f "$manager_backup"; return 1; }
+    fi
+    if [ -e "$previous_file" ]; then
+        previous_existed=1
+        previous_backup=$(mktemp "${manager_dir}/.sing-box.sh.previous-rollback.XXXXXX") || {
+            rm -f "$manager_backup"
+            return 1
+        }
+        cp -p "$previous_file" "$previous_backup" || {
+            rm -f "$manager_backup" "$previous_backup"
+            return 1
+        }
+    fi
+
+    if ! update_local_manager "$install_root" "$update_url"; then
+        rm -f "$manager_backup" "$previous_backup"
         red "sb 本地管理脚本更新失败，已保留当前版本。"
         return 1
     fi
+    if ! migrate_legacy_manager_shortcuts "$install_root"; then
+        if [ "$manager_existed" -eq 1 ]; then
+            mv -f "$manager_backup" "$manager_file" || rollback_ok=0
+        else
+            rm -f "$manager_file" || rollback_ok=0
+        fi
+        if [ "$previous_existed" -eq 1 ]; then
+            mv -f "$previous_backup" "$previous_file" || rollback_ok=0
+        else
+            rm -f "$previous_file" || rollback_ok=0
+        fi
+        rm -f "$manager_backup" "$previous_backup"
+        [ "$rollback_ok" -eq 1 ] || red "sb 本地管理脚本回滚失败。"
+        red "旧版 sb 快捷方式迁移失败。"
+        return 1
+    fi
+    rm -f "$manager_backup" "$previous_backup"
     green "已更新 sb 本地管理脚本；不会修改已有节点、订阅、端口或服务配置。\n"
 }
 
@@ -5164,10 +5353,38 @@ delete_rule_menu() {
 }
 
 probe_proxy_url() {
-    local proxy_url="$1"
+    (
+        local proxy_url="${1:-}"
+        local config_dir="${PROXY_CURL_CONFIG_DIR:-${TMPDIR:-/tmp}}"
+        local config_file='' escaped_proxy curl_status
 
-    curl -fsS --proxy "$proxy_url" --connect-timeout 5 --max-time 10 \
-        https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+        [ -n "$proxy_url" ] || exit 1
+        case "$proxy_url" in
+            *$'\r'*|*$'\n'*) exit 1 ;;
+        esac
+        config_file=$(mktemp "${config_dir%/}/.sing-box-proxy-curl.XXXXXX") || exit 1
+        trap 'rm -f -- "$config_file"' EXIT
+        trap 'exit 1' HUP INT TERM
+        chmod 600 "$config_file" || exit 1
+
+        escaped_proxy=${proxy_url//\\/\\\\}
+        escaped_proxy=${escaped_proxy//\"/\\\"}
+        {
+            printf '%s\n' \
+                'fail' \
+                'silent' \
+                'show-error' \
+                'connect-timeout = 5' \
+                'max-time = 10' \
+                'output = "/dev/null"'
+            printf 'proxy = "%s"\n' "$escaped_proxy"
+        } > "$config_file" || exit 1
+
+        curl --config "$config_file" \
+            https://www.cloudflare.com/cdn-cgi/trace
+        curl_status=$?
+        exit "$curl_status"
+    )
 }
 
 add_socks5_proxy() {

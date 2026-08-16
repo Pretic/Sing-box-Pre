@@ -81,6 +81,7 @@ for function_name in \
     persist_install_settings \
     atomic_write_file \
     atomic_write_secret_file \
+    write_local_manager_wrapper \
     write_base64_subscription \
     sync_combined_subscription \
     update_sub \
