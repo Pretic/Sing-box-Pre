@@ -19,6 +19,16 @@ validate_port_source=$(sed -n '/^validate_port_value() {/,/^}/p' "$script")
 [[ -n "$validate_port_source" ]] || fail 'port validation helper could not be extracted'
 source /dev/stdin <<< "$validate_port_source"
 
+change_config_source=$(sed -n '/^change_config() {/,/^change_ip() {/p' "$script" | sed '$d')
+hop_enable_source=$(sed -n '/purple "端口跳跃需确保/,/^        5)/p' <<< "$change_config_source")
+hop_disable_source=$(sed -n '/^        5)/,/^        6)/p' <<< "$change_config_source")
+for option_source in "$hop_enable_source" "$hop_disable_source"; do
+    grep -Fq 'hy2_transaction_status=$?' <<< "$option_source" || \
+        fail 'HY2 menu option does not capture the transaction status'
+    grep -Fq '[ "$hy2_transaction_status" -eq 2 ] && return 2' <<< "$option_source" || \
+        fail 'HY2 menu option does not propagate fatal rollback status 2'
+done
+
 work_dir="$tmp_root/work"
 client_dir="$work_dir/url.txt"
 combined_client_dir="$work_dir/all-url.txt"
@@ -192,6 +202,8 @@ grep -Fxq 'RULE|ip6tables|PRENET_HY2|-p udp --dport 53000:53100 -j ACCEPT' "$nat
 if grep -Fq '|PRENET_HY2|' "$HY2_NAT_STATE_FILE"; then
     fail 'administrator-owned PRENET_HY2 was recorded as script-owned'
 fi
+[[ "$(grep -Ec '\|created$' "$HY2_NAT_STATE_FILE")" -eq 2 ]] || \
+    fail 'new ownership records are not marked created'
 if [[ "$(uname -s)" != MINGW* ]]; then
     [[ "$(stat -c '%a' "$HY2_NAT_STATE_FILE")" == 600 ]] || fail 'HY2 ownership state is not mode 600'
 else
@@ -218,10 +230,33 @@ add_hy2_port_hopping 52000 52100 9443 || fail 'exact legacy HY2 rules were not a
 [[ "$(firewall_snapshot)" == "$legacy_before" ]] || fail 'legacy adoption changed live firewall rules'
 [[ "$(grep -Fc '|PRENET_HY2|prenet-hy2|52000|52100|9443' "$HY2_NAT_STATE_FILE")" -eq 2 ]] || \
     fail 'exact legacy rules were not recorded as adopted ownership'
+[[ "$(grep -Ec '\|adopted$' "$HY2_NAT_STATE_FILE")" -eq 2 ]] || \
+    fail 'legacy ownership records are not marked adopted'
 remove_hy2_port_hopping || fail 'adopted legacy HY2 rules could not be removed'
 if grep -Eq 'PRENET_HY2|prenet-hy2' "$nat_state"; then
     fail 'adopted legacy HY2 resources remained after removal'
 fi
+
+reset_firewall
+for family in iptables ip6tables; do
+    add_chain "$family" PREROUTING
+    add_chain "$family" PRENET_HY2
+    add_rule "$family" PRENET_HY2 \
+        '-p udp --dport 52200:52300 -m comment --comment prenet-hy2 -j DNAT --to-destination :9443'
+    add_rule "$family" PREROUTING \
+        '-p udp -m comment --comment prenet-hy2 -j PRENET_HY2'
+done
+legacy_before=$(firewall_snapshot)
+original_state_writer=$(declare -f write_hy2_nat_state_records)
+write_hy2_nat_state_records() { return 1; }
+if add_hy2_port_hopping 52200 52300 9443; then
+    fail 'legacy adoption succeeded despite ownership-state persistence failure'
+fi
+eval "$original_state_writer"
+[[ "$(firewall_snapshot)" == "$legacy_before" ]] || \
+    fail 'ownership-state failure deleted adopted legacy rules'
+[[ ! -e "$HY2_NAT_STATE_FILE" ]] || \
+    fail 'ownership-state failure left state for an uncommitted legacy adoption'
 
 # RED 3: every append and cross-family failure rolls back only this attempt.
 for failure_case in dnat jump; do
@@ -345,6 +380,9 @@ remove_hy2_port_hopping || fail 'IPv4-only HY2 remove failed'
 # RED 6: menu-facing helpers stage first and roll back every committed surface.
 for helper_name in \
     stage_hy2_client_file \
+    restore_hy2_client_snapshot \
+    restore_hy2_subscription_snapshot \
+    handle_hy2_menu_transaction_failure \
     enable_hy2_port_hopping_transaction \
     disable_hy2_port_hopping_transaction; do
     declare -F "$helper_name" >/dev/null || fail "$helper_name is not implemented"
@@ -355,6 +393,7 @@ RESTART_FAILURES=0
 UPDATE_SUB_FAILURES=0
 ATOMIC_CLIENT_FAILURES=0
 RESTART_CALLS=0
+HY2_ERROR_LOG="$tmp_root/hy2-errors.log"
 
 singbox_service_is_active() { [[ "$SERVICE_ACTIVE" == 1 ]]; }
 restart_singbox() {
@@ -388,6 +427,7 @@ update_sub() {
     cp -- "$client_dir" "$work_dir/all-sub.txt"
     cp -- "$client_dir" "$work_dir/sub.txt"
 }
+red() { printf '%s\n' "$*" >> "$HY2_ERROR_LOG"; }
 
 prepare_menu_fixture() {
     prepare_empty_firewall
@@ -407,6 +447,7 @@ prepare_menu_fixture() {
     UPDATE_SUB_FAILURES=0
     ATOMIC_CLIENT_FAILURES=0
     RESTART_CALLS=0
+    : > "$HY2_ERROR_LOG"
 }
 
 assert_menu_fixture_restored() {
@@ -419,6 +460,50 @@ assert_menu_fixture_restored() {
             fail "$description did not restore $(basename "$path")"
     done
     [[ "$SERVICE_ACTIVE" == 1 ]] || fail "$description did not restore service state"
+}
+
+prepare_adopted_menu_fixture() {
+    prepare_empty_firewall
+    local family path
+    for family in iptables ip6tables; do
+        add_chain "$family" PRENET_HY2
+        add_rule "$family" PRENET_HY2 \
+            '-p udp --dport 56200:56300 -m comment --comment prenet-hy2 -j DNAT --to-destination :12443'
+        add_rule "$family" PREROUTING \
+            '-p udp -m comment --comment prenet-hy2 -j PRENET_HY2'
+    done
+    printf '%s\n' \
+        'vless://unchanged' \
+        'hysteria2://11111111-2222-3333-4444-555555555555@198.51.100.1:12443?peer=www.bing.com&insecure=1#legacy' \
+        'tuic://unchanged' > "$client_dir"
+    for path in "$work_dir/base-sub.txt" "$combined_client_dir" "$work_dir/all-sub.txt" "$work_dir/sub.txt"; do
+        printf 'legacy:%s\n' "$(basename "$path")" > "$path"
+    done
+    MENU_NAT_BEFORE=$(firewall_snapshot)
+    SERVICE_ACTIVE=1
+    RESTART_FAILURES=0
+    UPDATE_SUB_FAILURES=0
+    ATOMIC_CLIENT_FAILURES=0
+    RESTART_CALLS=0
+    : > "$HY2_ERROR_LOG"
+}
+
+assert_fatal_backup_retained() {
+    local description="$1" candidate found=''
+    for candidate in "$work_dir"/.hy2-menu.*; do
+        [ -d "$candidate" ] || continue
+        [ -z "$found" ] || fail "$description retained multiple recovery directories"
+        found="$candidate"
+    done
+    [ -n "$found" ] || fail "$description deleted its recovery directory"
+    grep -Fq '人工恢复路径' "$HY2_ERROR_LOG" || \
+        fail "$description did not report a manual recovery path"
+    grep -Fq "$found" "$HY2_ERROR_LOG" || \
+        fail "$description did not report the retained recovery directory"
+    if grep -Fq '已恢复' "$HY2_ERROR_LOG"; then
+        fail "$description falsely claimed complete restoration"
+    fi
+    FATAL_BACKUP_PATH="$found"
 }
 
 prepare_menu_fixture
@@ -453,6 +538,72 @@ for failure_stage in atomic restart update_sub; do
     fi
     assert_menu_fixture_restored "$failure_stage failure"
 done
+
+prepare_adopted_menu_fixture
+UPDATE_SUB_FAILURES=1
+if enable_hy2_port_hopping_transaction 56200 56300; then
+    fail 'legacy adoption menu transaction succeeded despite update_sub failure'
+fi
+[[ "$(firewall_snapshot)" == "$MENU_NAT_BEFORE" ]] || \
+    fail 'menu rollback did not restore the stateless adopted legacy baseline'
+[[ ! -e "$HY2_NAT_STATE_FILE" ]] || \
+    fail 'menu rollback created ownership state for the stateless adopted legacy baseline'
+grep -Fq '#legacy' "$client_dir" || \
+    fail 'menu rollback did not restore the legacy client'
+for path in "$work_dir/base-sub.txt" "$combined_client_dir" "$work_dir/all-sub.txt" "$work_dir/sub.txt"; do
+    [[ "$(<"$path")" == "legacy:$(basename "$path")" ]] || \
+        fail "menu rollback did not restore legacy $(basename "$path")"
+done
+[[ "$SERVICE_ACTIVE" == 1 ]] || \
+    fail 'menu rollback did not restore service state for legacy adoption'
+
+for restore_stage in nat client subscription service; do
+    prepare_menu_fixture
+    UPDATE_SUB_FAILURES=1
+    case "$restore_stage" in
+        nat)
+            original_restore_helper=$(declare -f restore_hy2_nat_snapshot)
+            restore_hy2_nat_snapshot() { return 1; }
+            ;;
+        client)
+            original_restore_helper=$(declare -f restore_hy2_client_snapshot)
+            restore_hy2_client_snapshot() { return 1; }
+            ;;
+        subscription)
+            original_restore_helper=$(declare -f restore_hy2_subscription_snapshot)
+            restore_hy2_subscription_snapshot() { return 1; }
+            ;;
+        service)
+            original_restore_helper=$(declare -f restore_hy2_service_state)
+            restore_hy2_service_state() { return 1; }
+            ;;
+    esac
+    if enable_hy2_port_hopping_transaction 56200 56300; then
+        fatal_status=0
+    else
+        fatal_status=$?
+    fi
+    [[ "$fatal_status" -eq 2 ]] || \
+        fail "$restore_stage restore failure returned $fatal_status instead of fatal status 2"
+    assert_fatal_backup_retained "$restore_stage restore failure"
+    eval "$original_restore_helper"
+    rm -rf -- "$FATAL_BACKUP_PATH"
+done
+
+prepare_menu_fixture
+UPDATE_SUB_FAILURES=1
+original_restore_helper=$(declare -f restore_hy2_nat_snapshot)
+restore_hy2_nat_snapshot() { return 1; }
+if disable_hy2_port_hopping_transaction; then
+    fatal_status=0
+else
+    fatal_status=$?
+fi
+[[ "$fatal_status" -eq 2 ]] || \
+    fail "disable rollback failure returned $fatal_status instead of fatal status 2"
+assert_fatal_backup_retained 'disable rollback failure'
+eval "$original_restore_helper"
+rm -rf -- "$FATAL_BACKUP_PATH"
 
 prepare_menu_fixture
 enable_hy2_port_hopping_transaction 56200 56300 || fail 'HY2 menu enable transaction failed'

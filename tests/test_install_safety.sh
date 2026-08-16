@@ -328,7 +328,7 @@ EOF
     [[ -n "$hop_enable_source" ]] || fail 'Hysteria2 port-hop option 4 block is missing'
     [[ -n "$hop_disable_source" ]] || fail 'Hysteria2 port-hop option 5 block is missing'
 
-    enable_line="$(grep -nF 'if ! enable_hy2_port_hopping_transaction "$min_port" "$max_port"; then' \
+    enable_line="$(grep -nF 'enable_hy2_port_hopping_transaction "$min_port" "$max_port"' \
         <<< "$hop_enable_source" | head -1 | cut -d: -f1 || true)"
     enable_success_line="$(grep -nF 'hysteria2端口跳跃已开启' \
         <<< "$hop_enable_source" | head -1 | cut -d: -f1 || true)"
@@ -339,7 +339,7 @@ EOF
     [[ "$enable_line" -lt "$enable_success_line" ]] || \
         fail 'Hysteria2 port-hop option 4 displays success before the enable transaction commits'
 
-    disable_line="$(grep -nF 'if ! disable_hy2_port_hopping_transaction; then' \
+    disable_line="$(grep -nF 'disable_hy2_port_hopping_transaction' \
         <<< "$hop_disable_source" | head -1 | cut -d: -f1 || true)"
     disable_success_line="$(grep -nF '端口跳跃已删除' \
         <<< "$hop_disable_source" | head -1 | cut -d: -f1 || true)"

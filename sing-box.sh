@@ -1819,7 +1819,7 @@ configure_hy2_nat_family() {
         return 1
     fi
 
-    HY2_NAT_CONFIGURED_RECORD="${firewall_cmd}|${chain}|${comment}|${min_port}|${max_port}|${listen_port}"
+    HY2_NAT_CONFIGURED_RECORD="${firewall_cmd}|${chain}|${comment}|${min_port}|${max_port}|${listen_port}|created"
 }
 
 adopt_legacy_hy2_nat_family() {
@@ -1839,7 +1839,7 @@ adopt_legacy_hy2_nat_family() {
     [ "$(printf '%s\n' "$chain_rules" | grep -c '^-A ')" -eq 1 ] || return 1
     printf '%s\n' "$chain_rules" | grep -Fqx -- "$expected_dnat" || return 1
     [ "$(printf '%s\n' "$prerouting_rules" | grep -Fxc -- "$expected_jump")" -eq 1 ] || return 1
-    HY2_NAT_CONFIGURED_RECORD="${firewall_cmd}|${chain}|${comment}|${min_port}|${max_port}|${listen_port}"
+    HY2_NAT_CONFIGURED_RECORD="${firewall_cmd}|${chain}|${comment}|${min_port}|${max_port}|${listen_port}|adopted"
 }
 
 remove_hy2_nat_family() {
@@ -1850,13 +1850,13 @@ remove_hy2_nat_family() {
     local max_port="${5:-}"
     local listen_port="${6:-}"
     local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
-    local family saved_chain saved_comment saved_min saved_max saved_listen
+    local family saved_chain saved_comment saved_min saved_max saved_listen saved_kind
 
     command_exists "$firewall_cmd" || return 1
 
     if [ -z "$chain" ]; then
         [ -r "$state_file" ] || return 0
-        while IFS='|' read -r family saved_chain saved_comment saved_min saved_max saved_listen; do
+        while IFS='|' read -r family saved_chain saved_comment saved_min saved_max saved_listen saved_kind; do
             [ "$family" = "$firewall_cmd" ] || continue
             chain="$saved_chain"
             comment="$saved_comment"
@@ -1893,9 +1893,9 @@ remove_hy2_nat_family() {
 
 restore_hy2_nat_record() {
     local record="${1:-}"
-    local firewall_cmd chain comment min_port max_port listen_port
+    local firewall_cmd chain comment min_port max_port listen_port record_kind
 
-    IFS='|' read -r firewall_cmd chain comment min_port max_port listen_port <<< "$record"
+    IFS='|' read -r firewall_cmd chain comment min_port max_port listen_port record_kind <<< "$record"
     command_exists "$firewall_cmd" || return 1
     if ! "$firewall_cmd" -t nat -S "$chain" >/dev/null 2>&1; then
         "$firewall_cmd" -t nat -N "$chain" >/dev/null 2>&1 || return 1
@@ -1912,11 +1912,11 @@ restore_hy2_nat_record() {
 
 remove_hy2_nat_records() {
     local -a records=("$@")
-    local index record family chain comment min_port max_port listen_port restore_index
+    local index record family chain comment min_port max_port listen_port record_kind restore_index
 
     for ((index = 0; index < ${#records[@]}; index++)); do
         record="${records[$index]}"
-        IFS='|' read -r family chain comment min_port max_port listen_port <<< "$record"
+        IFS='|' read -r family chain comment min_port max_port listen_port record_kind <<< "$record"
         if ! remove_hy2_nat_family "$family" "$chain" "$comment" "$min_port" "$max_port" "$listen_port"; then
             for ((restore_index = index - 1; restore_index >= 0; restore_index--)); do
                 restore_hy2_nat_record "${records[$restore_index]}" || true
@@ -1935,11 +1935,12 @@ restore_hy2_nat_records() {
 
 rollback_new_hy2_nat_records() {
     local -a records=("$@")
-    local index record family chain comment min_port max_port listen_port
+    local index record family chain comment min_port max_port listen_port record_kind
 
     for ((index = ${#records[@]} - 1; index >= 0; index--)); do
         record="${records[$index]}"
-        IFS='|' read -r family chain comment min_port max_port listen_port <<< "$record"
+        IFS='|' read -r family chain comment min_port max_port listen_port record_kind <<< "$record"
+        [ "$record_kind" = created ] || continue
         remove_hy2_nat_family "$family" "$chain" "$comment" "$min_port" "$max_port" "$listen_port" || true
     done
 }
@@ -1985,7 +1986,7 @@ add_hy2_port_hopping() {
     local -a configured_records=()
     local -a old_records=()
     local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
-    local same_configuration=1 record family chain comment old_min old_max old_listen
+    local same_configuration=1 record family chain comment old_min old_max old_listen old_kind
 
     validate_port_value "$min_port" hy2_hop_min_port || return 1
     validate_port_value "$max_port" hy2_hop_max_port || return 1
@@ -1996,7 +1997,7 @@ add_hy2_port_hopping() {
         mapfile -t old_records < "$state_file" || return 1
         [ "${#old_records[@]}" -gt 0 ] || return 1
         for record in "${old_records[@]}"; do
-            IFS='|' read -r family chain comment old_min old_max old_listen <<< "$record"
+            IFS='|' read -r family chain comment old_min old_max old_listen old_kind <<< "$record"
             case "$family" in iptables|ip6tables) ;; *) return 1 ;; esac
             [ -n "$chain" ] && [ -n "$comment" ] || return 1
             validate_port_value "$old_min" hy2_state_min_port >/dev/null 2>&1 || return 1
@@ -2023,15 +2024,7 @@ add_hy2_port_hopping() {
     fi
     if ipv6_stack_available && command_exists ip6tables; then
         if ! configure_hy2_nat_family ip6tables "$min_port" "$max_port" "$listen_port"; then
-            local rollback_index rollback_record rollback_family rollback_chain rollback_comment
-            local rollback_min rollback_max rollback_listen
-            for ((rollback_index = ${#configured_records[@]} - 1; rollback_index >= 0; rollback_index--)); do
-                rollback_record="${configured_records[$rollback_index]}"
-                IFS='|' read -r rollback_family rollback_chain rollback_comment \
-                    rollback_min rollback_max rollback_listen <<< "$rollback_record"
-                remove_hy2_nat_family "$rollback_family" "$rollback_chain" "$rollback_comment" \
-                    "$rollback_min" "$rollback_max" "$rollback_listen" || true
-            done
+            rollback_new_hy2_nat_records "${configured_records[@]}"
             return 1
         fi
         configured_families+=(ip6tables)
@@ -2070,7 +2063,7 @@ remove_hy2_port_hopping() {
     local status=0
     local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
     local -a records=()
-    local record family chain comment min_port max_port listen_port
+    local record family chain comment min_port max_port listen_port record_kind
 
     [ -r "$state_file" ] || return 0
     mapfile -t records < "$state_file" || return 1
@@ -2179,6 +2172,9 @@ atomic_replace_hy2_client() {
 
 backup_hy2_menu_transaction() {
     local backup_dir="${1:-}"
+    local baseline_min="${2:-}"
+    local baseline_max="${3:-}"
+    local baseline_listen="${4:-}"
     local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
     local -a files=(
         "$client_dir"
@@ -2188,12 +2184,19 @@ backup_hy2_menu_transaction() {
         "${work_dir}/sub.txt"
         "${work_dir}/cfy-sub.txt"
     )
-    local index path
+    local index path family
 
     [ -d "$backup_dir" ] || return 1
     if [ -f "$state_file" ]; then
         cp -p -- "$state_file" "${backup_dir}/nat.state" || return 1
         : > "${backup_dir}/nat.present" || return 1
+    elif [ -n "$baseline_min" ] && [ -n "$baseline_max" ] && [ -n "$baseline_listen" ]; then
+        for family in iptables ip6tables; do
+            if command_exists "$family" && \
+               adopt_legacy_hy2_nat_family "$family" "$baseline_min" "$baseline_max" "$baseline_listen"; then
+                printf '%s\n' "$HY2_NAT_CONFIGURED_RECORD" >> "${backup_dir}/nat.baseline" || return 1
+            fi
+        done
     fi
     for ((index = 0; index < ${#files[@]}; index++)); do
         path="${files[$index]}"
@@ -2204,23 +2207,36 @@ backup_hy2_menu_transaction() {
     done
 }
 
-restore_hy2_menu_files() {
+restore_hy2_client_snapshot() {
+    local backup_dir="${1:-}"
+    local tmp_file
+
+    if [ -e "${backup_dir}/present.0" ]; then
+        tmp_file=$(mktemp "$(dirname "$client_dir")/.hy2-restore.XXXXXX") || return 1
+        cp -p -- "${backup_dir}/file.0" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+        mv -f -- "$tmp_file" "$client_dir" || { rm -f -- "$tmp_file"; return 1; }
+    else
+        rm -f -- "$client_dir" || return 1
+    fi
+}
+
+restore_hy2_subscription_snapshot() {
     local backup_dir="${1:-}"
     local -a files=(
-        "$client_dir"
         "${work_dir}/base-sub.txt"
         "$combined_client_dir"
         "${work_dir}/all-sub.txt"
         "${work_dir}/sub.txt"
         "${work_dir}/cfy-sub.txt"
     )
-    local index path tmp_file
+    local index slot path tmp_file
 
     for ((index = 0; index < ${#files[@]}; index++)); do
         path="${files[$index]}"
-        if [ -e "${backup_dir}/present.${index}" ]; then
+        slot=$((index + 1))
+        if [ -e "${backup_dir}/present.${slot}" ]; then
             tmp_file=$(mktemp "$(dirname "$path")/.hy2-restore.XXXXXX") || return 1
-            cp -p -- "${backup_dir}/file.${index}" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+            cp -p -- "${backup_dir}/file.${slot}" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
             mv -f -- "$tmp_file" "$path" || { rm -f -- "$tmp_file"; return 1; }
         else
             rm -f -- "$path" || return 1
@@ -2242,6 +2258,11 @@ restore_hy2_nat_snapshot() {
         restore_hy2_nat_records "${old_records[@]}" || return 1
         persist_hy2_nat_rules || return 1
         write_hy2_nat_state_records "${old_records[@]}" || return 1
+    elif [ -s "${backup_dir}/nat.baseline" ]; then
+        mapfile -t old_records < "${backup_dir}/nat.baseline" || return 1
+        restore_hy2_nat_records "${old_records[@]}" || return 1
+        persist_hy2_nat_rules || return 1
+        rm -f -- "$state_file" || return 1
     else
         persist_hy2_nat_rules || return 1
         rm -f -- "$state_file" || return 1
@@ -2269,9 +2290,26 @@ rollback_hy2_menu_transaction() {
     local status=0
 
     restore_hy2_nat_snapshot "$backup_dir" || status=1
-    restore_hy2_menu_files "$backup_dir" || status=1
+    restore_hy2_client_snapshot "$backup_dir" || status=1
+    restore_hy2_subscription_snapshot "$backup_dir" || status=1
     restore_hy2_service_state "$was_active" || status=1
     return "$status"
+}
+
+handle_hy2_menu_transaction_failure() {
+    local backup_dir="${1:-}"
+    local was_active="${2:-0}"
+    local staged_file="${3:-}"
+
+    if rollback_hy2_menu_transaction "$backup_dir" "$was_active"; then
+        rm -f -- "$staged_file"
+        rm -rf -- "$backup_dir"
+        return 1
+    fi
+
+    rm -f -- "$staged_file"
+    red "Hysteria2 事务回滚不完整。人工恢复路径: ${backup_dir}"
+    return 2
 }
 
 enable_hy2_port_hopping_transaction() {
@@ -2297,7 +2335,7 @@ enable_hy2_port_hopping_transaction() {
         return 1
     }
     chmod 700 "$backup_dir" || { rm -f -- "$staged_file"; rm -rf -- "$backup_dir"; return 1; }
-    backup_hy2_menu_transaction "$backup_dir" || {
+    backup_hy2_menu_transaction "$backup_dir" "$min_port" "$max_port" "$listen_port" || {
         rm -f -- "$staged_file"
         rm -rf -- "$backup_dir"
         return 1
@@ -2308,10 +2346,8 @@ enable_hy2_port_hopping_transaction() {
        ! atomic_replace_hy2_client "$staged_file" "$client_dir" ||
        { [ "$was_active" -eq 1 ] && ! restart_singbox; } ||
        ! update_sub; then
-        rollback_hy2_menu_transaction "$backup_dir" "$was_active" || true
-        rm -f -- "$staged_file"
-        rm -rf -- "$backup_dir"
-        return 1
+        handle_hy2_menu_transaction_failure "$backup_dir" "$was_active" "$staged_file"
+        return $?
     fi
 
     rm -rf -- "$backup_dir"
@@ -2338,10 +2374,8 @@ disable_hy2_port_hopping_transaction() {
        ! atomic_replace_hy2_client "$staged_file" "$client_dir" ||
        { [ "$was_active" -eq 1 ] && ! restart_singbox; } ||
        ! update_sub; then
-        rollback_hy2_menu_transaction "$backup_dir" "$was_active" || true
-        rm -f -- "$staged_file"
-        rm -rf -- "$backup_dir"
-        return 1
+        handle_hy2_menu_transaction_failure "$backup_dir" "$was_active" "$staged_file"
+        return $?
     fi
 
     rm -rf -- "$backup_dir"
@@ -3954,7 +3988,10 @@ change_config() {
             reading "\n请输入跳跃结束端口 (需大于起始端口): " max_port
             [ -z "$max_port" ] && max_port=$(($min_port + 100))
             yellow "你的结束端口为：$max_port\n"
-            if ! enable_hy2_port_hopping_transaction "$min_port" "$max_port"; then
+            enable_hy2_port_hopping_transaction "$min_port" "$max_port"
+            hy2_transaction_status=$?
+            if [ "$hy2_transaction_status" -ne 0 ]; then
+                [ "$hy2_transaction_status" -eq 2 ] && return 2
                 red "Hysteria2 端口跳跃启用失败，原配置已保留或恢复。"
                 return 1
             fi
@@ -3962,7 +3999,10 @@ change_config() {
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
             ;;
         5)
-            if ! disable_hy2_port_hopping_transaction; then
+            disable_hy2_port_hopping_transaction
+            hy2_transaction_status=$?
+            if [ "$hy2_transaction_status" -ne 0 ]; then
+                [ "$hy2_transaction_status" -eq 2 ] && return 2
                 red "Hysteria2 端口跳跃删除失败，原配置已保留或恢复。"
                 return 1
             fi
