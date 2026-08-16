@@ -35,6 +35,7 @@ assert_equal() {
 for function_name in \
     remove_managed_singbox_link \
     auto_uninstall \
+    uninstall_singbox \
     detect_argo_tunnel_mode \
     get_quick_tunnel \
     refresh_quick_argo \
@@ -49,6 +50,8 @@ yellow() { :; }
 red() { printf '%s\n' "$*" >&2; }
 purple() { :; }
 skyblue() { :; }
+green=''
+yellow=''
 purple=''
 re=''
 
@@ -104,6 +107,125 @@ case "$(uname -s)" in
         run_uninstall_fixture legacy symlink '/etc/sing-box/sb.sh'
         run_uninstall_fixture custom symlink '/opt/custom/sing-box'
         run_uninstall_fixture regular file
+        ;;
+esac
+
+# The interactive uninstaller must use the same safe shortcut cleanup as the
+# non-interactive path. A guarded rm makes the pre-fix call safe even though it
+# ignores the fixture root: paths outside the fixture are logged, never run.
+run_interactive_uninstall_fixture() {
+    local fixture_name="$1"
+    local fixture_kind="$2"
+    local fixture_root="${tmp_dir}/interactive-${fixture_name}"
+    local denied_log="${fixture_root}/denied-rm.log"
+    local local_singbox="${fixture_root}/usr/local/bin/sing-box"
+    local local_sb="${fixture_root}/usr/local/bin/sb"
+    local usr_sb="${fixture_root}/usr/bin/sb"
+    local path
+
+    mkdir -p "$(dirname "$local_singbox")" "$(dirname "$usr_sb")" \
+        "${fixture_root}/etc/sing-box"
+    : > "$denied_log"
+    work_dir="${fixture_root}/etc/sing-box"
+    printf 'runtime fixture\n' > "${work_dir}/runtime"
+
+    case "$fixture_kind" in
+        current)
+            ln -s '/etc/sing-box/sing-box' "$local_singbox"
+            ln -s '/etc/sing-box/sb.sh' "$local_sb"
+            ln -s '/etc/sing-box/sb.sh' "$usr_sb"
+            ;;
+        legacy)
+            ln -s '/etc/sing-box/sb.sh' "$local_singbox"
+            ln -s '/etc/sing-box/sb.sh' "$local_sb"
+            ln -s '/etc/sing-box/sb.sh' "$usr_sb"
+            ;;
+        custom)
+            ln -s '/opt/custom/sing-box' "$local_singbox"
+            ln -s '/opt/custom/local-sb' "$local_sb"
+            ln -s '/opt/custom/usr-sb' "$usr_sb"
+            ;;
+        regular)
+            printf 'user sing-box\n' > "$local_singbox"
+            printf 'user local sb\n' > "$local_sb"
+            printf 'user usr sb\n' > "$usr_sb"
+            ;;
+    esac
+
+    (
+        rm() {
+            local argument allowed=1
+            for argument in "$@"; do
+                [[ "$argument" == -* ]] && continue
+                if [[ "$argument" != "$fixture_root" && \
+                      "$argument" != "$fixture_root/"* ]]; then
+                    printf '%s\n' "$argument" >> "$denied_log"
+                    allowed=0
+                fi
+            done
+            [[ "$allowed" -eq 0 ]] || command rm "$@"
+            return 0
+        }
+        command_exists() { [[ "${1:-}" == rc-service ]]; }
+        rc-service() { :; }
+        rc-update() { :; }
+        reading_count=0
+        reading() {
+            reading_count=$((reading_count + 1))
+            if [[ "$reading_count" -eq 1 ]]; then
+                printf -v "$2" 'y'
+            else
+                printf -v "$2" 'n'
+            fi
+        }
+        server_name=sing-box
+        uninstall_singbox "$fixture_root"
+    )
+
+    [[ ! -s "$denied_log" ]] || \
+        fail "interactive uninstall escaped fixture root: $(tr '\n' ' ' < "$denied_log")"
+    [[ ! -e "$work_dir" ]] || fail 'interactive uninstall did not remove work_dir'
+
+    case "$fixture_kind" in
+        current|legacy)
+            for path in "$local_singbox" "$local_sb" "$usr_sb"; do
+                [[ ! -e "$path" && ! -L "$path" ]] || \
+                    fail "interactive uninstall retained managed link: ${path}"
+            done
+            ;;
+        custom)
+            for path in "$local_singbox" "$local_sb" "$usr_sb"; do
+                [[ -L "$path" ]] || fail "interactive uninstall removed custom link: ${path}"
+            done
+            assert_equal '/opt/custom/sing-box' "$(readlink "$local_singbox")" \
+                'custom interactive sing-box target'
+            assert_equal '/opt/custom/local-sb' "$(readlink "$local_sb")" \
+                'custom interactive local sb target'
+            assert_equal '/opt/custom/usr-sb' "$(readlink "$usr_sb")" \
+                'custom interactive usr sb target'
+            ;;
+        regular)
+            for path in "$local_singbox" "$local_sb" "$usr_sb"; do
+                [[ -f "$path" && ! -L "$path" ]] || \
+                    fail "interactive uninstall removed regular file: ${path}"
+            done
+            assert_equal 'user sing-box' "$(cat "$local_singbox")" \
+                'interactive regular sing-box content'
+            assert_equal 'user local sb' "$(cat "$local_sb")" \
+                'interactive regular local sb content'
+            assert_equal 'user usr sb' "$(cat "$usr_sb")" \
+                'interactive regular usr sb content'
+            ;;
+    esac
+}
+
+case "$(uname -s)" in
+    MINGW*) run_interactive_uninstall_fixture regular regular ;;
+    *)
+        run_interactive_uninstall_fixture current current
+        run_interactive_uninstall_fixture legacy legacy
+        run_interactive_uninstall_fixture custom custom
+        run_interactive_uninstall_fixture regular regular
         ;;
 esac
 

@@ -2742,27 +2742,34 @@ purge_nginx_package() {
 
 remove_managed_singbox_link() {
     local install_root="${1:-}"
-    local singbox_link="${install_root}/usr/local/bin/sing-box"
-    local link_target
+    local managed_link link_target
 
-    [ -L "$singbox_link" ] || return 0
-    link_target=$(readlink "$singbox_link" 2>/dev/null) || return 0
-    case "$link_target" in
-        /etc/sing-box/sb.sh|/etc/sing-box/sing-box)
-            rm -f "$singbox_link"
-            ;;
-    esac
+    for managed_link in \
+        "${install_root}/usr/local/bin/sing-box" \
+        "${install_root}/usr/local/bin/sb" \
+        "${install_root}/usr/bin/sb"; do
+        [ -L "$managed_link" ] || continue
+        link_target=$(readlink "$managed_link" 2>/dev/null) || continue
+        case "$link_target" in
+            /etc/sing-box/sb.sh|/etc/sing-box/sing-box)
+                rm -f "$managed_link"
+                ;;
+        esac
+    done
 }
 
 # 卸载 sing-box（交互式）
 uninstall_singbox() {
+    local uninstall_root="${1:-}"
+
     reading "确定要卸载 sing-box 吗? (y/n): " choice
     case "${choice}" in
         y|Y)
             yellow "正在卸载 sing-box"
             if command_exists rc-service; then
                 rc-service sing-box stop; rc-service argo stop
-                rm -f /etc/init.d/sing-box /etc/init.d/argo
+                rm -f "${uninstall_root}/etc/init.d/sing-box" \
+                      "${uninstall_root}/etc/init.d/argo"
                 rc-update del sing-box default; rc-update del argo default
             else
                 systemctl stop "${server_name}"; systemctl stop argo
@@ -2770,8 +2777,10 @@ uninstall_singbox() {
                 systemctl daemon-reload || true
             fi
             rm -rf "${work_dir}" || true
-            rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
-            rm -f /etc/nginx/conf.d/sing-box.conf
+            remove_managed_singbox_link "$uninstall_root"
+            rm -f "${uninstall_root}/etc/systemd/system/sing-box.service" \
+                  "${uninstall_root}/etc/systemd/system/argo.service"
+            rm -f "${uninstall_root}/etc/nginx/conf.d/sing-box.conf"
 
             reading "\n是否卸载 Nginx？${green}(卸载请输入 ${yellow}y${re} ${green}回车将跳过卸载Nginx) (y/n): ${re}" choice
             case "${choice}" in
@@ -2980,7 +2989,6 @@ auto_uninstall() {
     fi
 
     rm -rf "${work_dir}"
-    rm -f "${uninstall_root}/usr/bin/sb" "${uninstall_root}/usr/local/bin/sb"
     remove_managed_singbox_link "$uninstall_root"
 
     rm -f "${uninstall_root}/etc/nginx/conf.d/sing-box.conf"
