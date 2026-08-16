@@ -1774,6 +1774,97 @@ allow_port() {
     return "$status"
 }
 
+configure_hy2_nat_family() {
+    local firewall_cmd="${1:-}"
+    local min_port="${2:-}"
+    local max_port="${3:-}"
+    local listen_port="${4:-}"
+    local chain='PRENET_HY2'
+    local comment='prenet-hy2'
+
+    command_exists "$firewall_cmd" || return 1
+    "$firewall_cmd" -t nat -N "$chain" >/dev/null 2>&1 || true
+    "$firewall_cmd" -t nat -C "$chain" -p udp --dport "${min_port}:${max_port}" \
+        -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 ||
+        "$firewall_cmd" -t nat -A "$chain" -p udp --dport "${min_port}:${max_port}" \
+            -m comment --comment "$comment" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || return 1
+    "$firewall_cmd" -t nat -C PREROUTING -p udp -m comment --comment "$comment" \
+        -j "$chain" >/dev/null 2>&1 ||
+        "$firewall_cmd" -t nat -A PREROUTING -p udp -m comment --comment "$comment" \
+            -j "$chain" >/dev/null 2>&1 || return 1
+}
+
+remove_hy2_nat_family() {
+    local firewall_cmd="${1:-}"
+    local chain='PRENET_HY2'
+    local comment='prenet-hy2'
+
+    command_exists "$firewall_cmd" || return 0
+    while "$firewall_cmd" -t nat -C PREROUTING -p udp -m comment --comment "$comment" \
+        -j "$chain" >/dev/null 2>&1; do
+        "$firewall_cmd" -t nat -D PREROUTING -p udp -m comment --comment "$comment" \
+            -j "$chain" >/dev/null 2>&1 || return 1
+    done
+    "$firewall_cmd" -t nat -F "$chain" >/dev/null 2>&1 || true
+    "$firewall_cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
+}
+
+persist_hy2_nat_rules() {
+    if command_exists netfilter-persistent; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif command_exists service; then
+        command_exists iptables && service iptables save >/dev/null 2>&1 || true
+        command_exists ip6tables && service ip6tables save >/dev/null 2>&1 || true
+    fi
+}
+
+add_hy2_port_hopping() {
+    local min_port="${1:-}"
+    local max_port="${2:-}"
+    local listen_port="${3:-}"
+    local configured=0
+    local -a configured_families=()
+
+    validate_port_value "$min_port" hy2_hop_min_port || return 1
+    validate_port_value "$max_port" hy2_hop_max_port || return 1
+    validate_port_value "$listen_port" hy2_listen_port || return 1
+    [ "$min_port" -lt "$max_port" ] || return 1
+
+    if ipv4_stack_available && command_exists iptables; then
+        if ! configure_hy2_nat_family iptables "$min_port" "$max_port" "$listen_port"; then
+            return 1
+        fi
+        configured_families+=(iptables)
+        configured=1
+    fi
+    if ipv6_stack_available && command_exists ip6tables; then
+        if ! configure_hy2_nat_family ip6tables "$min_port" "$max_port" "$listen_port"; then
+            local configured_family
+            for configured_family in "${configured_families[@]}"; do
+                remove_hy2_nat_family "$configured_family" || true
+            done
+            return 1
+        fi
+        configured_families+=(ip6tables)
+        configured=1
+    fi
+    [ "$configured" -eq 1 ] || return 1
+    persist_hy2_nat_rules
+}
+
+remove_hy2_port_hopping() {
+    local status=0
+
+    if command_exists iptables; then
+        remove_hy2_nat_family iptables || status=1
+    fi
+    if command_exists ip6tables; then
+        remove_hy2_nat_family ip6tables || status=1
+    fi
+    persist_hy2_nat_rules || status=1
+    return "$status"
+}
+
 render_vless_reality_inbound() {
     local tag="${1:-}"
     local listen_address="${2:-}"
@@ -3351,28 +3442,9 @@ change_config() {
                 red "Hysteria2 监听端口不一致，无法配置端口跳跃。"
                 return 1
             }
-            iptables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
-            command -v ip6tables &> /dev/null && ip6tables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
-            if command_exists rc-service 2>/dev/null; then
-                iptables-save > /etc/iptables/rules.v4
-                command -v ip6tables &> /dev/null && ip6tables-save > /etc/iptables/rules.v6
-                cat << 'IEOF' > /etc/init.d/iptables
-#!/sbin/openrc-run
-depend() { need net; }
-start() {
-    [ -f /etc/iptables/rules.v4 ] && iptables-restore < /etc/iptables/rules.v4
-    command -v ip6tables &> /dev/null && [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6
-}
-IEOF
-                chmod +x /etc/init.d/iptables && rc-update add iptables default && /etc/init.d/iptables start
-            elif [ -f /etc/debian_version ]; then
-                DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent > /dev/null 2>&1 && netfilter-persistent save > /dev/null 2>&1
-                systemctl enable netfilter-persistent > /dev/null 2>&1 && systemctl start netfilter-persistent > /dev/null 2>&1
-            elif [ -f /etc/redhat-release ]; then
-                manage_packages install iptables-services > /dev/null 2>&1 && service iptables save > /dev/null 2>&1
-                systemctl enable iptables > /dev/null 2>&1 && systemctl start iptables > /dev/null 2>&1
-                command -v ip6tables &> /dev/null && service ip6tables save > /dev/null 2>&1
-                systemctl enable ip6tables > /dev/null 2>&1 && systemctl start ip6tables > /dev/null 2>&1
+            if ! add_hy2_port_hopping "$min_port" "$max_port" "$listen_port"; then
+                red "Hysteria2 端口跳跃规则添加失败，未修改订阅。"
+                return 1
             fi
             restart_singbox
             ip=$(get_realip)
@@ -3388,15 +3460,9 @@ IEOF
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
             ;;
         5)
-            iptables -t nat -F PREROUTING > /dev/null 2>&1
-            command -v ip6tables &> /dev/null && ip6tables -t nat -F PREROUTING > /dev/null 2>&1
-            if command_exists rc-service 2>/dev/null; then
-                rc-update del iptables default && rm -rf /etc/init.d/iptables
-            elif [ -f /etc/debian_version ]; then
-                netfilter-persistent save > /dev/null 2>&1
-            elif [ -f /etc/redhat-release ]; then
-                service iptables save > /dev/null 2>&1
-                command -v ip6tables &> /dev/null && service ip6tables save > /dev/null 2>&1
+            if ! remove_hy2_port_hopping; then
+                red "Hysteria2 端口跳跃规则删除失败，未修改订阅。"
+                return 1
             fi
             sed -i '/hysteria2/s/&mport=[^#&]*//g' /etc/sing-box/url.txt
             update_sub
@@ -5029,6 +5095,209 @@ restart_singbox_checked() {
     return "$restart_status"
 }
 
+singbox_check_config_dir() {
+    local staged_conf_dir="${1:-}"
+    local checker="${SINGBOX_CHECK_BIN:-${work_dir}/${server_name}}"
+
+    [ -d "$staged_conf_dir" ] || return 1
+    if [[ "$checker" != */* ]]; then
+        checker=$(command -v "$checker" 2>/dev/null) || return 1
+    fi
+    [ -x "$checker" ] || return 1
+    "$checker" check -C "$staged_conf_dir" >/dev/null 2>&1
+}
+
+singbox_service_is_active() {
+    if command_exists rc-service; then
+        rc-service sing-box status >/dev/null 2>&1
+    elif command_exists systemctl; then
+        systemctl is-active --quiet sing-box
+    else
+        return 1
+    fi
+}
+
+atomic_replace_config_file() {
+    local staged_file="${1:-}"
+    local target_file="${2:-}"
+
+    [ -f "$staged_file" ] && [ -n "$target_file" ] || return 1
+    mv -f -- "$staged_file" "$target_file"
+}
+
+restore_proxy_config_transaction() {
+    local route_backup="${1:-}"
+    local outbound_backup="${2:-}"
+    local current_route_file="${3:-}"
+    local current_outbound_file="${4:-}"
+    local restore_status=0
+
+    if [ -n "$route_backup" ] && [ -f "$route_backup" ]; then
+        mv -f -- "$route_backup" "$current_route_file" || restore_status=1
+    fi
+    if [ -n "$outbound_backup" ] && [ -f "$outbound_backup" ]; then
+        mv -f -- "$outbound_backup" "$current_outbound_file" || restore_status=1
+    fi
+    restart_singbox_checked >/dev/null 2>&1 || restore_status=1
+    singbox_service_is_active || restore_status=1
+    return "$restore_status"
+}
+
+apply_proxy_config_transaction() {
+    local route_filter="${1:-}"
+    local outbound_filter="${2:-}"
+    shift 2 || return 1
+    local current_route_file="${route_file:-${conf_dir}/route.json}"
+    local current_outbound_file="${outbound_file:-${conf_dir}/outbounds.json}"
+    local transaction_conf_dir conf_parent conf_name stage_dir
+    local staged_route_tmp staged_outbound_tmp route_mode outbound_mode
+    local route_backup='' outbound_backup='' backup_candidate
+
+    [ -n "$route_filter" ] && [ -n "$outbound_filter" ] || return 1
+    transaction_conf_dir=$(dirname "$current_route_file") || return 1
+    [ "$(dirname "$current_outbound_file")" = "$transaction_conf_dir" ] || return 1
+    [ -s "$current_route_file" ] && [ -s "$current_outbound_file" ] || return 1
+    jq empty "$current_route_file" >/dev/null 2>&1 || return 1
+    jq empty "$current_outbound_file" >/dev/null 2>&1 || return 1
+
+    conf_parent=$(dirname "$transaction_conf_dir") || return 1
+    conf_name=$(basename "$transaction_conf_dir") || return 1
+    stage_dir=$(mktemp -d "${conf_parent}/.${conf_name}.proxy-stage.XXXXXX") || return 1
+    if ! cp -a -- "${transaction_conf_dir}/." "$stage_dir/"; then
+        rm -rf -- "$stage_dir"
+        return 1
+    fi
+
+    staged_route_tmp=$(mktemp "${stage_dir}/.tmp.route.XXXXXX") || {
+        rm -rf -- "$stage_dir"
+        return 1
+    }
+    staged_outbound_tmp=$(mktemp "${stage_dir}/.tmp.outbounds.XXXXXX") || {
+        rm -f -- "$staged_route_tmp"
+        rm -rf -- "$stage_dir"
+        return 1
+    }
+    route_mode=$(stat -c '%a' "$current_route_file" 2>/dev/null || printf '%s' 600)
+    outbound_mode=$(stat -c '%a' "$current_outbound_file" 2>/dev/null || printf '%s' 600)
+
+    if ! jq "$@" "$route_filter" "$current_route_file" > "$staged_route_tmp" ||
+       ! jq "$@" "$outbound_filter" "$current_outbound_file" > "$staged_outbound_tmp" ||
+       ! jq empty "$staged_route_tmp" >/dev/null 2>&1 ||
+       ! jq empty "$staged_outbound_tmp" >/dev/null 2>&1 ||
+       ! chmod "$route_mode" "$staged_route_tmp" ||
+       ! chmod "$outbound_mode" "$staged_outbound_tmp" ||
+       ! mv -f -- "$staged_route_tmp" "$stage_dir/$(basename "$current_route_file")" ||
+       ! mv -f -- "$staged_outbound_tmp" "$stage_dir/$(basename "$current_outbound_file")" ||
+       ! singbox_check_config_dir "$stage_dir"; then
+        rm -rf -- "$stage_dir"
+        restore_proxy_config_transaction '' '' "$current_route_file" "$current_outbound_file" || true
+        red "sing-box 代理配置检查失败，生产配置未改变。"
+        return 1
+    fi
+
+    backup_candidate=$(mktemp "${transaction_conf_dir}/.bak.route.XXXXXX") || {
+        rm -rf -- "$stage_dir"
+        restore_proxy_config_transaction '' '' "$current_route_file" "$current_outbound_file" || true
+        return 1
+    }
+    if ! cp -p -- "$current_route_file" "$backup_candidate"; then
+        rm -f -- "$backup_candidate"
+        rm -rf -- "$stage_dir"
+        restore_proxy_config_transaction '' '' "$current_route_file" "$current_outbound_file" || true
+        return 1
+    fi
+    route_backup="$backup_candidate"
+
+    backup_candidate=$(mktemp "${transaction_conf_dir}/.bak.outbounds.XXXXXX") || {
+        rm -rf -- "$stage_dir"
+        restore_proxy_config_transaction "$route_backup" '' "$current_route_file" "$current_outbound_file" || true
+        return 1
+    }
+    if ! cp -p -- "$current_outbound_file" "$backup_candidate"; then
+        rm -f -- "$backup_candidate"
+        rm -rf -- "$stage_dir"
+        restore_proxy_config_transaction "$route_backup" '' "$current_route_file" "$current_outbound_file" || true
+        return 1
+    fi
+    outbound_backup="$backup_candidate"
+
+    if ! atomic_replace_config_file "$stage_dir/$(basename "$current_route_file")" "$current_route_file" ||
+       ! atomic_replace_config_file "$stage_dir/$(basename "$current_outbound_file")" "$current_outbound_file"; then
+        rm -rf -- "$stage_dir"
+        restore_proxy_config_transaction "$route_backup" "$outbound_backup" \
+            "$current_route_file" "$current_outbound_file" || true
+        red "代理配置提交失败，已恢复 route.json 与 outbounds.json。"
+        return 1
+    fi
+    rm -rf -- "$stage_dir"
+
+    if ! restart_singbox_checked || ! singbox_service_is_active; then
+        restore_proxy_config_transaction "$route_backup" "$outbound_backup" \
+            "$current_route_file" "$current_outbound_file" || true
+        red "sing-box 服务未能恢复 active，已回滚代理与路由配置。"
+        return 1
+    fi
+
+    rm -f -- "$route_backup" "$outbound_backup"
+}
+
+mutate_proxy_transaction() {
+    local tag="${1:-}"
+    local replacement="${2:-direct}"
+    local current_outbound_file="${outbound_file:-${conf_dir}/outbounds.json}"
+    local tag_count replacement_count
+
+    [ -n "$tag" ] && [ -n "$replacement" ] || return 1
+    [ "$tag" != direct ] && [ "$tag" != wireguard-out ] && [ "$tag" != "$replacement" ] || return 1
+    tag_count=$(jq -r --arg tag "$tag" '[.outbounds[]? | select(.tag == $tag)] | length' \
+        "$current_outbound_file" 2>/dev/null) || return 1
+    [ "$tag_count" -eq 1 ] || return 1
+    replacement_count=$(jq -r --arg replacement "$replacement" \
+        '[.outbounds[]? | select(.tag == $replacement)] | length' \
+        "$current_outbound_file" 2>/dev/null) || return 1
+    [ "$replacement_count" -eq 1 ] || return 1
+
+    apply_proxy_config_transaction '
+      if .route.final? == $tag then .route.final = $replacement else . end |
+      if ((.route.rules? | type) == "array") then
+        .route.rules = [
+          .route.rules[] |
+          if .outbound? == $tag then
+            if $replacement == "direct" then empty else .outbound = $replacement end
+          else . end
+        ]
+      else . end
+    ' '
+      .outbounds = [.outbounds[]? | select(.tag != $tag)]
+    ' --arg tag "$tag" --arg replacement "$replacement"
+}
+
+add_proxy_outbound_transaction() {
+    local outbound_json="${1:-}"
+    local switch_existing_rules="${2:-false}"
+    local current_outbound_file="${outbound_file:-${conf_dir}/outbounds.json}"
+    local tag
+
+    case "$switch_existing_rules" in true|false) ;; *) return 1 ;; esac
+    tag=$(jq -er 'select(type == "object") | .tag | select(type == "string" and length > 0)' \
+        <<< "$outbound_json") || return 1
+    jq -e --arg tag "$tag" '.outbounds[]? | select(.tag == $tag)' \
+        "$current_outbound_file" >/dev/null 2>&1 && return 1
+
+    apply_proxy_config_transaction '
+      if $switch then
+        .route.rules = [
+          .route.rules[]? |
+          if ((.rule_set? | type) == "array") then
+            .action = "route" | .outbound = $tag
+          else . end
+        ]
+      else . end
+    ' '
+      .outbounds += [$outbound]
+    ' --arg tag "$tag" --argjson outbound "$outbound_json" --argjson switch "$switch_existing_rules"
+}
+
 # 对 route.json 做单文件事务：生成、全配置校验、重启；失败时恢复并重启旧配置。
 apply_warp_route_update() {
     local jq_filter="$1"
@@ -5463,45 +5732,29 @@ add_socks5_proxy() {
     jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
         && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
 
+    local outbound_json switch_existing_rules=false
     # 根据是否有账号密码，决定写入字段，避免空字符串导致 sing-box 报错
     if [ -n "$user" ] && [ -n "$password" ]; then
-        if ! apply_jq_config "$outbound_file" \
+        outbound_json=$(jq -cn \
             --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
             --arg port "$port" --arg user "$user" --arg password "$password" \
-            '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}]'; then
-            red "代理出站配置校验失败，未添加 '${tag}'。"
-            sleep 2; return
-        fi
+            '{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}') || return
     else
-        # 无账号密码：不写 username/password 字段
-        if ! apply_jq_config "$outbound_file" \
+        outbound_json=$(jq -cn \
             --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
             --arg port "$port" \
-            '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}]'; then
-            red "代理出站配置校验失败，未添加 '${tag}'。"
-            sleep 2; return
-        fi
+            '{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}') || return
     fi
 
     if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        if apply_warp_route_update '
-          .route.rules = [
-            .route.rules[] |
-            if ((.rule_set? | type) == "array") then
-              .outbound = $tag | .action = "route"
-            else
-              .
-            end
-          ]
-        ' --arg tag "$tag"; then
-            yellow "已将现有分流规则出站切换为 '${tag}'。"
-        else
-            red "代理已添加，但现有分流规则切换失败。"
-            sleep 2; return
-        fi
-    elif ! restart_singbox_checked; then
-        red "代理已写入配置，但 sing-box 重启失败。"
+        switch_existing_rules=true
+    fi
+    if ! add_proxy_outbound_transaction "$outbound_json" "$switch_existing_rules"; then
+        red "代理出站添加失败，route.json 与 outbounds.json 已恢复。"
         sleep 2; return
+    fi
+    if [ "$switch_existing_rules" = true ]; then
+        yellow "已将现有分流规则出站切换为 '${tag}'。"
     fi
 
     green "\n${tag} 代理出站已添加\n"
@@ -5525,11 +5778,13 @@ delete_socks5_proxy() {
     fi
     [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
 
-    jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-
-    restart_singbox
-    green "${tag} 代理出站已删除。"
+    if mutate_proxy_transaction "$tag" direct; then
+        green "${tag} 代理出站已删除。"
+    else
+        red "${tag} 代理出站删除失败，route.json 与 outbounds.json 已恢复。"
+        sleep 1
+        return 1
+    fi
     sleep 1
 }
 
