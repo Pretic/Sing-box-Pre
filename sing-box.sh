@@ -4795,6 +4795,16 @@ singbox_service_is_active() {
     fi
 }
 
+stop_singbox_checked() {
+    if command_exists rc-service; then
+        rc-service sing-box stop
+    elif command_exists systemctl; then
+        systemctl stop sing-box
+    else
+        return 1
+    fi
+}
+
 rotate_warp_identity_once() {
     local old_ip candidate_dir candidate_endpoint new_ip activate_rc
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
@@ -5125,6 +5135,173 @@ atomic_replace_config_file() {
     mv -f -- "$staged_file" "$target_file"
 }
 
+acquire_proxy_transaction_lock() {
+    local transaction_conf_dir="${1:-}"
+    local timeout_seconds="${PROXY_TX_LOCK_TIMEOUT_SECONDS:-30}"
+    local lock_owner='' started_at
+
+    [ -d "$transaction_conf_dir" ] && [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+    PROXY_TX_LOCK_KIND=''
+    PROXY_TX_LOCK_PATH=''
+    PROXY_TX_LOCK_FD=''
+
+    if command_exists flock; then
+        PROXY_TX_LOCK_PATH="${transaction_conf_dir}/.proxy-transaction.lock"
+        (
+            umask 077
+            : >> "$PROXY_TX_LOCK_PATH"
+        ) || return 1
+        chmod 600 "$PROXY_TX_LOCK_PATH" || return 1
+        exec {PROXY_TX_LOCK_FD}>"$PROXY_TX_LOCK_PATH" || return 1
+        if ! flock -w "$timeout_seconds" "$PROXY_TX_LOCK_FD"; then
+            exec {PROXY_TX_LOCK_FD}>&-
+            PROXY_TX_LOCK_FD=''
+            return 1
+        fi
+        PROXY_TX_LOCK_KIND='flock'
+        return 0
+    fi
+
+    PROXY_TX_LOCK_PATH="${transaction_conf_dir}/.proxy-transaction.lock.d"
+    started_at=$SECONDS
+    while :; do
+        if (umask 077 && mkdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null); then
+            chmod 700 "$PROXY_TX_LOCK_PATH" || {
+                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
+                return 1
+            }
+            printf '%s\n' "$BASHPID" > "$PROXY_TX_LOCK_PATH/owner" || {
+                rm -f -- "$PROXY_TX_LOCK_PATH/owner"
+                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
+                return 1
+            }
+            chmod 600 "$PROXY_TX_LOCK_PATH/owner" || {
+                rm -f -- "$PROXY_TX_LOCK_PATH/owner"
+                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
+                return 1
+            }
+            PROXY_TX_LOCK_KIND='mkdir'
+            return 0
+        fi
+
+        if [ -d "$PROXY_TX_LOCK_PATH" ] && [ ! -L "$PROXY_TX_LOCK_PATH" ] && \
+           [ -r "$PROXY_TX_LOCK_PATH/owner" ]; then
+            lock_owner=$(cat "$PROXY_TX_LOCK_PATH/owner" 2>/dev/null || true)
+            if [[ "$lock_owner" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
+                rm -f -- "$PROXY_TX_LOCK_PATH/owner" 2>/dev/null || true
+                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
+                continue
+            fi
+        fi
+        [ "$((SECONDS - started_at))" -lt "$timeout_seconds" ] || return 1
+        sleep 0.1
+    done
+}
+
+release_proxy_transaction_lock() {
+    case "${PROXY_TX_LOCK_KIND:-}" in
+        flock)
+            flock -u "$PROXY_TX_LOCK_FD" 2>/dev/null || true
+            exec {PROXY_TX_LOCK_FD}>&-
+            ;;
+        mkdir)
+            if [ -d "${PROXY_TX_LOCK_PATH:-}" ] && [ ! -L "$PROXY_TX_LOCK_PATH" ]; then
+                rm -f -- "$PROXY_TX_LOCK_PATH/owner" 2>/dev/null || true
+                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
+            fi
+            ;;
+    esac
+    PROXY_TX_LOCK_KIND=''
+    PROXY_TX_LOCK_PATH=''
+    PROXY_TX_LOCK_FD=''
+}
+
+proxy_transaction_hook() {
+    :
+}
+
+reset_proxy_transaction_state() {
+    PROXY_TX_STAGE='locked'
+    PROXY_TX_STAGE_DIR=''
+    PROXY_TX_ROUTE_BACKUP=''
+    PROXY_TX_OUTBOUND_BACKUP=''
+    PROXY_TX_CURRENT_ROUTE_FILE=''
+    PROXY_TX_CURRENT_OUTBOUND_FILE=''
+    PROXY_TX_INITIAL_SERVICE_ACTIVE=1
+}
+
+cleanup_proxy_transaction_artifacts() {
+    local backup_name backup_path preserved_path
+
+    if [ -n "${PROXY_TX_STAGE_DIR:-}" ] && [ -d "$PROXY_TX_STAGE_DIR" ]; then
+        for backup_name in ROUTE OUTBOUND; do
+            eval "backup_path=\${PROXY_TX_${backup_name}_BACKUP:-}"
+            [ -n "$backup_path" ] && [ -f "$backup_path" ] || continue
+            case "$backup_path" in
+                "${PROXY_TX_STAGE_DIR}/"*) continue ;;
+            esac
+            preserved_path="${PROXY_TX_STAGE_DIR}/$(basename "$backup_path")"
+            mv -f -- "$backup_path" "$preserved_path" || return 1
+            printf -v "PROXY_TX_${backup_name}_BACKUP" '%s' "$preserved_path"
+        done
+        rm -rf -- "$PROXY_TX_STAGE_DIR" || return 1
+        return 0
+    fi
+
+    [ -z "${PROXY_TX_ROUTE_BACKUP:-}" ] || rm -f -- "$PROXY_TX_ROUTE_BACKUP" || return 1
+    [ -z "${PROXY_TX_OUTBOUND_BACKUP:-}" ] || rm -f -- "$PROXY_TX_OUTBOUND_BACKUP" || return 1
+}
+
+restore_proxy_transaction_traps() {
+    trap - INT TERM EXIT
+    [ -z "${PROXY_TX_PREVIOUS_INT_TRAP:-}" ] || eval "$PROXY_TX_PREVIOUS_INT_TRAP"
+    [ -z "${PROXY_TX_PREVIOUS_TERM_TRAP:-}" ] || eval "$PROXY_TX_PREVIOUS_TERM_TRAP"
+    [ -z "${PROXY_TX_PREVIOUS_EXIT_TRAP:-}" ] || eval "$PROXY_TX_PREVIOUS_EXIT_TRAP"
+}
+
+proxy_transaction_trap_handler() {
+    local event="${1:-EXIT}"
+    local original_status="${2:-1}"
+    local final_status="$original_status"
+
+    trap - INT TERM EXIT
+    case "${PROXY_TX_STAGE:-}" in
+        commit-in-progress|route-committed|outbounds-committed|restarting)
+            if restore_proxy_config_transaction \
+                "${PROXY_TX_ROUTE_BACKUP:-}" "${PROXY_TX_OUTBOUND_BACKUP:-}" \
+                "${PROXY_TX_CURRENT_ROUTE_FILE:-}" "${PROXY_TX_CURRENT_OUTBOUND_FILE:-}"; then
+                if ! cleanup_proxy_transaction_artifacts; then
+                    final_status=2
+                    report_proxy_transaction_fatal
+                fi
+            else
+                final_status=2
+                report_proxy_transaction_fatal
+            fi
+            ;;
+        *)
+            if ! cleanup_proxy_transaction_artifacts; then
+                final_status=2
+                report_proxy_transaction_fatal
+            fi
+            ;;
+    esac
+    release_proxy_transaction_lock
+    reset_proxy_transaction_state
+    restore_proxy_transaction_traps
+    [ "$event" = EXIT ] || red "代理配置事务被 ${event} 中断。"
+    exit "$final_status"
+}
+
+install_proxy_transaction_traps() {
+    PROXY_TX_PREVIOUS_INT_TRAP=$(trap -p INT || true)
+    PROXY_TX_PREVIOUS_TERM_TRAP=$(trap -p TERM || true)
+    PROXY_TX_PREVIOUS_EXIT_TRAP=$(trap -p EXIT || true)
+    trap 'proxy_transaction_trap_handler INT 130' INT
+    trap 'proxy_transaction_trap_handler TERM 143' TERM
+    trap 'proxy_transaction_trap_handler EXIT $?' EXIT
+}
+
 restore_proxy_config_transaction() {
     local route_backup="${1:-}"
     local outbound_backup="${2:-}"
@@ -5132,18 +5309,92 @@ restore_proxy_config_transaction() {
     local current_outbound_file="${4:-}"
     local restore_status=0
 
-    if [ -n "$route_backup" ] && [ -f "$route_backup" ]; then
-        mv -f -- "$route_backup" "$current_route_file" || restore_status=1
+    [ -f "$route_backup" ] && [ -f "$outbound_backup" ] && \
+        [ -n "$current_route_file" ] && [ -n "$current_outbound_file" ] || return 1
+    restore_proxy_config_file "$route_backup" "$current_route_file" || restore_status=1
+    restore_proxy_config_file "$outbound_backup" "$current_outbound_file" || restore_status=1
+    [ "$restore_status" -eq 0 ] || return 1
+    cmp -s -- "$route_backup" "$current_route_file" || return 1
+    cmp -s -- "$outbound_backup" "$current_outbound_file" || return 1
+    if [ "${PROXY_TX_INITIAL_SERVICE_ACTIVE:-1}" = 1 ]; then
+        restart_singbox_checked >/dev/null 2>&1 || return 1
+        singbox_service_is_active || return 1
+    else
+        if singbox_service_is_active; then
+            stop_singbox_checked >/dev/null 2>&1 || return 1
+        fi
+        ! singbox_service_is_active
     fi
-    if [ -n "$outbound_backup" ] && [ -f "$outbound_backup" ]; then
-        mv -f -- "$outbound_backup" "$current_outbound_file" || restore_status=1
+}
+
+restore_proxy_config_file() {
+    local backup_file="${1:-}"
+    local target_file="${2:-}"
+    local target_dir target_name restore_candidate
+
+    [ -f "$backup_file" ] && [ -n "$target_file" ] || return 1
+    target_dir=$(dirname "$target_file") || return 1
+    target_name=$(basename "$target_file") || return 1
+    restore_candidate=$(mktemp "${target_dir}/.restore.${target_name}.XXXXXX") || return 1
+    if ! cp -p -- "$backup_file" "$restore_candidate" ||
+       ! mv -f -- "$restore_candidate" "$target_file"; then
+        rm -f -- "$restore_candidate"
+        return 1
     fi
-    restart_singbox_checked >/dev/null 2>&1 || restore_status=1
-    singbox_service_is_active || restore_status=1
-    return "$restore_status"
+    cmp -s -- "$backup_file" "$target_file"
+}
+
+report_proxy_transaction_fatal() {
+    red "代理配置事务收尾或回滚不完整，事务以 fatal 状态退出。"
+    red "stage: ${PROXY_TX_STAGE_DIR:-未知}"
+    red "route backup: ${PROXY_TX_ROUTE_BACKUP:-未知}"
+    red "outbounds backup: ${PROXY_TX_OUTBOUND_BACKUP:-未知}"
+}
+
+rollback_proxy_config_transaction() {
+    if restore_proxy_config_transaction \
+        "${PROXY_TX_ROUTE_BACKUP:-}" "${PROXY_TX_OUTBOUND_BACKUP:-}" \
+        "${PROXY_TX_CURRENT_ROUTE_FILE:-}" "${PROXY_TX_CURRENT_OUTBOUND_FILE:-}"; then
+        if cleanup_proxy_transaction_artifacts; then
+            return 0
+        fi
+        report_proxy_transaction_fatal
+        return 2
+    fi
+    report_proxy_transaction_fatal
+    return 2
 }
 
 apply_proxy_config_transaction() {
+    local current_route_file="${route_file:-${conf_dir}/route.json}"
+    local current_outbound_file="${outbound_file:-${conf_dir}/outbounds.json}"
+    local transaction_conf_dir transaction_status
+
+    transaction_conf_dir=$(dirname "$current_route_file") || return 1
+    [ "$(dirname "$current_outbound_file")" = "$transaction_conf_dir" ] || return 1
+    acquire_proxy_transaction_lock "$transaction_conf_dir" || {
+        red "另一个代理配置事务仍在运行，本次操作已中止。"
+        return 1
+    }
+    reset_proxy_transaction_state
+    PROXY_TX_CURRENT_ROUTE_FILE="$current_route_file"
+    PROXY_TX_CURRENT_OUTBOUND_FILE="$current_outbound_file"
+    install_proxy_transaction_traps
+    if singbox_service_is_active; then
+        PROXY_TX_INITIAL_SERVICE_ACTIVE=1
+    else
+        PROXY_TX_INITIAL_SERVICE_ACTIVE=0
+    fi
+    _apply_proxy_config_transaction_locked "$@"
+    transaction_status=$?
+    trap - INT TERM EXIT
+    restore_proxy_transaction_traps
+    release_proxy_transaction_lock
+    reset_proxy_transaction_state
+    return "$transaction_status"
+}
+
+_apply_proxy_config_transaction_locked() {
     local route_filter="${1:-}"
     local outbound_filter="${2:-}"
     shift 2 || return 1
@@ -5163,25 +5414,27 @@ apply_proxy_config_transaction() {
     conf_parent=$(dirname "$transaction_conf_dir") || return 1
     conf_name=$(basename "$transaction_conf_dir") || return 1
     stage_dir=$(mktemp -d "${conf_parent}/.${conf_name}.proxy-stage.XXXXXX") || return 1
+    PROXY_TX_STAGE_DIR="$stage_dir"
+    PROXY_TX_STAGE='staging'
     if ! cp -a -- "${transaction_conf_dir}/." "$stage_dir/"; then
-        rm -rf -- "$stage_dir"
+        cleanup_proxy_transaction_artifacts || { report_proxy_transaction_fatal; return 2; }
         return 1
     fi
 
     staged_route_tmp=$(mktemp "${stage_dir}/.tmp.route.XXXXXX") || {
-        rm -rf -- "$stage_dir"
+        cleanup_proxy_transaction_artifacts || { report_proxy_transaction_fatal; return 2; }
         return 1
     }
     staged_outbound_tmp=$(mktemp "${stage_dir}/.tmp.outbounds.XXXXXX") || {
         rm -f -- "$staged_route_tmp"
-        rm -rf -- "$stage_dir"
+        cleanup_proxy_transaction_artifacts || { report_proxy_transaction_fatal; return 2; }
         return 1
     }
     route_mode=$(stat -c '%a' "$current_route_file" 2>/dev/null || printf '%s' 600)
     outbound_mode=$(stat -c '%a' "$current_outbound_file" 2>/dev/null || printf '%s' 600)
 
-    if ! jq "$@" "$route_filter" "$current_route_file" > "$staged_route_tmp" ||
-       ! jq "$@" "$outbound_filter" "$current_outbound_file" > "$staged_outbound_tmp" ||
+    if ! jq "$@" "$route_filter" "$current_route_file" > "$staged_route_tmp" 2>/dev/null ||
+       ! jq "$@" "$outbound_filter" "$current_outbound_file" > "$staged_outbound_tmp" 2>/dev/null ||
        ! jq empty "$staged_route_tmp" >/dev/null 2>&1 ||
        ! jq empty "$staged_outbound_tmp" >/dev/null 2>&1 ||
        ! chmod "$route_mode" "$staged_route_tmp" ||
@@ -5189,73 +5442,77 @@ apply_proxy_config_transaction() {
        ! mv -f -- "$staged_route_tmp" "$stage_dir/$(basename "$current_route_file")" ||
        ! mv -f -- "$staged_outbound_tmp" "$stage_dir/$(basename "$current_outbound_file")" ||
        ! singbox_check_config_dir "$stage_dir"; then
-        rm -rf -- "$stage_dir"
-        restore_proxy_config_transaction '' '' "$current_route_file" "$current_outbound_file" || true
+        cleanup_proxy_transaction_artifacts || { report_proxy_transaction_fatal; return 2; }
         red "sing-box 代理配置检查失败，生产配置未改变。"
         return 1
     fi
 
     backup_candidate=$(mktemp "${transaction_conf_dir}/.bak.route.XXXXXX") || {
-        rm -rf -- "$stage_dir"
-        restore_proxy_config_transaction '' '' "$current_route_file" "$current_outbound_file" || true
+        cleanup_proxy_transaction_artifacts || { report_proxy_transaction_fatal; return 2; }
         return 1
     }
     if ! cp -p -- "$current_route_file" "$backup_candidate"; then
         rm -f -- "$backup_candidate"
-        rm -rf -- "$stage_dir"
-        restore_proxy_config_transaction '' '' "$current_route_file" "$current_outbound_file" || true
+        cleanup_proxy_transaction_artifacts || { report_proxy_transaction_fatal; return 2; }
         return 1
     fi
     route_backup="$backup_candidate"
+    PROXY_TX_ROUTE_BACKUP="$route_backup"
 
     backup_candidate=$(mktemp "${transaction_conf_dir}/.bak.outbounds.XXXXXX") || {
-        rm -rf -- "$stage_dir"
-        restore_proxy_config_transaction "$route_backup" '' "$current_route_file" "$current_outbound_file" || true
+        cleanup_proxy_transaction_artifacts || { report_proxy_transaction_fatal; return 2; }
         return 1
     }
     if ! cp -p -- "$current_outbound_file" "$backup_candidate"; then
         rm -f -- "$backup_candidate"
-        rm -rf -- "$stage_dir"
-        restore_proxy_config_transaction "$route_backup" '' "$current_route_file" "$current_outbound_file" || true
+        cleanup_proxy_transaction_artifacts || { report_proxy_transaction_fatal; return 2; }
         return 1
     fi
     outbound_backup="$backup_candidate"
+    PROXY_TX_OUTBOUND_BACKUP="$outbound_backup"
+    PROXY_TX_STAGE='backups-ready'
 
-    if ! atomic_replace_config_file "$stage_dir/$(basename "$current_route_file")" "$current_route_file" ||
-       ! atomic_replace_config_file "$stage_dir/$(basename "$current_outbound_file")" "$current_outbound_file"; then
-        rm -rf -- "$stage_dir"
-        restore_proxy_config_transaction "$route_backup" "$outbound_backup" \
-            "$current_route_file" "$current_outbound_file" || true
-        red "代理配置提交失败，已恢复 route.json 与 outbounds.json。"
-        return 1
+    PROXY_TX_STAGE='commit-in-progress'
+    if ! atomic_replace_config_file "$stage_dir/$(basename "$current_route_file")" "$current_route_file"; then
+        if rollback_proxy_config_transaction; then
+            red "代理配置提交失败，已恢复 route.json 与 outbounds.json。"
+            return 1
+        fi
+        return 2
     fi
-    rm -rf -- "$stage_dir"
+    PROXY_TX_STAGE='route-committed'
+    proxy_transaction_hook after-route-commit
+    if ! atomic_replace_config_file "$stage_dir/$(basename "$current_outbound_file")" "$current_outbound_file"; then
+        if rollback_proxy_config_transaction; then
+            red "代理配置提交失败，已恢复 route.json 与 outbounds.json。"
+            return 1
+        fi
+        return 2
+    fi
+    PROXY_TX_STAGE='outbounds-committed'
 
+    PROXY_TX_STAGE='restarting'
     if ! restart_singbox_checked || ! singbox_service_is_active; then
-        restore_proxy_config_transaction "$route_backup" "$outbound_backup" \
-            "$current_route_file" "$current_outbound_file" || true
-        red "sing-box 服务未能恢复 active，已回滚代理与路由配置。"
-        return 1
+        if rollback_proxy_config_transaction; then
+            red "sing-box 服务未能恢复 active，已回滚代理与路由配置。"
+            return 1
+        fi
+        return 2
     fi
 
-    rm -f -- "$route_backup" "$outbound_backup"
+    if ! cleanup_proxy_transaction_artifacts; then
+        report_proxy_transaction_fatal
+        return 2
+    fi
+    PROXY_TX_STAGE='complete'
 }
 
 mutate_proxy_transaction() {
     local tag="${1:-}"
     local replacement="${2:-direct}"
-    local current_outbound_file="${outbound_file:-${conf_dir}/outbounds.json}"
-    local tag_count replacement_count
 
     [ -n "$tag" ] && [ -n "$replacement" ] || return 1
     [ "$tag" != direct ] && [ "$tag" != wireguard-out ] && [ "$tag" != "$replacement" ] || return 1
-    tag_count=$(jq -r --arg tag "$tag" '[.outbounds[]? | select(.tag == $tag)] | length' \
-        "$current_outbound_file" 2>/dev/null) || return 1
-    [ "$tag_count" -eq 1 ] || return 1
-    replacement_count=$(jq -r --arg replacement "$replacement" \
-        '[.outbounds[]? | select(.tag == $replacement)] | length' \
-        "$current_outbound_file" 2>/dev/null) || return 1
-    [ "$replacement_count" -eq 1 ] || return 1
 
     apply_proxy_config_transaction '
       if .route.final? == $tag then .route.final = $replacement else . end |
@@ -5268,21 +5525,23 @@ mutate_proxy_transaction() {
         ]
       else . end
     ' '
-      .outbounds = [.outbounds[]? | select(.tag != $tag)]
+      if ([.outbounds[]? | select(.tag == $tag)] | length) == 1 and
+         ([.outbounds[]? | select(.tag == $replacement)] | length) == 1 then
+        .outbounds = [.outbounds[]? | select(.tag != $tag)]
+      else
+        error("proxy mutation validation failed")
+      end
     ' --arg tag "$tag" --arg replacement "$replacement"
 }
 
 add_proxy_outbound_transaction() {
     local outbound_json="${1:-}"
     local switch_existing_rules="${2:-false}"
-    local current_outbound_file="${outbound_file:-${conf_dir}/outbounds.json}"
     local tag
 
     case "$switch_existing_rules" in true|false) ;; *) return 1 ;; esac
     tag=$(jq -er 'select(type == "object") | .tag | select(type == "string" and length > 0)' \
         <<< "$outbound_json") || return 1
-    jq -e --arg tag "$tag" '.outbounds[]? | select(.tag == $tag)' \
-        "$current_outbound_file" >/dev/null 2>&1 && return 1
 
     apply_proxy_config_transaction '
       if $switch then
@@ -5294,7 +5553,11 @@ add_proxy_outbound_transaction() {
         ]
       else . end
     ' '
-      .outbounds += [$outbound]
+      if any(.outbounds[]?; .tag == $tag) then
+        error("proxy outbound tag already exists")
+      else
+        .outbounds += [$outbound]
+      end
     ' --arg tag "$tag" --argjson outbound "$outbound_json" --argjson switch "$switch_existing_rules"
 }
 
@@ -5749,9 +6012,17 @@ add_socks5_proxy() {
     if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
         switch_existing_rules=true
     fi
-    if ! add_proxy_outbound_transaction "$outbound_json" "$switch_existing_rules"; then
-        red "代理出站添加失败，route.json 与 outbounds.json 已恢复。"
-        sleep 2; return
+    local proxy_transaction_status=0
+    add_proxy_outbound_transaction "$outbound_json" "$switch_existing_rules" || \
+        proxy_transaction_status=$?
+    if [ "$proxy_transaction_status" -ne 0 ]; then
+        if [ "$proxy_transaction_status" -eq 2 ]; then
+            red "代理出站添加事务 fatal 中止；请勿继续操作，并按上方路径人工恢复。"
+        else
+            red "代理出站添加失败，操作已中止。"
+        fi
+        sleep 2
+        return "$proxy_transaction_status"
     fi
     if [ "$switch_existing_rules" = true ]; then
         yellow "已将现有分流规则出站切换为 '${tag}'。"
@@ -5778,12 +6049,18 @@ delete_socks5_proxy() {
     fi
     [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
 
-    if mutate_proxy_transaction "$tag" direct; then
+    local proxy_transaction_status=0
+    mutate_proxy_transaction "$tag" direct || proxy_transaction_status=$?
+    if [ "$proxy_transaction_status" -eq 0 ]; then
         green "${tag} 代理出站已删除。"
     else
-        red "${tag} 代理出站删除失败，route.json 与 outbounds.json 已恢复。"
+        if [ "$proxy_transaction_status" -eq 2 ]; then
+            red "${tag} 代理出站删除事务 fatal 中止；请勿继续操作，并按上方路径人工恢复。"
+        else
+            red "${tag} 代理出站删除失败，操作已中止。"
+        fi
         sleep 1
-        return 1
+        return "$proxy_transaction_status"
     fi
     sleep 1
 }

@@ -30,6 +30,10 @@ for function_name in \
         fail "${function_name} is not implemented"
 done
 
+if grep -Eq '代理出站(添加|删除)失败，route\.json 与 outbounds\.json 已恢复' "$script"; then
+    fail 'proxy transaction caller still claims restoration for fatal status 2'
+fi
+
 proxy_block=$(sed -n '/^singbox_check_config_dir() {/,/^add_service_route() {/p' "$script" | sed '$d')
 [[ -n "$proxy_block" ]] || fail 'proxy transaction helper block could not be extracted'
 source /dev/stdin <<< "$proxy_block"
@@ -43,16 +47,24 @@ command_exists() {
         *) command -v "$1" >/dev/null 2>&1 ;;
     esac
 }
-red() { :; }
+red() {
+    [ -z "${proxy_error_log:-}" ] || printf '%s\n' "$*" >> "$proxy_error_log"
+}
 green() { :; }
 yellow() { :; }
 
 tmp_root=$(mktemp -d)
-trap 'rm -rf "$tmp_root"' EXIT
+test_shell_pid=$BASHPID
+cleanup_test_tmp() {
+    [ "$BASHPID" != "$test_shell_pid" ] || rm -rf "$tmp_root"
+}
+trap cleanup_test_tmp EXIT
 
 service_log="$tmp_root/service.log"
+proxy_error_log="$tmp_root/proxy-errors.log"
 restart_failures="$tmp_root/restart.failures"
 active_failures="$tmp_root/active.failures"
+service_state="$tmp_root/service.state"
 
 consume_failure() {
     local state_file="$1"
@@ -67,12 +79,21 @@ consume_failure() {
 
 restart_singbox_checked() {
     printf '%s\n' restart >> "$service_log"
-    ! consume_failure "$restart_failures"
+    consume_failure "$restart_failures" && return 1
+    printf '1\n' > "$service_state"
+}
+
+stop_singbox_checked() {
+    printf '%s\n' stop >> "$service_log"
+    printf '0\n' > "$service_state"
 }
 
 singbox_service_is_active() {
     printf '%s\n' active >> "$service_log"
-    ! consume_failure "$active_failures"
+    if [[ "${PROXY_TX_STAGE:-}" != locked ]] && consume_failure "$active_failures"; then
+        return 1
+    fi
+    [[ "$(<"$service_state")" == 1 ]]
 }
 
 check_log="$tmp_root/check.log"
@@ -88,11 +109,26 @@ set -euo pipefail
 stage_dir="$3"
 printf '%s\n' "$*" >> "$CHECK_LOG"
 [[ "$stage_dir" != "$PRODUCTION_CONF" ]] || exit 92
-cmp -s "$EXPECTED_ROUTE" "$PRODUCTION_CONF/route.json" || exit 93
-cmp -s "$EXPECTED_OUTBOUNDS" "$PRODUCTION_CONF/outbounds.json" || exit 94
+if [[ "${CHECK_ALLOW_PRODUCTION_CHANGE:-0}" != 1 ]]; then
+    cmp -s "$EXPECTED_ROUTE" "$PRODUCTION_CONF/route.json" || exit 93
+    cmp -s "$EXPECTED_OUTBOUNDS" "$PRODUCTION_CONF/outbounds.json" || exit 94
+fi
 jq empty "$stage_dir"/*.json >/dev/null
 cp "$stage_dir/route.json" "$CHECK_CAPTURE/route.json"
 cp "$stage_dir/outbounds.json" "$CHECK_CAPTURE/outbounds.json"
+if [[ -n "${CHECK_CONCURRENCY_BARRIER_DIR:-}" ]]; then
+    concurrent_tag=$(jq -r '.outbounds[]?.tag | select(startswith("proxy-concurrent-"))' \
+        "$stage_dir/outbounds.json" | tail -n 1)
+    if [[ -n "$concurrent_tag" ]]; then
+        mkdir -p "$CHECK_CONCURRENCY_BARRIER_DIR"
+        : > "$CHECK_CONCURRENCY_BARRIER_DIR/$concurrent_tag.$PPID"
+        for _ in $(seq 1 10); do
+            marker_count=$(find "$CHECK_CONCURRENCY_BARRIER_DIR" -type f | wc -l)
+            [[ "$marker_count" -ge 2 ]] && break
+            sleep 0.01
+        done
+    fi
+fi
 remaining=0
 [[ -s "$CHECK_FAILURES" ]] && remaining=$(<"$CHECK_FAILURES")
 if [[ "$remaining" -gt 0 ]]; then
@@ -105,6 +141,8 @@ chmod +x "$mock_singbox"
 export CHECK_LOG="$check_log"
 export CHECK_CAPTURE="$check_capture"
 export CHECK_FAILURES="$check_failures"
+export CHECK_CONCURRENCY_BARRIER_DIR=''
+export CHECK_ALLOW_PRODUCTION_CHANGE=0
 
 write_proxy_fixture() {
     conf_dir="$tmp_root/conf"
@@ -113,10 +151,12 @@ write_proxy_fixture() {
     rm -rf "$conf_dir"
     mkdir -p "$conf_dir"
     : > "$service_log"
+    : > "$proxy_error_log"
     : > "$check_log"
     printf '0\n' > "$check_failures"
     printf '0\n' > "$restart_failures"
     printf '0\n' > "$active_failures"
+    printf '1\n' > "$service_state"
 
     cat > "$route_file" <<'EOF'
 {
@@ -153,12 +193,25 @@ EOF
 }
 
 assert_proxy_fixture_restored() {
-    cmp -s "$EXPECTED_ROUTE" "$route_file" || fail "$1 did not restore route.json byte-for-byte"
-    cmp -s "$EXPECTED_OUTBOUNDS" "$outbound_file" || fail "$1 did not restore outbounds.json byte-for-byte"
+    assert_proxy_files_restored "$1"
     [[ "$(grep -c '^restart$' "$service_log" || true)" -ge 1 ]] || \
         fail "$1 did not restore the sing-box service"
     [[ "$(grep -c '^active$' "$service_log" || true)" -ge 1 ]] || \
         fail "$1 did not verify the restored service"
+}
+
+assert_proxy_files_restored() {
+    cmp -s "$EXPECTED_ROUTE" "$route_file" || fail "$1 did not restore route.json byte-for-byte"
+    cmp -s "$EXPECTED_OUTBOUNDS" "$outbound_file" || fail "$1 did not restore outbounds.json byte-for-byte"
+}
+
+assert_no_proxy_transaction_artifacts() {
+    local artifact
+    artifact=$(find "$tmp_root" -maxdepth 2 \
+        \( -name '.conf.proxy-stage.*' -o -name '.bak.route.*' \
+           -o -name '.bak.outbounds.*' -o -name '.proxy-transaction.lock.d' \) \
+        -print -quit)
+    [[ -z "$artifact" ]] || fail "$1 left proxy transaction artifact: $artifact"
 }
 
 write_proxy_fixture
@@ -201,11 +254,136 @@ jq -e '.route.rules | any((.rule_set? | index("netflix")) and .outbound == "prox
     fail 'proxy addition restarted more than once instead of using one transaction'
 
 write_proxy_fixture
+CHECK_CONCURRENCY_BARRIER_DIR="$tmp_root/concurrency-barrier"
+CHECK_ALLOW_PRODUCTION_CHANGE=1
+export CHECK_CONCURRENCY_BARRIER_DIR
+export CHECK_ALLOW_PRODUCTION_CHANGE
+add_proxy_outbound_transaction \
+    '{"type":"http","tag":"proxy-concurrent-a","server":"192.0.2.21","server_port":3128}' false &
+concurrent_a_pid=$!
+add_proxy_outbound_transaction \
+    '{"type":"http","tag":"proxy-concurrent-b","server":"192.0.2.22","server_port":3129}' false &
+concurrent_b_pid=$!
+concurrent_a_status=0
+concurrent_b_status=0
+wait "$concurrent_a_pid" || concurrent_a_status=$?
+wait "$concurrent_b_pid" || concurrent_b_status=$?
+CHECK_CONCURRENCY_BARRIER_DIR=''
+CHECK_ALLOW_PRODUCTION_CHANGE=0
+export CHECK_CONCURRENCY_BARRIER_DIR
+export CHECK_ALLOW_PRODUCTION_CHANGE
+[[ "$concurrent_a_status" -eq 0 && "$concurrent_b_status" -eq 0 ]] || \
+    fail "concurrent proxy transactions did not both complete successfully (a=$concurrent_a_status, b=$concurrent_b_status): $(tr '\n' ' ' < "$proxy_error_log")"
+jq -e '.outbounds | any(.tag == "proxy-concurrent-a")' "$outbound_file" >/dev/null || \
+    fail 'concurrent proxy transactions lost the first update'
+jq -e '.outbounds | any(.tag == "proxy-concurrent-b")' "$outbound_file" >/dev/null || \
+    fail 'concurrent proxy transactions lost the second update'
+
+write_proxy_fixture
+CHECK_CONCURRENCY_BARRIER_DIR="$tmp_root/duplicate-barrier"
+CHECK_ALLOW_PRODUCTION_CHANGE=1
+export CHECK_CONCURRENCY_BARRIER_DIR CHECK_ALLOW_PRODUCTION_CHANGE
+add_proxy_outbound_transaction \
+    '{"type":"http","tag":"proxy-concurrent-same","server":"192.0.2.23","server_port":3130}' false &
+duplicate_a_pid=$!
+add_proxy_outbound_transaction \
+    '{"type":"http","tag":"proxy-concurrent-same","server":"192.0.2.23","server_port":3130}' false &
+duplicate_b_pid=$!
+duplicate_a_status=0
+duplicate_b_status=0
+wait "$duplicate_a_pid" || duplicate_a_status=$?
+wait "$duplicate_b_pid" || duplicate_b_status=$?
+CHECK_CONCURRENCY_BARRIER_DIR=''
+CHECK_ALLOW_PRODUCTION_CHANGE=0
+export CHECK_CONCURRENCY_BARRIER_DIR CHECK_ALLOW_PRODUCTION_CHANGE
+if [[ "$duplicate_a_status" -eq 0 && "$duplicate_b_status" -eq 0 ]] ||
+   [[ "$duplicate_a_status" -ne 0 && "$duplicate_b_status" -ne 0 ]]; then
+    fail "same-tag concurrent transactions were not serialized at validation (a=$duplicate_a_status, b=$duplicate_b_status)"
+fi
+[[ "$(jq '[.outbounds[] | select(.tag == "proxy-concurrent-same")] | length' "$outbound_file")" -eq 1 ]] || \
+    fail 'same-tag concurrent transactions created duplicate outbounds'
+
+write_proxy_fixture
+pending_term_mv="$tmp_root/pending-term-mv"
+cat > "$pending_term_mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+mv -f -- "$1" "$2"
+kill -TERM "$PPID"
+sleep 0.1
+EOF
+chmod +x "$pending_term_mv"
+atomic_replace_config_file() {
+    if [[ "$2" == "$route_file" ]]; then
+        "$pending_term_mv" "$1" "$2"
+    else
+        command mv -f -- "$1" "$2"
+    fi
+}
+mutate_proxy_transaction proxy-a direct &
+term_transaction_pid=$!
+term_transaction_status=0
+wait "$term_transaction_pid" || term_transaction_status=$?
+source /dev/stdin <<< "$(sed -n '/^atomic_replace_config_file() {/,/^}/p' "$script")"
+[[ "$term_transaction_status" -eq 143 ]] || \
+    fail "TERM between production replacements returned $term_transaction_status instead of 143"
+assert_proxy_fixture_restored 'TERM between production replacements'
+assert_no_proxy_transaction_artifacts 'TERM between production replacements'
+
+write_proxy_fixture
+printf '1\n' > "$restart_failures"
+rollback_mv_calls=0
+mv() {
+    local source_path="${@: -2:1}"
+    if [[ "$source_path" == */.restore.route.json.* || "$source_path" == */.restore.outbounds.json.* ]]; then
+        rollback_mv_calls=$((rollback_mv_calls + 1))
+        [[ "$rollback_mv_calls" -ne 2 ]] || return 1
+    fi
+    command mv "$@"
+}
+fatal_transaction_status=0
+mutate_proxy_transaction proxy-a direct || fatal_transaction_status=$?
+unset -f mv
+[[ "$fatal_transaction_status" -eq 2 ]] || \
+    fail "incomplete rollback returned $fatal_transaction_status instead of fatal status 2"
+fatal_stage_dir=$(find "$tmp_root" -maxdepth 1 -type d -name '.conf.proxy-stage.*' -print -quit)
+fatal_route_backup=$(find "$conf_dir" -maxdepth 1 -type f -name '.bak.route.*' -print -quit)
+fatal_outbound_backup=$(find "$conf_dir" -maxdepth 1 -type f -name '.bak.outbounds.*' -print -quit)
+[[ -d "$fatal_stage_dir" && -f "$fatal_route_backup" && -f "$fatal_outbound_backup" ]] || \
+    fail 'incomplete rollback did not preserve its stage and both backups'
+grep -Fq "$fatal_stage_dir" "$proxy_error_log" || \
+    fail 'fatal rollback output did not print the preserved stage path'
+grep -Fq "$fatal_route_backup" "$proxy_error_log" || \
+    fail 'fatal rollback output did not print the preserved route backup path'
+grep -Fq "$fatal_outbound_backup" "$proxy_error_log" || \
+    fail 'fatal rollback output did not print the preserved outbounds backup path'
+if grep -Eq '已恢复|已回滚' "$proxy_error_log"; then
+    fail 'fatal rollback incorrectly claimed that production was restored'
+fi
+rm -rf -- "$fatal_stage_dir"
+rm -f -- "$fatal_route_backup" "$fatal_outbound_backup"
+
+write_proxy_fixture
+printf '0\n' > "$service_state"
+printf '1\n' > "$restart_failures"
+if mutate_proxy_transaction proxy-a direct; then
+    fail 'proxy mutation unexpectedly succeeded from an initially inactive service'
+fi
+assert_proxy_files_restored 'initially inactive restart failure'
+[[ "$(<"$service_state")" == 0 ]] || \
+    fail 'rollback started a sing-box service that was initially inactive'
+assert_no_proxy_transaction_artifacts 'initially inactive restart failure'
+
+write_proxy_fixture
 printf '1\n' > "$check_failures"
 if mutate_proxy_transaction proxy-a direct; then
     fail 'proxy mutation succeeded despite a staged config-check failure'
 fi
-assert_proxy_fixture_restored 'config-check failure'
+assert_proxy_files_restored 'config-check failure'
+if grep -Eq '^(restart|stop)$' "$service_log"; then
+    fail 'config-check failure changed the service state'
+fi
+assert_no_proxy_transaction_artifacts 'config-check failure'
 
 write_proxy_fixture
 printf '1\n' > "$restart_failures"
@@ -213,6 +391,7 @@ if mutate_proxy_transaction proxy-a direct; then
     fail 'proxy mutation succeeded despite a restart failure'
 fi
 assert_proxy_fixture_restored 'restart failure'
+assert_no_proxy_transaction_artifacts 'restart failure'
 [[ "$(grep -c '^restart$' "$service_log")" -ge 2 ]] || \
     fail 'restart failure did not restart the restored configuration'
 
@@ -222,8 +401,34 @@ if mutate_proxy_transaction proxy-a direct; then
     fail 'proxy mutation succeeded despite an inactive service'
 fi
 assert_proxy_fixture_restored 'active-check failure'
+assert_no_proxy_transaction_artifacts 'active-check failure'
 [[ "$(grep -c '^active$' "$service_log")" -ge 2 ]] || \
     fail 'active-check failure did not verify the restored configuration'
+
+write_proxy_fixture
+cleanup_rm_failed=0
+rm() {
+    local candidate
+    for candidate in "$@"; do
+        if [[ "$candidate" == */.conf.proxy-stage.* && "$cleanup_rm_failed" -eq 0 ]]; then
+            cleanup_rm_failed=1
+            return 1
+        fi
+    done
+    command rm "$@"
+}
+cleanup_transaction_status=0
+mutate_proxy_transaction proxy-a direct || cleanup_transaction_status=$?
+unset -f rm
+[[ "$cleanup_transaction_status" -eq 2 ]] || \
+    fail "incomplete transaction cleanup returned $cleanup_transaction_status instead of fatal status 2"
+cleanup_fatal_stage=$(find "$tmp_root" -maxdepth 1 -type d -name '.conf.proxy-stage.*' -print -quit)
+[[ -d "$cleanup_fatal_stage" ]] || fail 'cleanup fatal did not preserve the stage directory'
+[[ "$(find "$cleanup_fatal_stage" -maxdepth 1 -type f -name '.bak.*' | wc -l)" -eq 2 ]] || \
+    fail 'cleanup fatal did not preserve both backups inside the stage directory'
+grep -Fq "$cleanup_fatal_stage" "$proxy_error_log" || \
+    fail 'cleanup fatal output did not print its recovery stage path'
+command rm -rf -- "$cleanup_fatal_stage"
 
 write_proxy_fixture
 atomic_replace_calls=0
@@ -236,6 +441,7 @@ if mutate_proxy_transaction proxy-a direct; then
     fail 'proxy mutation succeeded despite the second atomic replacement failing'
 fi
 assert_proxy_fixture_restored 'atomic replacement failure'
+assert_no_proxy_transaction_artifacts 'atomic replacement failure'
 
 nat_block=$(sed -n '/^configure_hy2_nat_family() {/,/^render_vless_reality_inbound() {/p' "$script" | sed '$d')
 [[ -n "$nat_block" ]] || fail 'HY2 NAT helper block could not be extracted'
