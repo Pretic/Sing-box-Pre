@@ -88,6 +88,9 @@ for function_name in \
     is_install_complete \
     mark_install_complete \
     clear_install_complete_marker \
+    legacy_services_are_active \
+    legacy_install_is_complete \
+    prepare_existing_install \
     is_valid_subscription_path \
     is_valid_http_subscription_path \
     render_nginx_subscription_location \
@@ -883,8 +886,18 @@ fi
 check_singbox() {
     [[ -n "${INSTALL_CALL_LOG:-}" && -s "$INSTALL_CALL_LOG" ]]
 }
-command_exists() { [[ "$1" == systemctl ]]; }
-systemctl() { return 0; }
+command_exists() {
+    case "${LEGACY_INIT_SYSTEM:-systemd}:$1" in
+        systemd:systemctl|openrc:rc-service|openrc:rc-update) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+systemctl() {
+    if [[ "$*" == "is-active --quiet ${LEGACY_INACTIVE_SERVICE:-}" ]]; then
+        return 1
+    fi
+    return 0
+}
 sleep() { :; }
 record_install_stage() {
     builtin printf '%s\n' "$1" >> "$INSTALL_CALL_LOG"
@@ -893,7 +906,12 @@ record_install_stage() {
 main_systemd_services() { record_install_stage services; }
 alpine_openrc_services() { record_install_stage services; }
 change_hosts() { :; }
-rc-service() { :; }
+rc-service() {
+    if [[ "$*" == "${LEGACY_INACTIVE_SERVICE:-} status" ]]; then
+        return 1
+    fi
+    return 0
+}
 manage_packages() { record_install_stage packages; }
 install_singbox() { record_install_stage install; }
 validate_singbox_config() { record_install_stage config; }
@@ -906,6 +924,163 @@ red() { printf '%s\n' "$*"; }
 
 load_function run_install_flow
 load_function interactive_install
+
+setup_complete_legacy_install_fixture() {
+    work_dir="${tmp_dir}/legacy-install"
+    conf_dir="${work_dir}/conf"
+    client_dir="${work_dir}/url.txt"
+    combined_client_dir="${work_dir}/all-url.txt"
+    LEGACY_SYSTEMD_UNIT_DIR="${work_dir}/systemd"
+    LEGACY_OPENRC_INIT_DIR="${work_dir}/init.d"
+    NGINX_SUBSCRIPTION_CONF="${work_dir}/nginx/sing-box.conf"
+    INSTALL_FAIL_STAGE=none
+    INSTALL_CALL_LOG="${work_dir}/calls.log"
+    LEGACY_INIT_SYSTEM=systemd
+
+    command rm -rf "$work_dir"
+    command mkdir -p "$conf_dir" "$LEGACY_SYSTEMD_UNIT_DIR" \
+        "$LEGACY_OPENRC_INIT_DIR" "$(dirname "$NGINX_SUBSCRIPTION_CONF")"
+    command printf '%s\n' '#!/usr/bin/env bash' \
+        '[[ "$1" == check && "$2" == -C && -n "$3" ]]' > "${work_dir}/sing-box"
+    command chmod 755 "${work_dir}/sing-box"
+    for config_name in log ntp dns inbounds outbounds endpoints route; do
+        command printf '{"fixture":"%s"}\n' "$config_name" > "${conf_dir}/${config_name}.json"
+    done
+    for subscription_name in url.txt base-sub.txt all-url.txt all-sub.txt sub.txt; do
+        command printf 'legacy-%s\n' "$subscription_name" > "${work_dir}/${subscription_name}"
+    done
+    command printf 'legacy nginx config\n' > "$NGINX_SUBSCRIPTION_CONF"
+    command printf 'legacy sing-box service\n' > "${LEGACY_SYSTEMD_UNIT_DIR}/sing-box.service"
+    command printf 'legacy argo service\n' > "${LEGACY_SYSTEMD_UNIT_DIR}/argo.service"
+    command printf '%s\n' '#!/sbin/openrc-run' 'legacy sing-box OpenRC service' > \
+        "${LEGACY_OPENRC_INIT_DIR}/sing-box"
+    command printf '%s\n' '#!/sbin/openrc-run' 'legacy argo OpenRC service' > \
+        "${LEGACY_OPENRC_INIT_DIR}/argo"
+    : > "$INSTALL_CALL_LOG"
+}
+
+for INSTALL_MODE in auto interactive; do
+    setup_complete_legacy_install_fixture
+    assert_ok "${INSTALL_MODE}_install"
+    [[ -f "${work_dir}/.install-complete" ]] || \
+        fail "${INSTALL_MODE}_install did not migrate a complete markerless legacy install"
+    assert_file_content complete "${work_dir}/.install-complete" \
+        "${INSTALL_MODE}_install migrated marker has unexpected content"
+    [[ ! -s "$INSTALL_CALL_LOG" ]] || \
+        fail "${INSTALL_MODE}_install reinstalled a complete markerless legacy install"
+done
+
+setup_complete_legacy_install_fixture
+command rm -f "${work_dir}/sing-box"
+INSTALL_FAIL_STAGE=packages
+assert_fail auto_install
+[[ ! -e "${work_dir}/.install-complete" ]] || \
+    fail 'auto_install migrated a legacy install without the core sing-box binary'
+assert_file_content packages "$INSTALL_CALL_LOG" \
+    'auto_install did not enter fail-safe repair when the legacy binary was missing'
+
+setup_complete_legacy_install_fixture
+: > "${conf_dir}/route.json"
+INSTALL_FAIL_STAGE=packages
+assert_fail auto_install
+[[ ! -e "${work_dir}/.install-complete" ]] || \
+    fail 'auto_install migrated a legacy install with an empty required config'
+assert_file_content packages "$INSTALL_CALL_LOG" \
+    'auto_install did not enter fail-safe repair when a legacy config was empty'
+
+setup_complete_legacy_install_fixture
+command printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "${work_dir}/sing-box"
+command chmod 755 "${work_dir}/sing-box"
+INSTALL_FAIL_STAGE=packages
+assert_fail auto_install
+[[ ! -e "${work_dir}/.install-complete" ]] || \
+    fail 'auto_install migrated a legacy install rejected by sing-box check'
+assert_file_content packages "$INSTALL_CALL_LOG" \
+    'auto_install did not enter fail-safe repair after sing-box check failed'
+
+for LEGACY_INACTIVE_SERVICE in sing-box argo nginx; do
+    setup_complete_legacy_install_fixture
+    INSTALL_FAIL_STAGE=packages
+    assert_fail auto_install
+    [[ ! -e "${work_dir}/.install-complete" ]] || \
+        fail "auto_install migrated a legacy install with inactive ${LEGACY_INACTIVE_SERVICE}"
+    assert_file_content packages "$INSTALL_CALL_LOG" \
+        "auto_install did not repair an install with inactive ${LEGACY_INACTIVE_SERVICE}"
+done
+unset LEGACY_INACTIVE_SERVICE
+
+for LEGACY_EMPTY_SUBSCRIPTION in url.txt base-sub.txt all-url.txt all-sub.txt sub.txt; do
+    setup_complete_legacy_install_fixture
+    : > "${work_dir}/${LEGACY_EMPTY_SUBSCRIPTION}"
+    INSTALL_FAIL_STAGE=packages
+    assert_fail auto_install
+    [[ ! -e "${work_dir}/.install-complete" ]] || \
+        fail "auto_install migrated a legacy install with empty ${LEGACY_EMPTY_SUBSCRIPTION}"
+    assert_file_content packages "$INSTALL_CALL_LOG" \
+        "auto_install did not repair an install with empty ${LEGACY_EMPTY_SUBSCRIPTION}"
+done
+unset LEGACY_EMPTY_SUBSCRIPTION
+
+setup_complete_legacy_install_fixture
+: > "$NGINX_SUBSCRIPTION_CONF"
+INSTALL_FAIL_STAGE=packages
+assert_fail auto_install
+[[ ! -e "${work_dir}/.install-complete" ]] || \
+    fail 'auto_install migrated a legacy install with an empty nginx subscription config'
+assert_file_content packages "$INSTALL_CALL_LOG" \
+    'auto_install did not repair an install with an empty nginx subscription config'
+
+for LEGACY_MISSING_SERVICE_DEFINITION in sing-box.service argo.service; do
+    setup_complete_legacy_install_fixture
+    command rm -f "${LEGACY_SYSTEMD_UNIT_DIR}/${LEGACY_MISSING_SERVICE_DEFINITION}"
+    INSTALL_FAIL_STAGE=packages
+    assert_fail auto_install
+    [[ ! -e "${work_dir}/.install-complete" ]] || \
+        fail "auto_install migrated without ${LEGACY_MISSING_SERVICE_DEFINITION}"
+    assert_file_content packages "$INSTALL_CALL_LOG" \
+        "auto_install did not repair an install without ${LEGACY_MISSING_SERVICE_DEFINITION}"
+done
+unset LEGACY_MISSING_SERVICE_DEFINITION
+
+setup_complete_legacy_install_fixture
+LEGACY_INIT_SYSTEM=openrc
+command chmod 755 "${LEGACY_OPENRC_INIT_DIR}/sing-box" "${LEGACY_OPENRC_INIT_DIR}/argo"
+legacy_install_is_complete || fail 'complete OpenRC fixture did not satisfy legacy validation'
+assert_ok auto_install
+[[ -f "${work_dir}/.install-complete" ]] || \
+    fail 'auto_install did not migrate a complete OpenRC legacy install'
+[[ ! -s "$INSTALL_CALL_LOG" ]] || \
+    fail 'auto_install reinstalled a complete OpenRC legacy install'
+
+setup_complete_legacy_install_fixture
+LEGACY_INIT_SYSTEM=openrc
+command chmod 755 "${LEGACY_OPENRC_INIT_DIR}/sing-box" "${LEGACY_OPENRC_INIT_DIR}/argo"
+command rm -f "${LEGACY_OPENRC_INIT_DIR}/argo"
+INSTALL_FAIL_STAGE=packages
+assert_fail auto_install
+[[ ! -e "${work_dir}/.install-complete" ]] || \
+    fail 'auto_install migrated an OpenRC legacy install without the argo service definition'
+
+setup_complete_legacy_install_fixture
+LEGACY_INIT_SYSTEM=openrc
+command chmod 755 "${LEGACY_OPENRC_INIT_DIR}/sing-box" "${LEGACY_OPENRC_INIT_DIR}/argo"
+LEGACY_INACTIVE_SERVICE=sing-box
+INSTALL_FAIL_STAGE=packages
+assert_fail auto_install
+[[ ! -e "${work_dir}/.install-complete" ]] || \
+    fail 'auto_install migrated an OpenRC legacy install with inactive sing-box'
+unset LEGACY_INACTIVE_SERVICE
+
+for INSTALL_MODE in auto interactive; do
+    setup_complete_legacy_install_fixture
+    mark_install_complete() { return 1; }
+    assert_fail "${INSTALL_MODE}_install"
+    [[ ! -e "${work_dir}/.install-complete" ]] || \
+        fail "${INSTALL_MODE}_install left a marker after migration marker write failed"
+    [[ ! -s "$INSTALL_CALL_LOG" ]] || \
+        fail "${INSTALL_MODE}_install reinstalled after migration marker write failed"
+done
+load_function mark_install_complete
 
 run_install_failure_case() {
     local mode="$1"

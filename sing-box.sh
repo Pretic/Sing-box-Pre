@@ -271,6 +271,63 @@ clear_install_complete_marker() {
     rm -f "$marker_file"
 }
 
+legacy_services_are_active() {
+    local service_name service_definition
+
+    if command_exists systemctl; then
+        for service_definition in sing-box.service argo.service; do
+            [ -s "${LEGACY_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/${service_definition}" ] || return 1
+        done
+        for service_name in sing-box argo nginx; do
+            systemctl is-active --quiet "$service_name" >/dev/null 2>&1 || return 1
+        done
+    elif command_exists rc-service; then
+        for service_definition in sing-box argo; do
+            [ -s "${LEGACY_OPENRC_INIT_DIR:-/etc/init.d}/${service_definition}" ] && \
+                [ -x "${LEGACY_OPENRC_INIT_DIR:-/etc/init.d}/${service_definition}" ] || return 1
+        done
+        for service_name in sing-box argo nginx; do
+            rc-service "$service_name" status >/dev/null 2>&1 || return 1
+        done
+    else
+        return 1
+    fi
+}
+
+legacy_install_is_complete() {
+    local singbox_binary="${work_dir}/${server_name:-sing-box}"
+    local legacy_conf_dir="${conf_dir:-${work_dir}/conf}"
+    local nginx_subscription_conf="${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"
+    local config_name subscription_file
+
+    [ -x "$singbox_binary" ] || return 1
+    for config_name in log ntp dns inbounds outbounds endpoints route; do
+        [ -s "${legacy_conf_dir}/${config_name}.json" ] || return 1
+    done
+    "$singbox_binary" check -C "$legacy_conf_dir" >/dev/null 2>&1 || return 1
+    [ -s "$nginx_subscription_conf" ] || return 1
+    legacy_services_are_active || return 1
+    for subscription_file in \
+        "${client_dir:-${work_dir}/url.txt}" \
+        "${work_dir}/base-sub.txt" \
+        "${combined_client_dir:-${work_dir}/all-url.txt}" \
+        "${work_dir}/all-sub.txt" \
+        "${work_dir}/sub.txt"; do
+        [ -s "$subscription_file" ] || return 1
+    done
+}
+
+prepare_existing_install() {
+    local marker_file="${INSTALL_COMPLETE_MARKER:-${work_dir}/.install-complete}"
+
+    if check_singbox &>/dev/null && is_install_complete; then
+        return 0
+    fi
+    [ ! -e "$marker_file" ] || return 1
+    legacy_install_is_complete || return 1
+    mark_install_complete || return 2
+}
+
 is_valid_subscription_token() {
     [[ "${1:-}" =~ ^[0123456789abcdefghjkmnpqrstvwxyz]{32}$ ]]
 }
@@ -2660,9 +2717,17 @@ run_install_flow() {
 
 # 非交互静默安装（-i 参数）
 auto_install() {
-    if check_singbox &>/dev/null && is_install_complete; then
+    local existing_install_status
+
+    if prepare_existing_install; then
         yellow "sing-box 已经安装，跳过安装流程。"
         return 0
+    else
+        existing_install_status=$?
+    fi
+    if [ "$existing_install_status" -eq 2 ]; then
+        red "旧安装验证通过，但安装完成标记写入失败，安装中止。"
+        return 1
     fi
 
     green "Starting non-interactive sing-box install..."
@@ -2670,9 +2735,17 @@ auto_install() {
 }
 
 interactive_install() {
-    if check_singbox &>/dev/null && is_install_complete; then
+    local existing_install_status
+
+    if prepare_existing_install; then
         yellow "sing-box 已经安装！\n"
         return 0
+    else
+        existing_install_status=$?
+    fi
+    if [ "$existing_install_status" -eq 2 ]; then
+        red "旧安装验证通过，但安装完成标记写入失败，安装中止。"
+        return 1
     fi
 
     run_install_flow
