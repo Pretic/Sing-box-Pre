@@ -1852,7 +1852,7 @@ remove_hy2_nat_family() {
     local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
     local family saved_chain saved_comment saved_min saved_max saved_listen
 
-    command_exists "$firewall_cmd" || return 0
+    command_exists "$firewall_cmd" || return 1
 
     if [ -z "$chain" ]; then
         [ -r "$state_file" ] || return 0

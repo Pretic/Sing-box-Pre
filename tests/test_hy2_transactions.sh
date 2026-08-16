@@ -315,6 +315,21 @@ fi
 [[ "$(<"$HY2_NAT_STATE_FILE")" == "$remove_before_owner" ]] || \
     fail 'remove persistence failure changed ownership state'
 
+FAIL_TOOL=''
+FAIL_OP=''
+FAIL_MATCH=''
+FAIL_REMAINING=0
+PERSIST_FAILURES=0
+HAS_IP6TABLES_COMMAND=0
+if remove_hy2_port_hopping; then
+    fail 'HY2 remove succeeded while a state-owned firewall backend was unavailable'
+fi
+[[ "$(firewall_snapshot)" == "$remove_before_nat" ]] || \
+    fail 'unavailable owned backend did not preserve all live rules exactly'
+[[ "$(<"$HY2_NAT_STATE_FILE")" == "$remove_before_owner" ]] || \
+    fail 'unavailable owned backend did not preserve ownership state'
+HAS_IP6TABLES_COMMAND=1
+
 # Existing single-stack support remains scoped to the available family.
 prepare_empty_firewall
 HAS_IPV6=0
