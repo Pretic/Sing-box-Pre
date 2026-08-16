@@ -4953,14 +4953,14 @@ sync_combined_subscription() {
         write_base64_subscription "$combined_client_dir" "${work_dir}/sub.txt" || return 1
     else
         rm -f "$tmp_file"
-        printf '' | atomic_write_file "$combined_client_dir" 644
-        printf '' | atomic_write_file "$combined_sub_file" 644
-        printf '' | atomic_write_file "${work_dir}/sub.txt" 644
+        printf '' | atomic_write_file "$combined_client_dir" 644 || return 1
+        printf '' | atomic_write_file "$combined_sub_file" 644 || return 1
+        printf '' | atomic_write_file "${work_dir}/sub.txt" 644 || return 1
     fi
 }
 update_sub() {
-    write_base64_subscription "$client_dir" "${work_dir}/base-sub.txt"
-    sync_combined_subscription
+    write_base64_subscription "$client_dir" "${work_dir}/base-sub.txt" || return 1
+    sync_combined_subscription || return 1
 }
 
 # ---- Socks5 入站 ----

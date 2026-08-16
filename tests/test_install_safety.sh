@@ -61,6 +61,9 @@ for function_name in \
     load_install_settings \
     persist_install_settings \
     atomic_write_file \
+    write_base64_subscription \
+    sync_combined_subscription \
+    update_sub \
     manage_packages \
     allow_port \
     is_valid_subscription_path \
@@ -343,6 +346,48 @@ if grep -Fq 'ping -c' <<< "$install_source"; then
     fail 'install_singbox still uses ping to select the network stack'
 fi
 
+subscription_root="${tmp_dir}/subscription-failures"
+command mkdir -p "$subscription_root"
+work_dir="$subscription_root"
+client_dir="${work_dir}/url.txt"
+combined_client_dir="${work_dir}/all-url.txt"
+printf '%s\n' 'vless://fixture' > "$client_dir"
+SUBSCRIPTION_MV_FAIL_TARGET="${work_dir}/base-sub.txt"
+mv() {
+    local target=''
+    for target in "$@"; do :; done
+    if [[ "$target" == "$SUBSCRIPTION_MV_FAIL_TARGET" ]]; then
+        return 1
+    fi
+    command mv "$@"
+}
+assert_fail update_sub
+unset -f mv
+
+atomic_write_source="$(extract_function atomic_write_file)"
+run_empty_subscription_failure() {
+    local failure_name="$1"
+    command rm -rf "$subscription_root"
+    command mkdir -p "$subscription_root"
+    work_dir="$subscription_root"
+    client_dir="${work_dir}/url.txt"
+    combined_client_dir="${work_dir}/all-url.txt"
+    ATOMIC_FAIL_TARGET="${work_dir}/${failure_name}"
+    atomic_write_file() {
+        local target_file="$1"
+        if [[ "$target_file" == "$ATOMIC_FAIL_TARGET" ]]; then
+            return 1
+        fi
+        command cat >/dev/null
+    }
+    assert_fail sync_combined_subscription
+    unset -f atomic_write_file
+    source <(printf '%s\n' "$atomic_write_source")
+}
+
+run_empty_subscription_failure all-url.txt
+run_empty_subscription_failure all-sub.txt
+
 load_function get_info
 get_public_ipv4() { printf '%s\n' '203.0.113.10'; }
 get_public_ipv6() { return 1; }
@@ -363,6 +408,7 @@ clear() { :; }
 setup_get_info_fixture() {
     work_dir="${tmp_dir}/get-info"
     client_dir="${work_dir}/url.txt"
+    combined_client_dir="${work_dir}/all-url.txt"
     command rm -rf "$work_dir"
     command mkdir -p "$work_dir"
     uuid='11111111-1111-4111-8111-111111111111'
@@ -384,21 +430,24 @@ setup_get_info_fixture() {
     purple=''
     INFO_FAIL_STAGE="$1"
 }
-update_sub() {
-    if [[ "$INFO_FAIL_STAGE" == update_sub ]]; then
+mv() {
+    local target=''
+    for target in "$@"; do :; done
+    if [[ "$INFO_FAIL_STAGE" == update_sub && "$target" == "${work_dir}/base-sub.txt" ]]; then
         return 1
     fi
-    printf '%s\n' subscription > "${work_dir}/sub.txt"
+    command mv "$@"
 }
 chmod() {
-    [[ "$INFO_FAIL_STAGE" != chmod ]]
+    [[ "$INFO_FAIL_STAGE" != chmod ]] || return 1
+    command chmod "$@"
 }
 
 setup_get_info_fixture update_sub
 assert_fail get_info
 setup_get_info_fixture chmod
 assert_fail get_info
-unset -f chmod
+unset -f mv chmod
 
 add_nginx_source="$(sed -n '/^add_nginx_conf() {/,/^# 从已安装配置中获取UUID/p' "$script" | sed '$d')"
 [[ -n "$add_nginx_source" ]] || fail 'add_nginx_conf is not implemented'
