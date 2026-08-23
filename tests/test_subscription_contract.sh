@@ -28,6 +28,8 @@ load_function() {
 for function_name in \
     with_subscription_lock \
     encode_subscription_source \
+    read_strict_subscription_generation_file \
+    select_cfy_subscription_source_locked \
     publish_subscriptions_locked \
     mutate_base_subscription_locked \
     mutate_base_subscription \
@@ -50,6 +52,7 @@ done
 work_dir="${tmp_root}/sing-box"
 client_dir="${work_dir}/url.txt"
 combined_client_dir="${work_dir}/all-url.txt"
+CFY_SOURCE_GENERATION_FILE="${work_dir}/cfy-source.generation"
 mkdir -p "$work_dir"
 
 printf '%s\n' \
@@ -61,7 +64,15 @@ printf '%s\r\n' \
     'vless://cfy-b' \
     'vless://same-fields#two' \
     'vless://cfy-b' > "${work_dir}/cfy-url.txt"
+chmod 600 "${work_dir}/cfy-url.txt"
+initial_base_digest="$(sha256sum "$client_dir")"
+initial_base_digest="${initial_base_digest%%[[:space:]]*}"
+initial_base_bytes="$(wc -c < "$client_dir")"
+initial_base_bytes="${initial_base_bytes//[[:space:]]/}"
+printf '%s:%s\n' "$initial_base_digest" "$initial_base_bytes" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
 cfy_source_checksum="$(cksum < "${work_dir}/cfy-url.txt")"
+cfy_generation_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
 
 # The functional publication checks use a harmless lock shim. A real
 # cross-process exclusion check runs below whenever util-linux flock exists.
@@ -78,12 +89,14 @@ cmp -s "$combined_client_dir" <(base64 -d "${work_dir}/sub.txt") || \
     fail 'served sub.txt was not generated from all-url.txt'
 [[ "$(cksum < "${work_dir}/cfy-url.txt")" == "$cfy_source_checksum" ]] || \
     fail 'Sing-box rewrote the cfy-owned source file'
+[[ "$(cksum < "$CFY_SOURCE_GENERATION_FILE")" == "$cfy_generation_checksum" ]] || \
+    fail 'Sing-box rewrote the cfy-owned source-generation sidecar'
 [[ -f "${work_dir}/.subscription.lock" ]] || fail 'the canonical subscription lock was not used'
 
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) ;;
     *)
-        for internal in url.txt base-sub.txt cfy-url.txt cfy-sub.txt all-url.txt all-sub.txt; do
+        for internal in url.txt base-sub.txt cfy-url.txt cfy-source.generation cfy-sub.txt all-url.txt all-sub.txt; do
             [[ "$(stat -c '%a' "${work_dir}/${internal}")" == 600 ]] || \
                 fail "${internal} is not mode 600"
         done
@@ -92,6 +105,66 @@ case "$(uname -s)" in
             fail 'subscription lock is not mode 600'
         ;;
 esac
+
+assert_base_only_publication() {
+    local expected_base="$1"
+
+    [[ "$(cat "$combined_client_dir")" == "$expected_base" ]] || \
+        fail 'an untrusted cfy generation leaked into all-url.txt'
+    [[ "$(base64 -d "${work_dir}/sub.txt")" == "$expected_base" ]] || \
+        fail 'an untrusted cfy generation leaked into the served subscription'
+    [[ "$(cksum < "${work_dir}/cfy-url.txt")" == "$cfy_source_checksum" ]] || \
+        fail 'Sing-box changed cfy-url.txt while ignoring an untrusted generation'
+}
+
+printf '%s\n' 'vless://base-after-generation-change' > "$client_dir"
+update_sub || fail 'base mutation with stale cfy metadata did not publish safely'
+assert_base_only_publication 'vless://base-after-generation-change'
+[[ "$(cksum < "$CFY_SOURCE_GENERATION_FILE")" == "$cfy_generation_checksum" ]] || \
+    fail 'Sing-box changed the stale cfy generation sidecar'
+
+rm -f "$CFY_SOURCE_GENERATION_FILE"
+update_sub || fail 'missing cfy generation sidecar did not degrade to base-only publication'
+assert_base_only_publication 'vless://base-after-generation-change'
+
+printf '%s\n' 'not-a-generation' > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
+update_sub || fail 'malformed cfy generation sidecar did not degrade to base-only publication'
+assert_base_only_publication 'vless://base-after-generation-change'
+
+current_base_generation="$(get_base_subscription_generation)" || fail 'could not fingerprint the current base'
+[[ "$current_base_generation" =~ ^[0-9a-f]{64}:[0-9]+$ ]] || \
+    fail 'Sing-box base generation is not canonical digest:bytes'
+printf '%s\n' "$current_base_generation" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 644 "$CFY_SOURCE_GENERATION_FILE"
+generation_mode_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
+update_sub || fail 'wrong-mode cfy generation sidecar did not degrade safely'
+assert_base_only_publication 'vless://base-after-generation-change'
+[[ "$(stat -c '%a' "$CFY_SOURCE_GENERATION_FILE")" == 644 ]] || \
+    fail 'Sing-box changed the mode of the cfy-owned generation sidecar'
+[[ "$(cksum < "$CFY_SOURCE_GENERATION_FILE")" == "$generation_mode_checksum" ]] || \
+    fail 'Sing-box changed a wrong-mode cfy generation sidecar'
+
+generation_target="${work_dir}/generation-target"
+printf '%s\n' "$current_base_generation" > "$generation_target"
+chmod 600 "$generation_target"
+rm -f "$CFY_SOURCE_GENERATION_FILE"
+ln -s "$generation_target" "$CFY_SOURCE_GENERATION_FILE"
+update_sub || fail 'symlink cfy generation sidecar did not degrade safely'
+assert_base_only_publication 'vless://base-after-generation-change'
+[[ -L "$CFY_SOURCE_GENERATION_FILE" ]] || fail 'Sing-box replaced the cfy-owned generation symlink'
+
+rm -f "$CFY_SOURCE_GENERATION_FILE"
+printf '%s\n' "$current_base_generation" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
+update_sub || fail 'matching cfy generation sidecar was rejected'
+expected=$'vless://base-after-generation-change\nvless://shared\nvless://cfy-b\nvless://same-fields#two'
+[[ "$(cat "$combined_client_dir")" == "$expected" ]] || \
+    fail 'matching cfy generation was not merged'
+matching_generation_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
+update_sub || fail 'repeat matching cfy publication failed'
+[[ "$(cksum < "$CFY_SOURCE_GENERATION_FILE")" == "$matching_generation_checksum" ]] || \
+    fail 'Sing-box rewrote a matching cfy generation sidecar'
 
 printf '%s\n' 'old-served-generation' > "${work_dir}/sub.txt"
 base64() { return 1; }

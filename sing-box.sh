@@ -119,6 +119,7 @@ work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
 combined_client_dir="${work_dir}/all-url.txt"
+CFY_SOURCE_GENERATION_FILE="${CFY_SOURCE_GENERATION_FILE:-${work_dir}/cfy-source.generation}"
 install_env_file="${INSTALL_ENV_FILE:-${work_dir}/install.env}"
 load_install_settings "$install_env_file" || {
     red "install.env 中存在无效端口设置，请修正后重试。"
@@ -13569,9 +13570,45 @@ write_base64_subscription() {
     mv -f "$tmp_file" "$sub_file" || { rm -f "$tmp_file"; return 1; }
 }
 
+read_strict_subscription_generation_file() {
+    local generation_file="${1:-}"
+    local generation file_mode
+
+    [ -n "$generation_file" ] || return 1
+    [ -f "$generation_file" ] && [ ! -L "$generation_file" ] || return 1
+    file_mode=$(stat -c '%a' -- "$generation_file" 2>/dev/null) || return 1
+    [ "$file_mode" = 600 ] || return 1
+    generation=$(awk '
+        NR == 1 { value = $0; next }
+        { invalid = 1 }
+        END {
+            if (NR != 1 || invalid) exit 1
+            printf "%s", value
+        }
+    ' "$generation_file") || return 1
+    [[ "$generation" =~ ^[0-9a-f]{64}:[0-9]+$ ]] || return 1
+    printf '%s\n' "$generation"
+}
+
+select_cfy_subscription_source_locked() {
+    local base_source_file="${1:-$client_dir}"
+    local cfy_file="${work_dir}/cfy-url.txt"
+    local generation_file="${CFY_SOURCE_GENERATION_FILE:-${work_dir}/cfy-source.generation}"
+    local current_generation cfy_generation
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    current_generation=$(get_base_subscription_generation_locked "$base_source_file") || return 1
+    if [ -f "$cfy_file" ] && [ ! -L "$cfy_file" ] &&
+       cfy_generation=$(read_strict_subscription_generation_file "$generation_file") &&
+       [ "$cfy_generation" = "$current_generation" ]; then
+        printf '%s\n' "$cfy_file"
+    else
+        printf '/dev/null\n'
+    fi
+}
+
 publish_subscriptions_locked() {
     local staged_base_file="${1:-}"
-    local cfy_file="${work_dir}/cfy-url.txt"
     local base_source_file="$client_dir"
     local cfy_source_file=/dev/null
     local base_sub_file="${work_dir}/base-sub.txt"
@@ -13584,7 +13621,7 @@ publish_subscriptions_locked() {
 
     [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
     mkdir -p "$work_dir" || return 1
-    for target_file in "$client_dir" "$cfy_file" "$base_sub_file" "$cfy_sub_file" \
+    for target_file in "$client_dir" "$base_sub_file" "$cfy_sub_file" \
         "$combined_client_dir" "$combined_sub_file" "$served_sub_file"; do
         if [ -e "$target_file" ] || [ -L "$target_file" ]; then
             [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
@@ -13599,10 +13636,7 @@ publish_subscriptions_locked() {
         [ -f "$client_dir" ] || return 1
         chmod 600 "$client_dir" || return 1
     fi
-    if [ -e "$cfy_file" ]; then
-        chmod 600 "$cfy_file" || return 1
-        cfy_source_file="$cfy_file"
-    fi
+    cfy_source_file=$(select_cfy_subscription_source_locked "$base_source_file") || return 1
 
     tmp_base_sub=$(mktemp "${work_dir}/.tmp.base-sub.txt.XXXXXX") || return 1
     tmp_cfy_sub=$(mktemp "${work_dir}/.tmp.cfy-sub.txt.XXXXXX") || { rm -f "$tmp_base_sub"; return 1; }
@@ -13708,7 +13742,7 @@ get_base_subscription_generation_locked() {
     byte_count=$(wc -c < "$source_file") || return 1
     byte_count=${byte_count//[[:space:]]/}
     [[ "$byte_count" =~ ^[0-9]+$ ]] || return 1
-    printf 'file:%s:%s\n' "${digest,,}" "$byte_count"
+    printf '%s:%s\n' "${digest,,}" "$byte_count"
 }
 
 get_base_subscription_generation() {

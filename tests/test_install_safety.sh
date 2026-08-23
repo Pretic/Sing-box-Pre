@@ -85,6 +85,8 @@ for function_name in \
     with_subscription_lock \
     encode_subscription_source \
     write_base64_subscription \
+    read_strict_subscription_generation_file \
+    select_cfy_subscription_source_locked \
     publish_subscriptions_locked \
     get_base_subscription_generation_locked \
     get_base_subscription_generation \
