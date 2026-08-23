@@ -44,3 +44,10 @@ jobs:
             echo "Running ${test_script}"
             bash "${test_script}"
           done
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v shellcheck
+          find . -type f -name '*.sh' -print0 | xargs -0 shellcheck -S error
