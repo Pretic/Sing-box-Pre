@@ -10671,14 +10671,113 @@ warp_endpoint_is_valid() {
     ' >/dev/null 2>&1 <<< "$endpoint_json"
 }
 
+fail_warp_generation_after_registration() {
+    local response_file="$1" register_dir="$2"
+    chmod 700 "$register_dir" 2>/dev/null || true
+    [ ! -e "$response_file" ] || chmod 600 "$response_file" 2>/dev/null || true
+    if delete_warp_registration "$response_file"; then
+        if rm -rf -- "$register_dir"; then
+            return 1
+        fi
+        red "WARP 云端设备已清理，但本地注册临时目录删除失败。"
+    else
+        red "WARP 云端设备清理失败，已停止后续注册尝试。"
+    fi
+    red "注册恢复凭据保留在: ${register_dir}"
+    return 2
+}
+
+install_warp_identity_file() {
+    local source_file="$1" target_file="$2"
+    if command_exists install; then
+        install -m 600 "$source_file" "$target_file"
+    else
+        cp "$source_file" "$target_file" && chmod 600 "$target_file"
+    fi
+}
+
+move_warp_identity_file() {
+    mv -f "$1" "$2"
+}
+
+remove_warp_identity_file() {
+    rm -f -- "$1"
+}
+
+remove_warp_identity_transaction() {
+    rm -rf -- "$1"
+}
+
+commit_warp_identity_pair() {
+    local endpoint_source="$1" account_source="$2" state_dir="$3"
+    local endpoint_target="${state_dir}/endpoint.json" account_target="${state_dir}/account.json"
+    local transaction_dir rollback_ok=true
+
+    transaction_dir=$(mktemp -d "${state_dir}/.identity-commit.XXXXXX") || return 1
+    chmod 700 "$transaction_dir"
+    if ! install_warp_identity_file "$endpoint_source" "$transaction_dir/new-endpoint.json" || \
+       ! install_warp_identity_file "$account_source" "$transaction_dir/new-account.json"; then
+        remove_warp_identity_transaction "$transaction_dir" || \
+          yellow "WARP 身份暂存目录清理失败，已保留: ${transaction_dir}"
+        return 1
+    fi
+    if [ -e "$endpoint_target" ]; then
+        install_warp_identity_file "$endpoint_target" "$transaction_dir/old-endpoint.json" || {
+            remove_warp_identity_transaction "$transaction_dir" || true
+            return 1
+        }
+        : > "$transaction_dir/had-endpoint"
+    fi
+    if [ -e "$account_target" ]; then
+        install_warp_identity_file "$account_target" "$transaction_dir/old-account.json" || {
+            remove_warp_identity_transaction "$transaction_dir" || true
+            return 1
+        }
+        : > "$transaction_dir/had-account"
+    fi
+
+    if move_warp_identity_file "$transaction_dir/new-endpoint.json" "$endpoint_target" && \
+       move_warp_identity_file "$transaction_dir/new-account.json" "$account_target"; then
+        if remove_warp_identity_transaction "$transaction_dir"; then
+            return 0
+        fi
+        red "WARP 身份已成对提交，但事务目录清理失败。"
+        red "事务恢复材料保留在: ${transaction_dir}"
+        return 2
+    fi
+
+    if [ -e "$transaction_dir/had-endpoint" ]; then
+        install_warp_identity_file "$transaction_dir/old-endpoint.json" "$transaction_dir/restore-endpoint.json" && \
+          move_warp_identity_file "$transaction_dir/restore-endpoint.json" "$endpoint_target" || rollback_ok=false
+    else
+        remove_warp_identity_file "$endpoint_target" || rollback_ok=false
+    fi
+    if [ -e "$transaction_dir/had-account" ]; then
+        install_warp_identity_file "$transaction_dir/old-account.json" "$transaction_dir/restore-account.json" && \
+          move_warp_identity_file "$transaction_dir/restore-account.json" "$account_target" || rollback_ok=false
+    else
+        remove_warp_identity_file "$account_target" || rollback_ok=false
+    fi
+    if [ "$rollback_ok" = true ]; then
+        remove_warp_identity_transaction "$transaction_dir" || \
+          yellow "WARP 身份回滚完成，但事务目录清理失败，已保留: ${transaction_dir}"
+        return 1
+    fi
+    red "WARP 身份成对提交失败，且旧身份恢复不完整。"
+    red "事务恢复材料保留在: ${transaction_dir}"
+    return 2
+}
+
 # 为当前 VPS 生成独立密钥并直接向 Cloudflare WARP API 注册。
 # 私钥始终在本机生成；账户令牌和 endpoint 仅以 600 权限保存在本机。
+# 返回 1 表示没有遗留云端注册，可由调用者重试；返回 2 表示注册状态不确定
+# 或清理失败，恢复材料已尽可能保留，调用者必须停止重试。
 generate_unique_warp_identity() {
     local state_dir="${1:-${conf_dir}/warp}"
     local register_dir response_file request_file endpoint_file account_file
     local singbox_bin keypair private_key public_key random_hex install_id fcm_token tos
-    local http_code registered client_id reserved_bytes r1 r2 r3 extra
-    local v4 v6 peer_key attempt
+    local http_code client_id reserved_bytes r1 r2 r3 extra
+    local v4 v6 peer_key failure_rc commit_rc
 
     command_exists curl || { red "生成独立 WARP 身份需要 curl。"; return 1; }
     command_exists jq || { red "生成独立 WARP 身份需要 jq。"; return 1; }
@@ -10733,40 +10832,50 @@ generate_unique_warp_identity() {
       }
     chmod 600 "$request_file"
 
-    registered=false
-    for attempt in 1 2 3; do
-        http_code=""
-        if http_code=$(curl -sS --location --connect-timeout 10 --max-time 45 \
-          -o "$response_file" -w '%{http_code}' \
-          --request POST 'https://api.cloudflareclient.com/v0a2158/reg' \
-          --header 'User-Agent: okhttp/3.12.1' \
-          --header 'CF-Client-Version: a-6.10-2158' \
-          --header 'Content-Type: application/json' \
-          --data-binary "@${request_file}") && \
-          [ "$http_code" = 200 ] && \
-          jq -e '
-            .id and .token and .config.client_id and
-            .config.interface.addresses.v4 and .config.interface.addresses.v6 and
-            .config.peers[0].public_key
-          ' "$response_file" >/dev/null 2>&1; then
-            registered=true
-            break
-        fi
-        sleep $((attempt * 2))
-    done
-    if [ "$registered" != true ]; then
+    http_code=""
+    if ! http_code=$(curl -sS --location --connect-timeout 10 --max-time 45 \
+      -o "$response_file" -w '%{http_code}' \
+      --request POST 'https://api.cloudflareclient.com/v0a2158/reg' \
+      --header 'User-Agent: okhttp/3.12.1' \
+      --header 'CF-Client-Version: a-6.10-2158' \
+      --header 'Content-Type: application/json' \
+      --data-binary "@${request_file}"); then
+        [ ! -e "$response_file" ] || chmod 600 "$response_file" 2>/dev/null || true
+        red "Cloudflare WARP 注册请求结果不确定，已停止后续注册尝试。"
+        red "注册恢复材料保留在: ${register_dir}"
+        return 2
+    fi
+    [ ! -e "$response_file" ] || chmod 600 "$response_file" 2>/dev/null || true
+    if [ "$http_code" != 200 ]; then
         rm -rf -- "$register_dir"
         red "Cloudflare WARP 注册失败，现有配置未修改。"
         return 1
+    fi
+    if jq -e '
+      .id and .token and .config.client_id and
+      .config.interface.addresses.v4 and .config.interface.addresses.v6 and
+      .config.peers[0].public_key
+    ' "$response_file" >/dev/null 2>&1; then
+        :
+    elif jq -e '.id and .token' "$response_file" >/dev/null 2>&1; then
+        if fail_warp_generation_after_registration "$response_file" "$register_dir"; then
+            failure_rc=0
+        else
+            failure_rc=$?
+        fi
+        return "$failure_rc"
+    else
+        red "Cloudflare WARP 注册响应不完整，注册状态不确定，已停止后续注册尝试。"
+        red "注册恢复材料保留在: ${register_dir}"
+        return 2
     fi
 
     client_id=$(jq -r '.config.client_id' "$response_file")
     read -r r1 r2 r3 extra < <(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1)
     if [ -z "${r1:-}" ] || [ -z "${r2:-}" ] || [ -z "${r3:-}" ] || [ -n "${extra:-}" ]; then
-        delete_warp_registration "$response_file" || true
-        rm -rf -- "$register_dir"
         red "Cloudflare WARP client_id 无效，现有配置未修改。"
-        return 1
+        if fail_warp_generation_after_registration "$response_file" "$register_dir"; then failure_rc=0; else failure_rc=$?; fi
+        return "$failure_rc"
     fi
     reserved_bytes=$(jq -n --argjson a "$r1" --argjson b "$r2" --argjson c "$r3" '[$a,$b,$c]')
     v4=$(jq -r '.config.interface.addresses.v4' "$response_file")
@@ -10793,39 +10902,38 @@ generate_unique_warp_identity() {
         }]
       }
       ' > "$endpoint_file" || {
-        delete_warp_registration "$response_file" || true
-        rm -rf -- "$register_dir"
-        return 1
+        if fail_warp_generation_after_registration "$response_file" "$register_dir"; then failure_rc=0; else failure_rc=$?; fi
+        return "$failure_rc"
       }
     jq --arg private "$private_key" --argjson reserved "$reserved_bytes" \
       '. + {private_key:$private,reserved:$reserved}' "$response_file" > "$account_file" || {
-        delete_warp_registration "$response_file" || true
-        rm -rf -- "$register_dir"
-        return 1
+        if fail_warp_generation_after_registration "$response_file" "$register_dir"; then failure_rc=0; else failure_rc=$?; fi
+        return "$failure_rc"
       }
     chmod 600 "$response_file" "$endpoint_file" "$account_file"
 
     local generated_endpoint
     generated_endpoint=$(extract_warp_endpoint "$endpoint_file")
     if ! warp_endpoint_is_valid "$generated_endpoint" || warp_endpoint_is_legacy "$generated_endpoint"; then
-        delete_warp_registration "$response_file" || true
-        rm -rf -- "$register_dir"
         red "生成的 WARP endpoint 校验失败，现有配置未修改。"
-        return 1
+        if fail_warp_generation_after_registration "$response_file" "$register_dir"; then failure_rc=0; else failure_rc=$?; fi
+        return "$failure_rc"
     fi
 
-    if command_exists install; then
-        install -m 600 "$endpoint_file" "${state_dir}/endpoint.json" && \
-        install -m 600 "$account_file" "${state_dir}/account.json"
-    else
-        cp "$endpoint_file" "${state_dir}/endpoint.json" && \
-        cp "$account_file" "${state_dir}/account.json" && \
-        chmod 600 "${state_dir}/endpoint.json" "${state_dir}/account.json"
+    if commit_warp_identity_pair "$endpoint_file" "$account_file" "$state_dir"; then commit_rc=0; else commit_rc=$?; fi
+    if [ "$commit_rc" -eq 1 ]; then
+        if fail_warp_generation_after_registration "$response_file" "$register_dir"; then failure_rc=0; else failure_rc=$?; fi
+        return "$failure_rc"
     fi
-    local install_status=$?
-    [ "$install_status" -eq 0 ] || delete_warp_registration "$response_file" || true
-    rm -rf -- "$register_dir"
-    [ "$install_status" -eq 0 ] || return "$install_status"
+    if [ "$commit_rc" -eq 2 ]; then
+        red "WARP 身份提交或恢复未完整完成，已停止后续注册尝试。"
+        red "注册恢复材料保留在: ${register_dir}"
+        return 2
+    fi
+    rm -rf -- "$register_dir" || {
+        red "WARP 身份已生成，但注册临时目录清理失败: ${register_dir}"
+        return 2
+    }
     green "已为本机生成独立 WARP 身份。"
 }
 
@@ -10998,9 +11106,7 @@ check_unlock_chatgpt() {
     local proxy="$1" web_meta web_code web_url ios_file ios_meta ios_code restriction
     web_meta=$(curl -sSIL -L --connect-timeout 5 --max-time 12 --proxy "$proxy" \
       -A 'Mozilla/5.0' -o /dev/null -w $'%{http_code}\t%{url_effective}' \
-      https://chatgpt.com 2>/dev/null) || {
-        WARP_UNLOCK_STATUS='检测失败'; return 2
-    }
+      https://chatgpt.com 2>/dev/null) || web_meta=''
     IFS=$'\t' read -r web_code web_url <<< "$web_meta"
     ios_file=$(mktemp) || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
     if ! ios_meta=$(curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
@@ -11018,16 +11124,240 @@ check_unlock_chatgpt() {
     if grep -qE '\(1\)|\(2\)' <<< "$restriction"; then
         WARP_UNLOCK_STATUS='仅网页可用'; return 1
     fi
+    web_url=${web_url,,}
     [[ "$web_code" =~ ^2[0-9][0-9]$ ]] && \
-      [[ "$web_url" =~ ^https://([^.]+\.)*chatgpt\.com(/|$) ]] && \
+      [[ "$web_url" =~ ^https://([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*chatgpt\.com(:443)?([/?#]|$) ]] && \
       [[ "$ios_code" =~ ^[234][0-9][0-9]$ ]] || {
         WARP_UNLOCK_STATUS='检测失败'; return 2
     }
     WARP_UNLOCK_STATUS='解锁'; return 0
 }
 
+extract_html_visible_text() {
+    local input="$1"
+    awk '
+      function find_tag_end(s, start, n, i, c, quote) {
+          n=length(s)
+          quote=""
+          for (i=start + 1; i<=n; i++) {
+              c=substr(s, i, 1)
+              if (quote != "") {
+                  if (c == quote) quote=""
+              } else if (c == "\"" || c == apostrophe) {
+                  quote=c
+              } else if (c == ">") {
+                  return i
+              }
+          }
+          return 0
+      }
+
+      function has_hidden_attr(tag, pos, n, i, c, start, name, quote) {
+          n=length(tag)
+          i=pos
+          while (i <= n) {
+              while (i <= n && substr(tag, i, 1) ~ /[[:space:]\/]/) i++
+              if (i > n) break
+              start=i
+              while (i <= n && substr(tag, i, 1) !~ /[[:space:]=\/]/) i++
+              name=tolower(substr(tag, start, i - start))
+              if (name == "hidden") return 1
+              while (i <= n && substr(tag, i, 1) ~ /[[:space:]]/) i++
+              if (substr(tag, i, 1) != "=") continue
+              i++
+              while (i <= n && substr(tag, i, 1) ~ /[[:space:]]/) i++
+              c=substr(tag, i, 1)
+              if (c == "\"" || c == apostrophe) {
+                  quote=c
+                  i++
+                  while (i <= n && substr(tag, i, 1) != quote) i++
+                  if (i <= n) i++
+              } else {
+                  while (i <= n && substr(tag, i, 1) !~ /[[:space:]]/) i++
+              }
+          }
+          return 0
+      }
+
+      function is_void_tag(name) {
+          return name ~ /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/
+      }
+
+      function pop_from_depth(match_depth, j) {
+          for (j=depth; j>=match_depth; j--) {
+              if (hidden_stack[j]) hidden_count--
+              tag_stack[j]=""
+              hidden_stack[j]=0
+          }
+          depth=match_depth - 1
+      }
+
+      function pop_to_tag(name, match_depth, j) {
+          match_depth=0
+          for (j=depth; j>=1; j--) {
+              if (tag_stack[j] == name) {
+                  match_depth=j
+                  break
+              }
+          }
+          if (match_depth) pop_from_depth(match_depth)
+      }
+
+      function is_scope_boundary(name, scope) {
+          if (scope == "table") return name ~ /^(html|table|template)$/
+          if (name ~ /^(applet|caption|html|marquee|object|table|td|template|th)$/) return 1
+          if (scope == "list" && name ~ /^(menu|ol|ul)$/) return 1
+          if (scope == "button" && name == "button") return 1
+          return 0
+      }
+
+      function pop_to_tag_in_scope(name, scope, j, open_name) {
+          for (j=depth; j>=1; j--) {
+              open_name=tag_stack[j]
+              if (open_name == name) {
+                  pop_from_depth(j)
+                  return 1
+              }
+              if (is_scope_boundary(open_name, scope)) return 0
+          }
+          return 0
+      }
+
+      function pop_either_tag_in_scope(first, second, scope, j, open_name) {
+          for (j=depth; j>=1; j--) {
+              open_name=tag_stack[j]
+              if (open_name == first || open_name == second) {
+                  pop_from_depth(j)
+                  return 1
+              }
+              if (is_scope_boundary(open_name, scope)) return 0
+          }
+          return 0
+      }
+
+      function closes_p_on_start(name) {
+          return name ~ /^(address|article|aside|blockquote|center|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hgroup|hr|li|listing|main|menu|nav|ol|p|plaintext|pre|search|section|summary|table|ul|xmp)$/
+      }
+
+      function apply_implicit_start_rules(name) {
+          if (name ~ /^h[1-6]$/ && depth && tag_stack[depth] ~ /^h[1-6]$/) pop_from_depth(depth)
+          if (name == "dd" || name == "dt") pop_either_tag_in_scope("dd", "dt", "")
+          if (name == "td" || name == "th") pop_either_tag_in_scope("td", "th", "table")
+          if (name == "li") pop_to_tag_in_scope("li", "list")
+          if (name == "button") pop_to_tag_in_scope("button", "")
+          if (closes_p_on_start(name)) pop_to_tag_in_scope("p", "button")
+      }
+
+      function visible_html(s, n, pos, rel, start, tag_end, raw, token, closing, name_len, name, self_closing, hide, lower_tail, close_rel) {
+          n=length(s)
+          pos=1
+          while (pos <= n) {
+              rel=index(substr(s, pos), "<")
+              if (!rel) {
+                  if (!hidden_count) output=output substr(s, pos)
+                  break
+              }
+              start=pos + rel - 1
+              if (!hidden_count) output=output substr(s, pos, start - pos)
+
+              if (substr(s, start, 4) == "<!--") {
+                  close_rel=index(substr(s, start + 4), "-->")
+                  if (!close_rel) break
+                  if (!hidden_count) output=output " "
+                  pos=start + close_rel + 6
+                  continue
+              }
+
+              tag_end=find_tag_end(s, start)
+              if (!tag_end) break
+              raw=substr(s, start + 1, tag_end - start - 1)
+              token=raw
+              sub(/^[[:space:]]+/, "", token)
+              closing=(substr(token, 1, 1) == "/")
+              if (closing) sub(/^\/[[:space:]]*/, "", token)
+              if (!match(token, /^[[:alnum:]_:-]+/)) {
+                  if (!hidden_count) output=output " "
+                  pos=tag_end + 1
+                  continue
+              }
+              name_len=RLENGTH
+              name=tolower(substr(token, 1, name_len))
+
+              if (!closing && (name == "plaintext" || name == "xmp")) {
+                  apply_implicit_start_rules(name)
+                  if (!hidden_count) output=output " "
+                  hide=has_hidden_attr(token, name_len + 1)
+                  depth++
+                  tag_stack[depth]=name
+                  hidden_stack[depth]=hide
+                  if (hide) hidden_count++
+
+                  if (name == "plaintext") {
+                      if (!hidden_count) output=output substr(s, tag_end + 1)
+                      break
+                  }
+
+                  lower_tail=tolower(substr(s, tag_end + 1))
+                  if (!match(lower_tail, "</xmp[[:space:]]*>")) {
+                      if (!hidden_count) output=output substr(s, tag_end + 1)
+                      break
+                  }
+                  if (!hidden_count) output=output substr(s, tag_end + 1, RSTART - 1)
+                  pop_from_depth(depth)
+                  if (!hidden_count) output=output " "
+                  pos=tag_end + RSTART + RLENGTH
+                  continue
+              }
+
+              if (!closing && (name == "script" || name == "style")) {
+                  if (!hidden_count) output=output " "
+                  lower_tail=tolower(substr(s, tag_end + 1))
+                  if (!match(lower_tail, "</" name "[[:space:]]*>")) break
+                  pos=tag_end + RSTART + RLENGTH
+                  continue
+              }
+
+              if (closing) {
+                  if (name == "li") pop_to_tag_in_scope("li", "list")
+                  else if (name == "p") pop_to_tag_in_scope("p", "button")
+                  else if (name == "button") pop_to_tag_in_scope("button", "")
+                  else pop_to_tag_in_scope(name, "")
+                  if (!hidden_count) output=output " "
+                  pos=tag_end + 1
+                  continue
+              }
+
+              apply_implicit_start_rules(name)
+              if (!hidden_count) output=output " "
+              self_closing=is_void_tag(name)
+              hide=(name == "template" || name == "noscript" || has_hidden_attr(token, name_len + 1))
+              if (!self_closing) {
+                  depth++
+                  tag_stack[depth]=name
+                  hidden_stack[depth]=hide
+                  if (hide) hidden_count++
+              }
+              pos=tag_end + 1
+          }
+          return output
+      }
+
+      BEGIN { apostrophe=sprintf("%c", 39) }
+      { html=html $0 "\n" }
+      END {
+          html=visible_html(html)
+          gsub(/&([nN][bB][sS][pP]|[tT][aA][bB]|[nN][eE][wW][lL][iI][nN][eE]);/, " ", html)
+          gsub(/&#(9|10|13|32|160);|&#[xX](9|[aA]|[dD]|20|[aA]0);/, " ", html)
+          gsub(/[[:space:]]+/, " ", html)
+          sub(/^[[:space:]]+/, "", html)
+          sub(/[[:space:]]+$/, "", html)
+          print html
+      }
+    ' "$input"
+}
+
 check_unlock_gemini() {
-    local proxy="$1" result meta code effective
+    local proxy="$1" result meta code effective visible
     WARP_UNLOCK_STATUS='检测失败'
     result=$(mktemp) || return 2
     if ! meta=$(curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
@@ -11036,12 +11366,23 @@ check_unlock_gemini() {
         rm -f -- "$result"; return 2
     fi
     IFS=$'\t' read -r code effective <<< "$meta"
-    if grep -qiE 'not (currently )?available in your country|unsupported country|isn.t available' "$result"; then
+    visible=$(extract_html_visible_text "$result") || { rm -f -- "$result"; return 2; }
+    if grep -qiE 'not[[:space:]]+(currently[[:space:]]+)?(available|supported)[[:space:]]+in[[:space:]]+your[[:space:]]+(country|region|location)|unsupported[[:space:]]+(country|region|location)|isn[^[:space:]]*[[:space:]]+(currently[[:space:]]+)?(available|supported)|(is[[:space:]]+)?unavailable[[:space:]]+in[[:space:]]+(this|your)[[:space:]]+(country|region|location)' <<< "$visible"; then
         rm -f -- "$result"
         WARP_UNLOCK_STATUS='受限'; return 1
     fi
+    if grep -qiE 'temporarily[[:space:]]+unavailable|service[[:space:]]+unavailable|internal[[:space:]]+server[[:space:]]+error|something[[:space:]]+went[[:space:]]+wrong|try[[:space:]]+again[[:space:]]+later|maintenance' <<< "$visible"; then
+        rm -f -- "$result"; return 2
+    fi
     if [ "$code" = 200 ] && [[ "$effective" =~ ^https://gemini\.google\.com(/|$) ]] && \
       grep -Fq '45631641,null,true' "$result"; then
+        rm -f -- "$result"
+        WARP_UNLOCK_STATUS='网络/地区可用'; return 0
+    fi
+    if [ "$code" = 200 ] && [[ "$effective" =~ ^https://gemini\.google\.com(/|$) ]] && \
+      grep -Eqi '<title[^>]*>[^<]*Gemini[^<]*</title>' "$result" && \
+      grep -Fq '/_/BardChatUi/' "$result" && \
+      grep -Eq 'AF_initDataCallback\(\{[^}]*data:[[:space:]]*\[[[:space:]]*[^][:space:]]' "$result"; then
         rm -f -- "$result"
         WARP_UNLOCK_STATUS='网络/地区可用'; return 0
     fi
@@ -11089,23 +11430,40 @@ probe_active_warp() {
     return "$rc"
 }
 
+remove_warp_activation_backup() {
+    rm -rf -- "$1"
+}
+
 activate_warp_candidate() {
     local candidate_dir="$1" state_dir="${conf_dir}/warp" endpoint_file="${conf_dir}/endpoints.json"
     local expected_ip="${2:-}" strict_selection="${3:-}" endpoint_json backup_dir endpoint_tmp
+    local cleanup_incomplete=false
     endpoint_json=$(extract_warp_endpoint "${candidate_dir}/endpoint.json" 2>/dev/null || true)
     warp_endpoint_is_valid "$endpoint_json" || return 1
     backup_dir=$(mktemp -d "${conf_dir}/.warp-activate.XXXXXX") || return 1
     chmod 700 "$backup_dir"
-    cp -p "$endpoint_file" "$backup_dir/endpoints.json" || { rm -rf -- "$backup_dir"; return 1; }
+    cp -p "$endpoint_file" "$backup_dir/endpoints.json" || {
+        remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
+        return 1
+    }
     if [ -s "$state_dir/account.json" ]; then
-        cp -p "$state_dir/account.json" "$backup_dir/account.json" || { rm -rf -- "$backup_dir"; return 1; }
+        cp -p "$state_dir/account.json" "$backup_dir/account.json" || {
+            remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
+            return 1
+        }
         : > "$backup_dir/had-account"
     fi
     if [ -s "$state_dir/endpoint.json" ]; then
-        cp -p "$state_dir/endpoint.json" "$backup_dir/endpoint.json" || { rm -rf -- "$backup_dir"; return 1; }
+        cp -p "$state_dir/endpoint.json" "$backup_dir/endpoint.json" || {
+            remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
+            return 1
+        }
         : > "$backup_dir/had-endpoint"
     fi
-    endpoint_tmp=$(mktemp "${conf_dir}/.endpoints.activate.XXXXXX") || { rm -rf -- "$backup_dir"; return 1; }
+    endpoint_tmp=$(mktemp "${conf_dir}/.endpoints.activate.XXXXXX") || {
+        remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
+        return 1
+    }
     if ! jq --argjson endpoint "$endpoint_json" '.endpoints=([.endpoints[]?|select(.tag!="wireguard-out")]+[$endpoint])' \
       "$endpoint_file" > "$endpoint_tmp" || ! install -m 600 "${candidate_dir}/account.json" "$state_dir/account.json" || \
       ! install -m 600 "${candidate_dir}/endpoint.json" "$state_dir/endpoint.json" || ! chmod 600 "$endpoint_tmp" || \
@@ -11120,19 +11478,31 @@ activate_warp_candidate() {
         restart_singbox_checked >/dev/null 2>&1 || rollback_ok=false
         singbox_service_is_active || rollback_ok=false
         if [ "$rollback_ok" = true ]; then
-            rm -rf -- "$backup_dir"
+            remove_warp_activation_backup "$backup_dir" || yellow "回滚已完成，但激活备份目录清理失败，已保留: ${backup_dir}"
             return 1
         fi
-        WARP_KEEP_FAILED_CANDIDATE=true
         red "严重错误：旧 WARP 配置恢复不完整，已停止后续操作。"
         red "保留恢复目录: ${backup_dir}"
         return 2
     fi
-    write_warp_status_cache
+    write_warp_status_cache || yellow "WARP 状态缓存写入失败，不影响已提交的新身份。"
     if [ -e "$backup_dir/had-account" ]; then
-        delete_warp_registration "$backup_dir/account.json" || yellow "旧 WARP 云端设备未能自动清理，可稍后重试。"
+        if ! delete_warp_registration "$backup_dir/account.json"; then
+            cleanup_incomplete=true
+            yellow "旧 WARP 云端设备未能自动清理，恢复凭据已保留。"
+        fi
     fi
-    rm -rf -- "$backup_dir"
+    if [ "$cleanup_incomplete" = true ]; then
+        red "新 WARP 身份已提交，但旧设备清理未完成。"
+        red "保留恢复目录: ${backup_dir}"
+        return 3
+    fi
+    if ! remove_warp_activation_backup "$backup_dir"; then
+        red "新 WARP 身份已提交，但激活备份目录清理失败。"
+        red "保留恢复目录: ${backup_dir}"
+        return 3
+    fi
+    return 0
 }
 
 verify_activated_warp() {
@@ -11184,77 +11554,189 @@ stop_singbox_checked() {
     fi
 }
 
+remove_warp_candidate_dir() {
+    rm -rf -- "$1"
+}
+
 rotate_warp_identity_once() {
-    local old_ip candidate_dir candidate_endpoint new_ip activate_rc
+    local old_ip candidate_dir candidate_endpoint new_ip activate_rc generate_rc attempt
+    local proxy_started probe_ok
+    local failed_candidates=0 same_ip_candidates=0
+    local WARP_MAX_CANDIDATES=5
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
         red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
     }
-    probe_active_warp && old_ip="$WARP_PROBE_IP" || old_ip=''
-    candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
-    chmod 700 "$candidate_dir"
-    if ! generate_unique_warp_identity "$candidate_dir"; then rm -rf -- "$candidate_dir"; return 1; fi
-    candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
-    if ! start_warp_candidate_proxy "$candidate_endpoint" || ! probe_warp_trace "$WARP_PROBE_PROXY"; then
-        stop_warp_candidate_proxy; delete_warp_registration "$candidate_dir/account.json" || true
-        rm -rf -- "$candidate_dir"; return 1
+    if ! probe_active_warp; then
+        red "无法取得当前 WARP 出口 IP，已停止更换。"
+        return 1
     fi
-    new_ip="$WARP_PROBE_IP"; stop_warp_candidate_proxy
-    WARP_KEEP_FAILED_CANDIDATE=false
-    activate_warp_candidate "$candidate_dir" "$new_ip"
-    activate_rc=$?
-    if [ "$activate_rc" -eq 0 ]; then
-        rm -rf -- "$candidate_dir"
-        green "WARP 身份已更换：${old_ip:-未知} -> ${new_ip}"
-        [ "$old_ip" = "$new_ip" ] && yellow "Cloudflare 分配的公网出口 IP 未变化。"
-        return 0
+    old_ip="$WARP_PROBE_IP"
+    for ((attempt=1; attempt<=WARP_MAX_CANDIDATES; attempt++)); do
+        candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
+        chmod 700 "$candidate_dir"
+        if generate_unique_warp_identity "$candidate_dir"; then generate_rc=0; else generate_rc=$?; fi
+        if [ "$generate_rc" -ne 0 ]; then
+            if [ "$generate_rc" -eq 2 ]; then
+                red "候选 WARP 注册状态不确定或云端清理失败，已停止更换。"
+                red "候选凭据保留在: ${candidate_dir}"
+                return 2
+            fi
+            failed_candidates=$((failed_candidates + 1))
+            if ! remove_warp_candidate_dir "$candidate_dir"; then
+                red "候选本地文件清理失败，已停止更换。"
+                red "候选凭据保留在: ${candidate_dir}"
+                return 2
+            fi
+            [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
+            continue
+        fi
+        candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
+        proxy_started=false
+        probe_ok=false
+        if start_warp_candidate_proxy "$candidate_endpoint"; then
+            proxy_started=true
+            probe_warp_trace "$WARP_PROBE_PROXY" && probe_ok=true
+        fi
+        if [ "$probe_ok" != true ]; then
+            [ "$proxy_started" = true ] && stop_warp_candidate_proxy
+            if ! delete_warp_registration "$candidate_dir/account.json"; then
+                red "候选 WARP 云端设备清理失败，已停止更换。"
+                red "候选凭据保留在: ${candidate_dir}"
+                return 2
+            fi
+            if ! remove_warp_candidate_dir "$candidate_dir"; then
+                red "候选本地文件清理失败，已停止更换。"
+                red "候选凭据保留在: ${candidate_dir}"
+                return 2
+            fi
+            failed_candidates=$((failed_candidates + 1))
+            [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
+            continue
+        fi
+        new_ip="$WARP_PROBE_IP"; stop_warp_candidate_proxy
+        if [ "$old_ip" = "$new_ip" ]; then
+            same_ip_candidates=$((same_ip_candidates + 1))
+            yellow "候选 ${attempt}/${WARP_MAX_CANDIDATES} 的 Cloudflare WARP 出口仍为 ${new_ip}，继续尝试。"
+            if ! delete_warp_registration "$candidate_dir/account.json"; then
+                red "候选 WARP 云端设备清理失败，已停止更换。"
+                red "候选凭据保留在: ${candidate_dir}"
+                return 2
+            fi
+            if ! remove_warp_candidate_dir "$candidate_dir"; then
+                red "候选本地文件清理失败，已停止更换。"
+                red "候选凭据保留在: ${candidate_dir}"
+                return 2
+            fi
+            [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
+            continue
+        fi
+        if activate_warp_candidate "$candidate_dir" "$new_ip"; then activate_rc=0; else activate_rc=$?; fi
+        if [ "$activate_rc" -eq 0 ] || [ "$activate_rc" -eq 3 ]; then
+            if ! remove_warp_candidate_dir "$candidate_dir"; then
+                yellow "新 WARP 身份已提交，但候选本地副本清理失败。"
+                red "候选凭据保留在: ${candidate_dir}"
+            fi
+            [ "$activate_rc" -eq 3 ] && yellow "新 WARP 身份已提交，但旧凭据或临时文件清理未完成。"
+            green "WARP 身份已更换：${old_ip} -> ${new_ip}"
+            return 0
+        fi
+        if [ "$activate_rc" -eq 2 ]; then
+            red "候选凭据保留在: ${candidate_dir}"
+            return 2
+        fi
+        if ! delete_warp_registration "$candidate_dir/account.json"; then
+            red "候选 WARP 云端设备清理失败，已停止更换。"
+            red "候选凭据保留在: ${candidate_dir}"
+            return 2
+        fi
+        if ! remove_warp_candidate_dir "$candidate_dir"; then
+            red "候选本地文件清理失败，已停止更换。"
+            red "候选凭据保留在: ${candidate_dir}"
+            return 2
+        fi
+        return 1
+    done
+    if [ "$same_ip_candidates" -gt 0 ]; then
+        red "未获得不同的 Cloudflare WARP 出口 IP，原 WARP 身份保持不变。"
+    else
+        red "候选均在生成或探测阶段失败，原 WARP 身份保持不变。"
     fi
-    if [ "$activate_rc" -eq 2 ]; then
-        red "候选凭据保留在: ${candidate_dir}"
-        return 2
-    fi
-    delete_warp_registration "$candidate_dir/account.json" || true
-    rm -rf -- "$candidate_dir"; return 1
+    return 1
 }
 
 auto_select_warp_candidate() {
-    local selection="${1:-1234}" active_ip candidate_dir candidate_endpoint attempt candidate_ip activate_rc
+    local selection="${1:-1234}" active_ip candidate_dir candidate_endpoint attempt candidate_ip activate_rc generate_rc
+    local proxy_started probe_ok
     local WARP_MAX_CANDIDATES=5
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
         red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
     }
     probe_active_warp && active_ip="$WARP_PROBE_IP" || { red "无法取得当前 WARP 出口 IP，已停止优选。"; return 1; }
     for ((attempt=1; attempt<=WARP_MAX_CANDIDATES; attempt++)); do
-        WARP_KEEP_FAILED_CANDIDATE=false
         yellow "正在测试候选 ${attempt}/${WARP_MAX_CANDIDATES}..."
         candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
         chmod 700 "$candidate_dir"
-        if generate_unique_warp_identity "$candidate_dir"; then
-            candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
-            if start_warp_candidate_proxy "$candidate_endpoint" && probe_warp_trace "$WARP_PROBE_PROXY"; then
-                if [ -n "$active_ip" ] && [ "$WARP_PROBE_IP" = "$active_ip" ]; then
-                    yellow "候选出口仍为 ${WARP_PROBE_IP}，继续。"
-                elif run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then
-                    printf '%s' "$WARP_UNLOCK_SUMMARY"
-                    candidate_ip="$WARP_PROBE_IP"
-                    stop_warp_candidate_proxy
-                    activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection"
-                    activate_rc=$?
-                    if [ "$activate_rc" -eq 0 ]; then
-                        rm -rf -- "$candidate_dir"; green "已启用新的 WARP 出口 ${candidate_ip}"; return 0
-                    fi
-                    if [ "$activate_rc" -eq 2 ]; then
-                        red "候选凭据保留在: ${candidate_dir}"
-                        red "因回滚不完整，自动优选已立即停止。"
-                        return 2
-                    fi
-                else
-                    printf '%s' "$WARP_UNLOCK_SUMMARY"
-                fi
-            fi
-            stop_warp_candidate_proxy
-            delete_warp_registration "$candidate_dir/account.json" || yellow "候选云端设备清理失败。"
+        if generate_unique_warp_identity "$candidate_dir"; then generate_rc=0; else generate_rc=$?; fi
+        if [ "$generate_rc" -eq 2 ]; then
+            red "候选 WARP 注册状态不确定或云端清理失败，自动优选已立即停止。"
+            red "候选凭据保留在: ${candidate_dir}"
+            return 2
         fi
-        rm -rf -- "$candidate_dir"
+        if [ "$generate_rc" -ne 0 ]; then
+            if ! remove_warp_candidate_dir "$candidate_dir"; then
+                red "候选本地文件清理失败，自动优选已立即停止。"
+                red "候选凭据保留在: ${candidate_dir}"
+                return 2
+            fi
+            [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
+            continue
+        fi
+
+        candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
+        proxy_started=false
+        probe_ok=false
+        if start_warp_candidate_proxy "$candidate_endpoint"; then
+            proxy_started=true
+            probe_warp_trace "$WARP_PROBE_PROXY" && probe_ok=true
+        fi
+        if [ "$probe_ok" = true ]; then
+            if [ -n "$active_ip" ] && [ "$WARP_PROBE_IP" = "$active_ip" ]; then
+                yellow "候选出口仍为 ${WARP_PROBE_IP}，继续。"
+            elif run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then
+                printf '%s' "$WARP_UNLOCK_SUMMARY"
+                candidate_ip="$WARP_PROBE_IP"
+                stop_warp_candidate_proxy
+                proxy_started=false
+                if activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection"; then activate_rc=0; else activate_rc=$?; fi
+                if [ "$activate_rc" -eq 0 ] || [ "$activate_rc" -eq 3 ]; then
+                    if ! remove_warp_candidate_dir "$candidate_dir"; then
+                        yellow "新 WARP 身份已提交，但候选本地副本清理失败。"
+                        red "候选凭据保留在: ${candidate_dir}"
+                    fi
+                    [ "$activate_rc" -eq 3 ] && yellow "新 WARP 身份已提交，但旧凭据或临时文件清理未完成。"
+                    green "已启用新的 WARP 出口 ${candidate_ip}"
+                    return 0
+                fi
+                if [ "$activate_rc" -eq 2 ]; then
+                    red "候选凭据保留在: ${candidate_dir}"
+                    red "因回滚不完整，自动优选已立即停止。"
+                    return 2
+                fi
+            else
+                printf '%s' "$WARP_UNLOCK_SUMMARY"
+            fi
+        fi
+        [ "$proxy_started" = true ] && stop_warp_candidate_proxy
+        if ! delete_warp_registration "$candidate_dir/account.json"; then
+            red "候选 WARP 云端设备清理失败，自动优选已立即停止。"
+            red "候选凭据保留在: ${candidate_dir}"
+            return 2
+        fi
+        if ! remove_warp_candidate_dir "$candidate_dir"; then
+            red "候选本地文件清理失败，自动优选已立即停止。"
+            red "候选凭据保留在: ${candidate_dir}"
+            return 2
+        fi
         [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
     done
     red "未找到满足条件的新出口，原 WARP 身份保持不变。"
@@ -12556,6 +13038,28 @@ native_ipv6_available() {
     [ -n "$native_ipv6" ]
 }
 
+dispatch_warp_rotation_menu_action() {
+    local rotate_rc
+    if rotate_warp_identity_once; then
+        return 0
+    else
+        rotate_rc=$?
+    fi
+    case "$rotate_rc" in
+      1)
+        red "WARP 身份更换失败，原配置保持不变。"
+        ;;
+      2)
+        red "WARP 身份更换未安全完成：回滚或状态不完整。"
+        red "请停止使用自动结论，并按上方提示的恢复目录处理。"
+        ;;
+      *)
+        red "WARP 身份更换返回未知状态 ${rotate_rc}，请检查上方日志后再处理。"
+        ;;
+    esac
+    return "$rotate_rc"
+}
+
 # WARP 分流管理
 warp_manage() {
     check_singbox &>/dev/null
@@ -12614,7 +13118,7 @@ warp_manage() {
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
         5)  clear; show_warp_status_and_unlocks; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
-        6)  clear; rotate_warp_identity_once || red "WARP 身份更换失败，原配置未改变。"; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
+        6)  clear; dispatch_warp_rotation_menu_action || true; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
         7)
             clear
             green "选择需要严格解锁的平台（可多选，如 134，回车默认 1234）:"
