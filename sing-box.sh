@@ -694,9 +694,44 @@ check_nginx() {
     check_service "nginx" "$(command -v nginx)"
 }
 
+# Query package ownership independently from executable discovery.  Return 0
+# for installed, 1 for definitely absent, and 2 when the package database
+# cannot be queried safely.
+package_is_installed() {
+    local package="${1:-}"
+    local query_output='' query_status=0
+
+    [ -n "$package" ] || return 2
+    if command_exists apt; then
+        command_exists dpkg-query || return 2
+        query_output=$(dpkg-query -W -f='${Status}\n' -- "$package" 2>/dev/null) || query_status=$?
+        case "$query_status" in
+            0) [ "$query_output" = 'install ok installed' ] && return 0; return 2 ;;
+            1) return 1 ;;
+            *) return 2 ;;
+        esac
+    elif command_exists dnf || command_exists yum; then
+        command_exists rpm || return 2
+        rpm -q -- "$package" >/dev/null 2>&1 || query_status=$?
+        case "$query_status" in
+            0) return 0 ;;
+            1) return 1 ;;
+            *) return 2 ;;
+        esac
+    elif command_exists apk; then
+        apk info -e "$package" >/dev/null 2>&1 || query_status=$?
+        case "$query_status" in
+            0) return 0 ;;
+            1) return 1 ;;
+            *) return 2 ;;
+        esac
+    fi
+    return 2
+}
+
 # 根据系统类型安装、卸载依赖
 manage_packages() {
-    local action package
+    local action package package_status
 
     if [ $# -lt 2 ]; then
         red "Unspecified package name or action"
@@ -744,19 +779,31 @@ manage_packages() {
                 return 1
             fi
         elif [ "$action" == "uninstall" ]; then
-            if ! command_exists "$package"; then
-                yellow "${package} is not installed"
-                continue
+            if package_is_installed "$package"; then
+                package_status=0
+            else
+                package_status=$?
             fi
+            case "$package_status" in
+                0) ;;
+                1)
+                    yellow "${package} is not installed"
+                    continue
+                    ;;
+                *)
+                    red "无法可靠查询 ${package} 的安装状态；已中止卸载。"
+                    return 1
+                    ;;
+            esac
             yellow "正在卸载 ${package}..."
             if command_exists apt; then
-                apt remove -y "$package" && apt autoremove -y
+                apt remove -y "$package" || return 1
             elif command_exists dnf; then
-                dnf remove -y "$package" && dnf autoremove -y
+                dnf remove -y "$package" || return 1
             elif command_exists yum; then
-                yum remove -y "$package" && yum autoremove -y
+                yum remove -y "$package" || return 1
             elif command_exists apk; then
-                apk del "$package"
+                apk del "$package" || return 1
             else
                 red "Unknown system!"
                 return 1
@@ -1076,7 +1123,7 @@ extract_argo_tunnel_id() {
 is_argo_hostname() {
     local hostname="$1"
 
-    [[ "$hostname" =~ ^[A-Za-z0-9.-]+$ ]] && [[ "$hostname" == *.* ]] && [[ "$hostname" != .* ]] && [[ "$hostname" != *..* ]]
+    [[ ! "$hostname" =~ ^[0-9.]+$ ]] && is_valid_subscription_domain "$hostname"
 }
 
 is_argo_tunnel_token() {
@@ -5067,47 +5114,31 @@ commit_subscription_frontend_state_transaction() {
 }
 
 add_nginx_conf() {
-    local http_end_line
     local main_conf="${NGINX_MAIN_CONF:-/etc/nginx/nginx.conf}"
     local nginx_conf_dir="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
-    local backup_file="${main_conf}.bak.sb"
+    local backup_file
 
     command_exists nginx || { red "nginx未安装，无法配置订阅服务"; return 1; }
     mkdir -p "$nginx_conf_dir" || return 1
-
-    if [ -f "$main_conf" ]; then
-        cp "$main_conf" "$backup_file" > /dev/null 2>&1 || return 1
-        chmod 600 "$backup_file" 2>/dev/null || return 1
-        sed -i -e '15{/include \/etc\/nginx\/modules\/\*\.conf/d;}' \
-               -e '18{/include \/etc\/nginx\/conf\.d\/\*\.conf/d;}' "$main_conf" > /dev/null 2>&1 || return 1
-        if ! grep -q "include.*conf.d" "$main_conf"; then
-            http_end_line=$(grep -n "^}" "$main_conf" | tail -1 | cut -d: -f1)
-            [ -n "$http_end_line" ] || return 1
-            sed -i "${http_end_line}i \    include ${nginx_conf_dir}/*.conf;" "$main_conf" > /dev/null 2>&1 || return 1
-        fi
-    else
-        cat > "$main_conf" << EOF || return 1
-user nginx;
-worker_processes auto;
-error_log /var/log/nginx/error.log;
-pid /run/nginx.pid;
-
-events { worker_connections 1024; }
-
-http {
-    include       /etc/nginx/mime.types;
-    default_type  application/octet-stream;
-    sendfile        on;
-    keepalive_timeout  65;
-    include ${nginx_conf_dir}/*.conf;
-}
-EOF
-    fi
+    [ -f "$main_conf" ] && [ ! -L "$main_conf" ] || {
+        red "Nginx 主配置不存在或不安全，拒绝自动创建/覆盖。"
+        return 1
+    }
+    backup_file=$(mktemp "$(dirname "$main_conf")/.nginx-main-backup.XXXXXX") || return 1
+    cp -p "$main_conf" "$backup_file" || { rm -f "$backup_file"; return 1; }
+    ensure_nginx_conf_d_include "$main_conf" "$nginx_conf_dir" || {
+        rm -f "$backup_file"
+        red "无法安全接入 Nginx conf.d，主配置保持不变。"
+        return 1
+    }
 
     if apply_nginx_subscription_config "$nginx_port" "/$password" ""; then
+        rm -f "$backup_file"
         green "nginx订阅配置已加载"
     else
-        red "nginx订阅配置测试失败，已保留或恢复原配置"
+        mv -f "$backup_file" "$main_conf" || \
+            red "Nginx 主配置回滚失败，备份保留在：$backup_file"
+        red "nginx订阅配置测试失败，已恢复原配置"
         return 1
     fi
 }
@@ -5298,7 +5329,7 @@ update_public_inbound_port() {
 get_uniform_inbound_port() {
     local target_file="$1"
     local protocol="$2"
-    local port
+    local port selector
 
     port=$(jq -er --arg protocol "$protocol" '
         [.inbounds[] |
@@ -5314,7 +5345,7 @@ get_uniform_inbound_port() {
         then $ports[0]
         else empty
         end
-    ' "$target_file") || return 1
+    " "$target_file") || return 1
     validate_port_value "$port" "${protocol}_port" || return 1
     printf '%s\n' "$port"
 }
@@ -5712,6 +5743,43 @@ purge_nginx_package() {
     manage_packages uninstall "$package"
 }
 
+# Return success only when an exact executable owned by this installation is
+# still running.  Process names alone are intentionally insufficient: another
+# user's "sing-box" or "nginx" process must never influence our lifecycle.
+managed_service_process_is_running() {
+    local service_name="$1"
+    local target_work_dir="${2:-$work_dir}"
+    local install_root="${3:-}"
+    local expected_executable='' process_executable
+
+    case "$service_name" in
+        sing-box) expected_executable="${target_work_dir}/sing-box" ;;
+        argo)     expected_executable="${target_work_dir}/argo" ;;
+        nginx)
+            if [ -n "$install_root" ]; then
+                for expected_executable in \
+                    "${install_root}/usr/sbin/nginx" \
+                    "${install_root}/usr/local/sbin/nginx" \
+                    "${install_root}/usr/bin/nginx"; do
+                    [ -x "$expected_executable" ] && break
+                    expected_executable=''
+                done
+            else
+                expected_executable=$(command -v nginx 2>/dev/null) || return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+
+    [ -n "$expected_executable" ] || return 1
+    expected_executable=$(readlink -f -- "$expected_executable" 2>/dev/null) || return 1
+    for process_executable in /proc/[0-9]*/exe; do
+        [ -e "$process_executable" ] || continue
+        [ "$(readlink -f -- "$process_executable" 2>/dev/null)" = "$expected_executable" ] && return 0
+    done
+    return 1
+}
+
 remove_managed_singbox_link() {
     local install_root="${1:-}"
     local managed_link link_target
@@ -5724,15 +5792,592 @@ remove_managed_singbox_link() {
         link_target=$(readlink "$managed_link" 2>/dev/null) || continue
         case "$link_target" in
             /etc/sing-box/sb.sh|/etc/sing-box/sing-box)
-                rm -f "$managed_link"
+                rm -f "$managed_link" || return 1
                 ;;
         esac
     done
 }
 
+perform_singbox_uninstall() {
+    local uninstall_root="${1:-}"
+    local purge_nginx="${2:-0}"
+    local target_work_dir init_system='' service_name definition
+    local systemd_dir="${uninstall_root}/etc/systemd/system"
+    local openrc_dir="${uninstall_root}/etc/init.d"
+    local nginx_main="${uninstall_root}/etc/nginx/nginx.conf"
+    local nginx_conf_dir="${uninstall_root}/etc/nginx/conf.d"
+    local nginx_conf="${nginx_conf_dir}/sing-box.conf"
+    local nginx_conf_existed=0 nginx_changed=0 nginx_package_present=0
+    local definitions_present=0
+    local sing_definition_present=0 argo_definition_present=0 nginx_definition_present=0
+    local selected_sing_definition=0 selected_argo_definition=0 selected_nginx_definition=0
+    local quiesce_failed=0 rollback_incomplete=0 service_active_now=0 service_enabled_now=0
+    local recovery_dir='' recovery_parent='' recovery_state_file='' i
+    local transaction_dir='' transaction_parent='' transaction_parent_created=0
+    local transaction_failed=0 transaction_uncertain=0 rollback_ok=1
+    local recovery_base='' recovery_reason='' snapshot_path='' snapshot_key='' old_nat_state=''
+    local -a quiesce_services=() service_was_active=() service_was_enabled=()
+    local -a service_was_stopped=() service_was_disabled=()
+    local -a snapshot_paths=() snapshot_keys=()
+
+    [[ "$purge_nginx" == 0 || "$purge_nginx" == 1 ]] || return 1
+    if [ -n "$uninstall_root" ]; then
+        case "$work_dir" in
+            "$uninstall_root"/*) target_work_dir="$work_dir" ;;
+            /*) target_work_dir="${uninstall_root}${work_dir}" ;;
+            *) target_work_dir="${uninstall_root}/${work_dir}" ;;
+        esac
+    else
+        target_work_dir="$work_dir"
+    fi
+    [ -n "$target_work_dir" ] && [ "$target_work_dir" != / ] || return 1
+    if [ "$purge_nginx" -eq 1 ]; then
+        if declare -F package_is_installed >/dev/null 2>&1; then
+            if package_is_installed nginx; then
+                nginx_package_present=1
+            else
+                case "$?" in
+                    1) nginx_package_present=0 ;;
+                    *)
+                        red "无法可靠查询 Nginx 软件包状态；卸载尚未开始。"
+                        return 1
+                        ;;
+                esac
+            fi
+        elif command_exists nginx; then
+            # Isolated function tests may source this function without the
+            # package helper; production always uses the native query above.
+            nginx_package_present=1
+        fi
+    fi
+
+    for definition in "${systemd_dir}/sing-box.service" "${openrc_dir}/sing-box"; do
+        [ -e "$definition" ] && sing_definition_present=1
+    done
+    for definition in "${systemd_dir}/argo.service" "${openrc_dir}/argo"; do
+        [ -e "$definition" ] && argo_definition_present=1
+    done
+    for definition in \
+        "${systemd_dir}/nginx.service" \
+        "${uninstall_root}/lib/systemd/system/nginx.service" \
+        "${uninstall_root}/usr/lib/systemd/system/nginx.service" \
+        "${openrc_dir}/nginx"; do
+        [ -e "$definition" ] && nginx_definition_present=1
+    done
+    [ "$sing_definition_present" -eq 1 ] && definitions_present=1
+    [ "$argo_definition_present" -eq 1 ] && definitions_present=1
+
+    # Unit-less exact managed processes are an unsafe, unknowable state.  This
+    # inventory is deliberately completed before init calls or file mutation.
+    if [ "$sing_definition_present" -eq 0 ] && \
+       declare -F managed_service_process_is_running >/dev/null 2>&1 && \
+       managed_service_process_is_running sing-box "$target_work_dir" "$uninstall_root"; then
+        red "检测到无服务单元的 sing-box 受管进程；卸载已中止。"
+        return 1
+    fi
+    if [ "$argo_definition_present" -eq 0 ] && \
+       declare -F managed_service_process_is_running >/dev/null 2>&1 && \
+       managed_service_process_is_running argo "$target_work_dir" "$uninstall_root"; then
+        red "检测到无服务单元的 Argo 受管进程；卸载已中止。"
+        return 1
+    fi
+    if [ "$purge_nginx" -eq 1 ] && [ "$nginx_definition_present" -eq 0 ] && \
+       declare -F managed_service_process_is_running >/dev/null 2>&1 && \
+       managed_service_process_is_running nginx "$target_work_dir" "$uninstall_root"; then
+        red "检测到无服务单元的 Nginx 进程；拒绝卸载 Nginx。"
+        return 1
+    fi
+
+    if [ "$definitions_present" -eq 1 ] || \
+       { [ "$purge_nginx" -eq 1 ] && [ "$nginx_definition_present" -eq 1 ]; }; then
+        init_system=$(detect_usable_init_system 2>/dev/null) || {
+            red "仍有受管服务需要停止，但当前 init 系统不可用；卸载已中止。"
+            return 1
+        }
+    fi
+
+    case "$init_system" in
+        systemd)
+            [ -e "${systemd_dir}/sing-box.service" ] && selected_sing_definition=1
+            [ -e "${systemd_dir}/argo.service" ] && selected_argo_definition=1
+            for definition in \
+                "${systemd_dir}/nginx.service" \
+                "${uninstall_root}/lib/systemd/system/nginx.service" \
+                "${uninstall_root}/usr/lib/systemd/system/nginx.service"; do
+                [ -e "$definition" ] && selected_nginx_definition=1
+            done
+            ;;
+        openrc)
+            [ -e "${openrc_dir}/sing-box" ] && selected_sing_definition=1
+            [ -e "${openrc_dir}/argo" ] && selected_argo_definition=1
+            [ -e "${openrc_dir}/nginx" ] && selected_nginx_definition=1
+            ;;
+    esac
+
+    # A definition for a different init implementation does not prove the
+    # process is controlled by the usable init.  Re-check that edge before any
+    # stop/disable operation.
+    if [ "$selected_sing_definition" -eq 0 ] && \
+       declare -F managed_service_process_is_running >/dev/null 2>&1 && \
+       managed_service_process_is_running sing-box "$target_work_dir" "$uninstall_root"; then
+        red "sing-box 进程不受当前 init 系统管理；卸载已中止。"
+        return 1
+    fi
+    if [ "$selected_argo_definition" -eq 0 ] && \
+       declare -F managed_service_process_is_running >/dev/null 2>&1 && \
+       managed_service_process_is_running argo "$target_work_dir" "$uninstall_root"; then
+        red "Argo 进程不受当前 init 系统管理；卸载已中止。"
+        return 1
+    fi
+    if [ "$purge_nginx" -eq 1 ] && [ "$selected_nginx_definition" -eq 0 ] && \
+       declare -F managed_service_process_is_running >/dev/null 2>&1 && \
+       managed_service_process_is_running nginx "$target_work_dir" "$uninstall_root"; then
+        red "Nginx 进程不受当前 init 系统管理；拒绝卸载 Nginx。"
+        return 1
+    fi
+
+    [ "$selected_sing_definition" -eq 1 ] && quiesce_services+=(sing-box)
+    [ "$selected_argo_definition" -eq 1 ] && quiesce_services+=(argo)
+    if [ "$purge_nginx" -eq 1 ] && [ "$selected_nginx_definition" -eq 1 ]; then
+        quiesce_services+=(nginx)
+    fi
+
+    for service_name in "${quiesce_services[@]}"; do
+        service_active_now=0
+        service_enabled_now=0
+        case "$init_system" in
+            systemd)
+                systemctl is-active --quiet "$service_name" >/dev/null 2>&1 && service_active_now=1
+                systemctl is-enabled --quiet "$service_name" >/dev/null 2>&1 && service_enabled_now=1
+                service_was_active+=("$service_active_now")
+                service_was_enabled+=("$service_enabled_now")
+                service_was_stopped+=(0)
+                service_was_disabled+=(0)
+                i=$((${#service_was_active[@]} - 1))
+                if [ "$service_active_now" -eq 1 ]; then
+                    if ! systemctl stop "$service_name" >/dev/null 2>&1; then
+                        systemctl is-active --quiet "$service_name" >/dev/null 2>&1 || service_was_stopped[$i]=1
+                        quiesce_failed=1
+                        break
+                    fi
+                    if systemctl is-active --quiet "$service_name" >/dev/null 2>&1; then
+                        quiesce_failed=1
+                        break
+                    fi
+                    service_was_stopped[$i]=1
+                fi
+                if [ "$service_enabled_now" -eq 1 ]; then
+                    if ! systemctl disable "$service_name" >/dev/null 2>&1; then
+                        systemctl is-enabled --quiet "$service_name" >/dev/null 2>&1 || service_was_disabled[$i]=1
+                        quiesce_failed=1
+                        break
+                    fi
+                    if systemctl is-enabled --quiet "$service_name" >/dev/null 2>&1; then
+                        quiesce_failed=1
+                        break
+                    fi
+                    service_was_disabled[$i]=1
+                fi
+                ;;
+            openrc)
+                rc-service "$service_name" status >/dev/null 2>&1 && service_active_now=1
+                rc-update show default 2>/dev/null | \
+                    grep -Eq "(^|[[:space:]])${service_name}([[:space:]]|$)" && service_enabled_now=1
+                service_was_active+=("$service_active_now")
+                service_was_enabled+=("$service_enabled_now")
+                service_was_stopped+=(0)
+                service_was_disabled+=(0)
+                i=$((${#service_was_active[@]} - 1))
+                if [ "$service_active_now" -eq 1 ]; then
+                    if ! rc-service "$service_name" stop >/dev/null 2>&1; then
+                        rc-service "$service_name" status >/dev/null 2>&1 || service_was_stopped[$i]=1
+                        quiesce_failed=1
+                        break
+                    fi
+                    if rc-service "$service_name" status >/dev/null 2>&1; then
+                        quiesce_failed=1
+                        break
+                    fi
+                    service_was_stopped[$i]=1
+                fi
+                if [ "$service_enabled_now" -eq 1 ]; then
+                    if ! rc-update del "$service_name" default >/dev/null 2>&1; then
+                        quiesce_failed=1
+                        break
+                    fi
+                    service_was_disabled[$i]=1
+                fi
+                ;;
+        esac
+    done
+
+    _restore_uninstall_services() {
+        local restore_index restore_service
+        local restore_status=0
+
+        for ((restore_index=${#service_was_active[@]} - 1; restore_index >= 0; restore_index--)); do
+            restore_service="${quiesce_services[$restore_index]}"
+            case "$init_system" in
+                systemd)
+                    if [ "${service_was_disabled[$restore_index]}" -eq 1 ]; then
+                        systemctl enable "$restore_service" >/dev/null 2>&1 || restore_status=1
+                        systemctl is-enabled --quiet "$restore_service" >/dev/null 2>&1 || restore_status=1
+                    fi
+                    if [ "${service_was_stopped[$restore_index]}" -eq 1 ]; then
+                        systemctl start "$restore_service" >/dev/null 2>&1 || restore_status=1
+                        systemctl is-active --quiet "$restore_service" >/dev/null 2>&1 || restore_status=1
+                    fi
+                    ;;
+                openrc)
+                    if [ "${service_was_disabled[$restore_index]}" -eq 1 ]; then
+                        rc-update add "$restore_service" default >/dev/null 2>&1 || restore_status=1
+                    fi
+                    if [ "${service_was_stopped[$restore_index]}" -eq 1 ]; then
+                        rc-service "$restore_service" start >/dev/null 2>&1 || restore_status=1
+                        rc-service "$restore_service" status >/dev/null 2>&1 || restore_status=1
+                    fi
+                    ;;
+            esac
+        done
+        return "$restore_status"
+    }
+
+    _write_uninstall_service_state_file() {
+        local state_target="$1"
+
+        {
+            printf 'INIT_SYSTEM=%q\n' "$init_system"
+            for ((i=0; i<${#service_was_active[@]}; i++)); do
+                printf 'SERVICE_%d=%q\n' "$i" "${quiesce_services[$i]}"
+                printf 'WAS_ACTIVE_%d=%q\n' "$i" "${service_was_active[$i]}"
+                printf 'WAS_ENABLED_%d=%q\n' "$i" "${service_was_enabled[$i]}"
+                printf 'STOPPED_%d=%q\n' "$i" "${service_was_stopped[$i]}"
+                printf 'DISABLED_%d=%q\n' "$i" "${service_was_disabled[$i]}"
+            done
+        } > "$state_target" || return 1
+        chmod 600 "$state_target"
+    }
+
+    _write_uninstall_service_recovery() {
+        recovery_parent="$target_work_dir"
+        if [ ! -d "$recovery_parent" ] || [ -L "$recovery_parent" ]; then
+            recovery_parent="${TMPDIR:-/tmp}"
+        fi
+        recovery_dir=$(umask 077; mktemp -d "${recovery_parent}/.uninstall-recovery.XXXXXX") || return 1
+        chmod 700 "$recovery_dir" || return 1
+        recovery_state_file="${recovery_dir}/service-state.conf"
+        _write_uninstall_service_state_file "$recovery_state_file"
+    }
+
+    if [ "$quiesce_failed" -eq 1 ]; then
+        _restore_uninstall_services || rollback_incomplete=1
+        if [ "$rollback_incomplete" -eq 0 ]; then
+            red "服务停止失败；原服务状态已恢复，卸载未开始。"
+            return 1
+        fi
+
+        if ! _write_uninstall_service_recovery; then
+            red "服务停止失败且自动回滚不完整；恢复材料创建失败，请立即检查服务状态。"
+            return 2
+        fi
+        red "服务停止失败且自动回滚不完整；恢复材料已保留：${recovery_dir}"
+        return 2
+    fi
+
+    _snapshot_uninstall_path() {
+        local source_path="$1"
+        local source_key="$2"
+
+        if [ -e "$source_path" ] || [ -L "$source_path" ]; then
+            cp -a -- "$source_path" "${transaction_dir}/${source_key}" || return 1
+            : > "${transaction_dir}/${source_key}.present" || return 1
+            chmod 600 "${transaction_dir}/${source_key}.present" || return 1
+        else
+            : > "${transaction_dir}/${source_key}.absent" || return 1
+            chmod 600 "${transaction_dir}/${source_key}.absent" || return 1
+        fi
+    }
+
+    _restore_uninstall_path() {
+        local destination_path="$1"
+        local source_key="$2"
+
+        if [ -e "${transaction_dir}/${source_key}.present" ]; then
+            if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
+                rm -rf -- "$destination_path" || return 1
+            fi
+            mkdir -p -- "$(dirname "$destination_path")" || return 1
+            cp -a -- "${transaction_dir}/${source_key}" "$destination_path" || return 1
+        elif [ -e "${transaction_dir}/${source_key}.absent" ]; then
+            if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
+                rm -rf -- "$destination_path" || return 1
+            fi
+        else
+            return 1
+        fi
+    }
+
+    _cleanup_uninstall_transaction() {
+        local cleanup_status=0
+
+        if [ -n "$transaction_dir" ] && { [ -e "$transaction_dir" ] || [ -L "$transaction_dir" ]; }; then
+            rm -rf -- "$transaction_dir" || cleanup_status=1
+        fi
+        if [ "$transaction_parent_created" -eq 1 ] && [ -d "$transaction_parent" ]; then
+            rmdir -- "$transaction_parent" 2>/dev/null || cleanup_status=1
+        fi
+        return "$cleanup_status"
+    }
+
+    _retain_uninstall_transaction() {
+        local reason="$1"
+        local retained_ok=1
+
+        recovery_base="${uninstall_root}/var/lib/sing-box-uninstall"
+        [ -n "$uninstall_root" ] || recovery_base='/var/lib/sing-box-uninstall'
+        if ! mkdir -p -- "$recovery_base" || ! chmod 700 "$recovery_base"; then
+            recovery_dir="$transaction_dir"
+        else
+            recovery_dir=$(umask 077; mktemp -d "${recovery_base}/.uninstall-recovery.XXXXXX") || \
+                recovery_dir="$transaction_dir"
+        fi
+        if [ "$recovery_dir" != "$transaction_dir" ]; then
+            chmod 700 "$recovery_dir" || retained_ok=0
+            cp -a -- "${transaction_dir}/." "$recovery_dir/" || retained_ok=0
+            if [ "$retained_ok" -eq 1 ]; then
+                rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                transaction_dir="$recovery_dir"
+            else
+                recovery_dir="$transaction_dir"
+            fi
+        fi
+        printf 'REASON=%q\n' "$reason" > "${recovery_dir}/recovery.conf" 2>/dev/null || true
+        chmod 600 "${recovery_dir}/recovery.conf" 2>/dev/null || true
+    }
+
+    _rollback_uninstall_transaction() {
+        local rollback_uncertain="${1:-0}"
+        local rollback_reason="$2"
+        local rollback_index
+        local -a rollback_nat_records=()
+
+        rollback_ok=1
+        for ((rollback_index=0; rollback_index<${#snapshot_paths[@]}; rollback_index++)); do
+            _restore_uninstall_path \
+                "${snapshot_paths[$rollback_index]}" \
+                "${snapshot_keys[$rollback_index]}" || rollback_ok=0
+        done
+
+        old_nat_state="${transaction_dir}/workdir/hy2-nat.state"
+        if [ -s "$old_nat_state" ]; then
+            if declare -F restore_hy2_nat_records >/dev/null 2>&1 && \
+               declare -F persist_hy2_nat_rules >/dev/null 2>&1 && \
+               mapfile -t rollback_nat_records < "$old_nat_state" && \
+               restore_hy2_nat_records "${rollback_nat_records[@]}" && \
+               persist_hy2_nat_rules; then
+                :
+            else
+                rollback_ok=0
+            fi
+        fi
+
+        if [ "$definitions_present" -eq 1 ] && [ "$init_system" = systemd ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || rollback_ok=0
+        fi
+        if [ "$nginx_changed" -eq 1 ] && [ "$purge_nginx" -eq 0 ] && command_exists nginx; then
+            if ! nginx -t >/dev/null 2>&1 || \
+               { ! nginx -s reload >/dev/null 2>&1 && ! restart_nginx >/dev/null 2>&1; }; then
+                rollback_ok=0
+            fi
+        fi
+        _restore_uninstall_services || rollback_ok=0
+
+        if [ "$rollback_ok" -eq 1 ] && [ "$rollback_uncertain" -eq 0 ]; then
+            _cleanup_uninstall_transaction >/dev/null 2>&1 || true
+            red "${rollback_reason}；原安装与服务状态已恢复。"
+            return 1
+        fi
+
+        _retain_uninstall_transaction "$rollback_reason"
+        red "${rollback_reason}且自动回滚不完整；恢复材料已保留：${recovery_dir}"
+        return 2
+    }
+
+    # Validate unsafe filesystem shapes before taking the first snapshot.
+    if { [ -e "$target_work_dir" ] || [ -L "$target_work_dir" ]; } && \
+       { [ ! -d "$target_work_dir" ] || [ -L "$target_work_dir" ]; }; then
+        _restore_uninstall_services >/dev/null 2>&1 || rollback_incomplete=1
+        [ "$rollback_incomplete" -eq 0 ] && return 1
+        _write_uninstall_service_recovery >/dev/null 2>&1 || true
+        red "安装目录形态不安全且服务恢复不完整；恢复材料已保留：${recovery_dir}"
+        return 2
+    fi
+    for snapshot_path in "$nginx_main" "$nginx_conf"; do
+        if { [ -e "$snapshot_path" ] || [ -L "$snapshot_path" ]; } && \
+           { [ ! -f "$snapshot_path" ] || [ -L "$snapshot_path" ]; }; then
+            _restore_uninstall_services >/dev/null 2>&1 || rollback_incomplete=1
+            [ "$rollback_incomplete" -eq 0 ] && return 1
+            _write_uninstall_service_recovery >/dev/null 2>&1 || true
+            red "Nginx 配置形态不安全且服务恢复不完整；恢复材料已保留：${recovery_dir}"
+            return 2
+        fi
+    done
+
+    if [ -n "$uninstall_root" ]; then
+        transaction_parent="${uninstall_root}/var/lib/sing-box-uninstall"
+        if [ ! -d "$transaction_parent" ]; then
+            mkdir -p -- "$transaction_parent" || {
+                _restore_uninstall_services >/dev/null 2>&1 && return 1
+                _write_uninstall_service_recovery >/dev/null 2>&1 || true
+                return 2
+            }
+            transaction_parent_created=1
+        fi
+        chmod 700 "$transaction_parent" || {
+            _restore_uninstall_services >/dev/null 2>&1 && return 1
+            _write_uninstall_service_recovery >/dev/null 2>&1 || true
+            return 2
+        }
+    else
+        transaction_parent="${TMPDIR:-/tmp}"
+    fi
+    transaction_dir=$(umask 077; mktemp -d "${transaction_parent}/.uninstall-transaction.XXXXXX") || {
+        _restore_uninstall_services >/dev/null 2>&1 && return 1
+        _write_uninstall_service_recovery >/dev/null 2>&1 || true
+        red "卸载快照创建失败且服务恢复不完整；恢复材料已保留：${recovery_dir}"
+        return 2
+    }
+    chmod 700 "$transaction_dir" || {
+        _restore_uninstall_services >/dev/null 2>&1 && { _cleanup_uninstall_transaction; return 1; }
+        _write_uninstall_service_recovery >/dev/null 2>&1 || true
+        return 2
+    }
+
+    snapshot_paths=(
+        "$target_work_dir"
+        "$nginx_main"
+        "$nginx_conf"
+        "${systemd_dir}/sing-box.service"
+        "${systemd_dir}/argo.service"
+        "${openrc_dir}/sing-box"
+        "${openrc_dir}/argo"
+        "${uninstall_root}/usr/local/bin/sing-box"
+        "${uninstall_root}/usr/local/bin/sb"
+        "${uninstall_root}/usr/bin/sb"
+    )
+    snapshot_keys=(
+        workdir nginx-main nginx-conf
+        systemd-sing systemd-argo openrc-sing openrc-argo
+        link-sing link-local-sb link-usr-sb
+    )
+    for ((i=0; i<${#snapshot_paths[@]}; i++)); do
+        if ! _snapshot_uninstall_path "${snapshot_paths[$i]}" "${snapshot_keys[$i]}"; then
+            if _restore_uninstall_services; then
+                _cleanup_uninstall_transaction >/dev/null 2>&1 || true
+                red "卸载快照创建失败；服务状态已恢复，卸载未开始。"
+                return 1
+            fi
+            _cleanup_uninstall_transaction >/dev/null 2>&1 || true
+            _write_uninstall_service_recovery >/dev/null 2>&1 || true
+            red "卸载快照创建失败且服务恢复不完整；恢复材料已保留：${recovery_dir}"
+            return 2
+        fi
+    done
+    if ! _write_uninstall_service_state_file "${transaction_dir}/service-state.conf"; then
+        if _restore_uninstall_services; then
+            _cleanup_uninstall_transaction >/dev/null 2>&1 || true
+            red "服务状态快照创建失败；服务状态已恢复，卸载未开始。"
+            return 1
+        fi
+        _cleanup_uninstall_transaction >/dev/null 2>&1 || true
+        _write_uninstall_service_recovery >/dev/null 2>&1 || true
+        red "服务状态快照创建失败且服务恢复不完整；恢复材料已保留：${recovery_dir}"
+        return 2
+    fi
+
+    # From here until the base commit every failure uses the same rollback.
+    transaction_failed=0
+    remove_hy2_port_hopping || transaction_failed=$?
+    if [ "$transaction_failed" -ne 0 ]; then
+        [ "$transaction_failed" -eq 2 ] && transaction_uncertain=1
+        _rollback_uninstall_transaction "$transaction_uncertain" "HY2 端口跳跃规则清理失败"
+        return $?
+    fi
+
+    [ -e "$nginx_conf" ] && nginx_conf_existed=1
+    if ! remove_managed_nginx_include "$nginx_main" "$nginx_conf_dir"; then
+        _rollback_uninstall_transaction 0 "Nginx 受管配置清理失败"
+        return $?
+    fi
+    if [ "$nginx_conf_existed" -eq 1 ]; then
+        if ! rm -f -- "$nginx_conf"; then
+            _rollback_uninstall_transaction 0 "Nginx 订阅配置删除失败"
+            return $?
+        fi
+        nginx_changed=1
+    fi
+    [ -e "${transaction_dir}/nginx-main.present" ] && nginx_changed=1
+
+    if [ "$purge_nginx" -eq 0 ] && [ "$nginx_changed" -eq 1 ] && command_exists nginx; then
+        if ! nginx -t >/dev/null 2>&1 || \
+           { ! nginx -s reload >/dev/null 2>&1 && ! restart_nginx >/dev/null 2>&1; }; then
+            _rollback_uninstall_transaction 0 "Nginx 重载失败"
+            return $?
+        fi
+    fi
+
+    if [ "$definitions_present" -eq 1 ]; then
+        for definition in \
+            "${systemd_dir}/sing-box.service" "${systemd_dir}/argo.service" \
+            "${openrc_dir}/sing-box" "${openrc_dir}/argo"; do
+            [ -e "$definition" ] || continue
+            if ! rm -f -- "$definition"; then
+                _rollback_uninstall_transaction 0 "服务定义删除失败"
+                return $?
+            fi
+        done
+        if [ "$init_system" = systemd ] && ! systemctl daemon-reload >/dev/null 2>&1; then
+            _rollback_uninstall_transaction 0 "systemd 重载失败"
+            return $?
+        fi
+    fi
+
+    if ! remove_managed_singbox_link "$uninstall_root"; then
+        _rollback_uninstall_transaction 0 "快捷方式清理失败"
+        return $?
+    fi
+    if [ -e "$target_work_dir" ] && ! rm -rf -- "$target_work_dir"; then
+        _rollback_uninstall_transaction 0 "安装目录删除失败"
+        return $?
+    fi
+
+    # The base uninstall is now committed.  Package removal is deliberately a
+    # separate, non-rollbackable step and never invokes autoremove.
+    if [ "$purge_nginx" -eq 1 ] && [ "$nginx_package_present" -eq 1 ]; then
+        if ! purge_nginx_package; then
+            {
+                printf 'BASE_UNINSTALL_COMMITTED=1\n'
+                printf 'PACKAGE=%q\n' nginx
+                printf 'PURGE_COMPLETE=0\n'
+            } > "${transaction_dir}/package-purge.conf" 2>/dev/null || true
+            chmod 600 "${transaction_dir}/package-purge.conf" 2>/dev/null || true
+            _retain_uninstall_transaction 'Nginx package purge incomplete after base commit'
+            red "基础卸载已完成，但 Nginx 软件包卸载不完整；恢复材料已保留：${recovery_dir}"
+            return 2
+        fi
+    fi
+
+    if ! _cleanup_uninstall_transaction; then
+        red "基础卸载已完成，但临时快照清理失败：${transaction_dir}"
+        return 3
+    fi
+    return 0
+}
+
 # 卸载 sing-box（交互式）
 uninstall_singbox() {
     local uninstall_root="${1:-}"
+    local purge_choice=0
 
     reading "确定要卸载 sing-box 吗? (y/n): " choice
     case "${choice}" in
@@ -5764,9 +6409,10 @@ uninstall_singbox() {
 
             reading "\n是否卸载 Nginx？${green}(卸载请输入 ${yellow}y${re} ${green}回车将跳过卸载Nginx) (y/n): ${re}" choice
             case "${choice}" in
-                y|Y) purge_nginx_package ;;
+                y|Y) purge_choice=1 ;;
                 *)   yellow "取消卸载Nginx\n\n" ;;
             esac
+            perform_singbox_uninstall "$uninstall_root" "$purge_choice" || return 1
             green "\nsing-box 卸载成功\n\n" && exit 0
             ;;
         *) purple "已取消卸载操作\n\n" ;;
@@ -6094,7 +6740,7 @@ run_install_flow() {
         return $?
     }
 
-    if command_exists systemctl; then
+    if [ "$init_system" = systemd ]; then
         main_systemd_services || {
             red "systemd 服务安装或启动失败，安装中止。"
             yellow "服务可能已部分启动；保留已登记的防火墙规则，避免现有连接被误断。"
@@ -6105,7 +6751,7 @@ run_install_flow() {
             yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
             return 1
         }
-    elif command_exists rc-update; then
+    elif [ "$init_system" = openrc ]; then
         alpine_openrc_services || {
             red "OpenRC 服务安装失败，安装中止。"
             yellow "服务可能已部分注册；保留已登记的防火墙规则供重试或卸载清理。"
@@ -6202,6 +6848,7 @@ auto_uninstall() {
     local uninstall_root="${1:-}"
 
     green "Starting non-interactive sing-box uninstall..."
+    perform_singbox_uninstall "$uninstall_root" "${PURGE_NGINX:-0}" || return 1
 
     if ! remove_hy2_port_hopping; then
         red "Unable to safely clean Hysteria2 port-hopping rules; uninstall aborted."
@@ -6251,10 +6898,46 @@ auto_uninstall() {
         fi
         green "\nsing-box and nginx have been purged.\n"
     else
-        command_exists nginx && restart_nginx > /dev/null 2>&1 || true
         green "\nsing-box uninstalled; nginx retained. Use --purge-nginx to remove nginx too.\n"
     fi
 }
+report_node_change_transaction_result() {
+    local transaction_status="${1:-2}"
+    local success_message="${2:-配置修改已生效}"
+    local show_client="${3:-1}"
+    local line
+
+    case "$show_client" in 0|1) ;; *) return 2 ;; esac
+    case "$transaction_status" in
+        0)
+            if [ "$show_client" -eq 1 ] && [ -r "$client_dir" ]; then
+                while IFS= read -r line; do yellow "$line"; done < "$client_dir"
+            fi
+            green "\n${success_message}\n"
+            return 0
+            ;;
+        1)
+            red "本次修改未提交，原配置已保留或完整恢复。"
+            return 1
+            ;;
+        2)
+            red "修改状态不确定或回滚不完整；请按上方恢复目录提示处理。"
+            return 2
+            ;;
+        3)
+            if [ "$show_client" -eq 1 ] && [ -r "$client_dir" ]; then
+                while IFS= read -r line; do yellow "$line"; done < "$client_dir"
+            fi
+            yellow "${success_message}（已生效，但有清理待办；请保留上方提示信息）。"
+            return 3
+            ;;
+        *)
+            red "配置事务返回未知状态，已按不确定状态停止后续操作。"
+            return 2
+            ;;
+    esac
+}
+
 change_config() {
     local singbox_status=$(check_singbox 2>/dev/null)
     local singbox_installed=$?
@@ -6300,7 +6983,6 @@ change_config() {
             purple "0. 返回上一级菜单"
             skyblue "------------"
             reading "请输入选择: " choice
-            local inbounds_file="${conf_dir}/inbounds.json"
             case "${choice}" in
                 1)
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
@@ -6332,20 +7014,11 @@ change_config() {
                 4)
                     reading "\n请输入vless-ws-tls-argo端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    apply_jq_config "$inbounds_file" --arg port "$new_port" \
-                       '(.inbounds[] | select(.tag == "vless-ws-argo").listen_port) = ($port | tonumber)' || return
-                    if command_exists rc-service; then
-                        grep -Eq "127\.0\.0\.1:|localhost:" /etc/init.d/argo && \
-                            sed -i -E 's#(127\.0\.0\.1|localhost):[0-9]+#127.0.0.1:'"$new_port"'#g' /etc/init.d/argo && \
-                            get_quick_tunnel && change_argo_domain
-                    else
-                        grep -Eq "127\.0\.0\.1:|localhost:" /etc/systemd/system/argo.service && \
-                            sed -i -E 's#(127\.0\.0\.1|localhost):[0-9]+#127.0.0.1:'"$new_port"'#g' /etc/systemd/system/argo.service && \
-                            get_quick_tunnel && change_argo_domain
-                    fi
-                    [ -f "${work_dir}/tunnel.yml" ] && sed -i -E 's#service: http://(127\.0\.0\.1|localhost):[0-9]+#service: http://127.0.0.1:'"$new_port"'#g' "${work_dir}/tunnel.yml"
-                    restart_singbox
-                    green "\nvless-ws-tls-argo端口已修改为：${purple}${new_port}${re}\n"
+                    change_argo_port_transaction "$new_port"
+                    transaction_status=$?
+                    report_node_change_transaction_result "$transaction_status" \
+                        "vless-ws-tls-argo端口已修改为：${purple}${new_port}${re}"
+                    return $?
                     ;;
                 0) change_config ;;
                 *) red "无效的选项，请输入 1 到 4" ;;
@@ -6354,16 +7027,11 @@ change_config() {
         2)
             reading "\n请输入新的UUID(直接回车随机生成UUID): " new_uuid
             [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
-            apply_jq_config "${conf_dir}/inbounds.json" --arg uuid "$new_uuid" \
-               '(.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
-                (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid' || return
-            restart_singbox
-            sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
-            sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            update_uuid_file "${work_dir}/cfy-url.txt" "$new_uuid"
-            update_sub
-            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-            green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
+            change_uuid_transaction "$new_uuid"
+            transaction_status=$?
+            report_node_change_transaction_result "$transaction_status" \
+                "UUID已修改为：${purple}${new_uuid}${re}"
+            return $?
             ;;
         3)
             clear
@@ -6376,14 +7044,11 @@ change_config() {
                 "4") new_sni="www.cerebrium.ai" ;;
                 "5") new_sni="www.nazhumi.com" ;;
             esac
-            apply_jq_config "${conf_dir}/inbounds.json" --arg sni "$new_sni" \
-               '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
-                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni' || return
-            restart_singbox
-            sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
-            update_sub
-            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-            green "\nReality sni已修改为：${purple}${new_sni}${re}\n"
+            change_reality_sni_transaction "$new_sni"
+            transaction_status=$?
+            report_node_change_transaction_result "$transaction_status" \
+                "Reality sni已修改为：${purple}${new_sni}${re}"
+            return $?
             ;;
         4)
             purple "端口跳跃需确保跳跃区间的端口没有被占用\n"
@@ -6430,13 +7095,14 @@ change_config() {
                 return 1
             fi
             if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@\[[0-9a-fA-F:]+\]' "$client_dir"; then
-                sed -i -E "/path=%2Fvless-argo/! s#@\[[0-9a-fA-F:]+\]#@${new_ipv4}#g" "$client_dir"
-                green "\n已将 IPv6 修改为 IPv4: $new_ipv4 可复制以下节点或更新订阅\n"
-                check_nodes
+                change_client_ip_transaction ipv4 "$new_ipv4"
+                transaction_status=$?
+                report_node_change_transaction_result "$transaction_status" \
+                    "已将直连节点地址修改为 IPv4：${new_ipv4}"
+                return $?
             else
                 yellow "\n当前已是ipv4, 无需切换\n" && return 0
             fi
-            update_sub
            ;;
         8)
             local new_ipv6
@@ -6454,13 +7120,14 @@ change_config() {
                 return 1
             fi
             if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@([0-9]{1,3}\.){3}[0-9]{1,3}' "$client_dir"; then
-                sed -i -E "/path=%2Fvless-argo/! s#@(([0-9]{1,3}\.){3}[0-9]{1,3})#@[${new_ipv6}]#g" "$client_dir"
-                green "\n已将 IPv4 修改为 IPv6: [${new_ipv6}] 可复制以下节点或更新订阅\n"
-                check_nodes
+                change_client_ip_transaction ipv6 "$new_ipv6"
+                transaction_status=$?
+                report_node_change_transaction_result "$transaction_status" \
+                    "已将直连节点地址修改为 IPv6：[${new_ipv6}]"
+                return $?
             else
                 yellow "\n当前已是ipv6, 无需切换\n" && return 0
             fi
-            update_sub
            ;;
         0) menu ;;
         *) red "无效的选项！\n" ;;
@@ -6485,9 +7152,13 @@ _configure_cf_https_subscription_locked() {
     fi
 
     old_domain="${SUB_HTTPS_DOMAIN:-}"
+    old_domain_mode="${SUB_HTTPS_DOMAIN_MODE:-}"
     old_https_path="${SUB_HTTPS_PATH:-}"
     old_path_regex=""
     is_valid_subscription_path "$old_https_path" && old_path_regex="^${old_https_path}$"
+    if [ -n "$old_domain" ] && [ -n "$old_https_path" ]; then
+        old_https_url=$(build_https_subscription_url "$old_domain" "$old_https_path" 2>/dev/null || true)
+    fi
 
     if [ "$force_rotate" = 1 ]; then
         domain_mode=''
@@ -7674,6 +8345,7 @@ restart_subscription_service_transaction() {
 
 disable_open_sub() {
     local singbox_installed=$?
+    local action_rc=0
     check_singbox &>/dev/null; singbox_installed=$?
     if [ $singbox_installed -eq 2 ]; then
         yellow "sing-box 尚未安装！"; sleep 1; menu; return
@@ -7752,7 +8424,8 @@ disable_open_sub() {
         0) menu ;;
         *) red "无效的选项！" ;;
     esac
-    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m\n'
+    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m\n' || true
+    return "$action_rc"
 }
 
 # singbox 管理
@@ -7784,6 +8457,7 @@ manage_singbox() {
 manage_argo() {
     local service_file="${1:-}"
     local argo_status=$(check_argo 2>/dev/null)
+    local transition_rc
     clear; echo ""
     green "=== Argo 隧道管理 ===\n"
     green "Argo当前状态: $argo_status\n"
@@ -7829,43 +8503,33 @@ manage_argo() {
             if [[ $argo_auth =~ TunnelSecret ]]; then
                 tunnel_id=$(extract_argo_tunnel_id "$argo_auth")
                 [ -z "$tunnel_id" ] && { yellow "ARGO_AUTH 未解析到 TunnelID，请重新输入"; manage_argo; return; }
-                ARGO_AUTH="$argo_auth"
-                ARGO_FIXED_READY=1
-                write_fixed_argo_credentials json "$argo_auth" || {
-                    yellow "固定 Tunnel JSON 保存失败"
-                    return 1
+                transition_to_fixed_argo "$argo_domain" json "$argo_auth" || {
+                    transition_rc=$?
+                    if [ "$transition_rc" -eq 2 ]; then
+                        red "固定 Tunnel 切换失败且自动回滚不完整；请按上方恢复快照提示手动处理。"
+                        return 2
+                    fi
+                    if [ "$transition_rc" -eq 3 ]; then
+                        yellow "固定 Tunnel 已成功切换；仅旧快照清理未完成，请按上方路径手动清理。"
+                        return 3
+                    fi
+                    red "固定 Tunnel 切换失败，原服务、凭据与订阅已恢复。"
+                    return "$transition_rc"
                 }
-                atomic_write_secret_file "${work_dir}/tunnel.yml" << EOF || return 1
-tunnel: ${tunnel_id}
-credentials-file: ${work_dir}/tunnel.json
-protocol: http2
-
-ingress:
-  - hostname: $ArgoDomain
-    service: http://127.0.0.1:${ARGO_PORT}
-    originRequest:
-      noTLSVerify: true
-  - service: http_status:404
-EOF
-                if command_exists rc-service 2>/dev/null; then
-                    write_argo_openrc_service local || return 1
-                else
-                    write_argo_systemd_service local || return 1
-                fi
-                restart_argo; sleep 1; change_argo_domain
             elif is_argo_tunnel_token "$argo_auth"; then
-                ARGO_AUTH="$argo_auth"
-                ARGO_FIXED_READY=1
-                write_fixed_argo_credentials token "$argo_auth" || {
-                    yellow "固定 Tunnel token 保存失败"
-                    return 1
+                transition_to_fixed_argo "$argo_domain" token "$argo_auth" || {
+                    transition_rc=$?
+                    if [ "$transition_rc" -eq 2 ]; then
+                        red "固定 Tunnel 切换失败且自动回滚不完整；请按上方恢复快照提示手动处理。"
+                        return 2
+                    fi
+                    if [ "$transition_rc" -eq 3 ]; then
+                        yellow "固定 Tunnel 已成功切换；仅旧快照清理未完成，请按上方路径手动清理。"
+                        return 3
+                    fi
+                    red "固定 Tunnel 切换失败，原服务、凭据与订阅已恢复。"
+                    return "$transition_rc"
                 }
-                if command_exists rc-service 2>/dev/null; then
-                    write_argo_openrc_service token || return 1
-                else
-                    write_argo_systemd_service token || return 1
-                fi
-                restart_argo; sleep 1; change_argo_domain
             else
                 yellow "输入不匹配，请重新输入"; manage_argo; return
             fi
@@ -7878,17 +8542,20 @@ EOF
             ;;
         5)
             clear
-            load_subscription_state
-            if [ "$SUB_HTTPS_ENABLED" = 1 ]; then
-                SUB_HTTPS_ENABLED=0
-                SUB_HTTPS_VERIFIED_AT=''
-                save_subscription_state || true
-                yellow "已切换到临时 Tunnel，稳定 HTTPS 订阅状态已暂停；HTTP 订阅保留。"
-            fi
-            use_quick_argo_fallback
-            if command_exists rc-service 2>/dev/null; then alpine_openrc_services
-            else main_systemd_services; fi
-            get_quick_tunnel; change_argo_domain
+            transition_to_quick_argo || {
+                transition_rc=$?
+                if [ "$transition_rc" -eq 2 ]; then
+                    red "临时 Tunnel 切换失败且自动回滚不完整；请按上方恢复快照提示手动处理。"
+                    return 2
+                fi
+                if [ "$transition_rc" -eq 3 ]; then
+                    yellow "临时 Tunnel 已成功切换；仅旧快照清理未完成，请按上方路径手动清理。"
+                    return 3
+                fi
+                red "临时 Tunnel 切换失败，原服务、凭据、订阅与 HTTPS 状态已恢复。"
+                return "$transition_rc"
+            }
+            yellow "已切换临时 Tunnel；固定凭据已清理，HTTP 订阅保留。"
             ;;
         6)
             dispatch_argo_menu_action "$choice" "$service_file" || { sleep 2; return 1; }
@@ -7971,16 +8638,33 @@ update_vless_argo_domain() {
 }
 
 change_argo_domain() {
-    [ -z "$ArgoDomain" ] && { red "未获取到Argo域名，无法更新节点"; return 1; }
+    local client_backup cfy_backup='' cfy_file="${work_dir}/cfy-url.txt"
+    local vmess_url encoded_vmess decoded_vmess updated_vmess encoded_updated_vmess new_vmess_url
 
-    update_vless_argo_domain "$ArgoDomain"
-    update_vless_argo_domain_file "${work_dir}/cfy-url.txt" "$ArgoDomain"
+    [ -z "$ArgoDomain" ] && { red "未获取到Argo域名，无法更新节点"; return 1; }
+    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
+    client_backup=$(mktemp "$(dirname "$client_dir")/.argo-domain.rollback.XXXXXX") || return 1
+    cp -p "$client_dir" "$client_backup" || { rm -f "$client_backup"; return 1; }
+    if [ -e "$cfy_file" ]; then
+        [ -f "$cfy_file" ] && [ ! -L "$cfy_file" ] || { rm -f "$client_backup"; return 1; }
+        cfy_backup=$(mktemp "$(dirname "$cfy_file")/.argo-domain-cfy.rollback.XXXXXX") || {
+            rm -f "$client_backup"
+            return 1
+        }
+        cp -p "$cfy_file" "$cfy_backup" || { rm -f "$client_backup" "$cfy_backup"; return 1; }
+    fi
+
+    if ! update_vless_argo_domain "$ArgoDomain" || \
+       { [ -n "$cfy_backup" ] && ! update_vless_argo_domain_file "$cfy_file" "$ArgoDomain"; }; then
+        cp -p "$client_backup" "$client_dir"
+        [ -z "$cfy_backup" ] || cp -p "$cfy_backup" "$cfy_file"
+        rm -f "$client_backup" "$cfy_backup"
+        return 1
+    fi
 
     # 兼容用户手动保留的旧 VMess 模板；默认新安装不再生成 VMess。
-    local vmess_url
     vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir" | head -1)
     if [ -n "$vmess_url" ]; then
-        local encoded_vmess decoded_vmess updated_vmess encoded_updated_vmess new_vmess_url
         encoded_vmess="${vmess_url#vmess://}"
         decoded_vmess=$(echo "$encoded_vmess" | base64 --decode 2>/dev/null || true)
         if [ -n "$decoded_vmess" ]; then
@@ -7993,7 +8677,14 @@ change_argo_domain() {
         fi
     fi
 
-    update_sub
+    if ! update_sub; then
+        cp -p "$client_backup" "$client_dir" || true
+        [ -z "$cfy_backup" ] || cp -p "$cfy_backup" "$cfy_file" || true
+        update_sub >/dev/null 2>&1 || red "订阅发布失败，源文件已恢复；请稍后重新发布订阅。"
+        rm -f "$client_backup" "$cfy_backup"
+        return 1
+    fi
+    rm -f "$client_backup" "$cfy_backup"
 
     green "vless-ws-tls-argo节点已更新\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
@@ -8040,39 +8731,567 @@ check_nodes() {
     show_subscription_links "$base64_url"
 }
 
+is_valid_ipv4_address() {
+    local value="${1:-}" part
+    local -a parts
+
+    [[ "$value" =~ ^[0-9]+([.][0-9]+){3}$ ]] || return 1
+    IFS='.' read -r -a parts <<< "$value"
+    [ "${#parts[@]}" -eq 4 ] || return 1
+    for part in "${parts[@]}"; do
+        [ "${#part}" -eq 1 ] || [[ "$part" != 0* ]] || return 1
+        [ "$part" -ge 0 ] 2>/dev/null && [ "$part" -le 255 ] 2>/dev/null || return 1
+    done
+}
+
+is_valid_ipv6_address() {
+    local value="${1:-}" left right part without_double
+    local -a left_parts=() right_parts=() all_parts=()
+    local compressed=0
+
+    [ -n "$value" ] && [[ "$value" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [[ "$value" != *:::* ]] || return 1
+    without_double="${value//::/}"
+    [ $(( (${#value} - ${#without_double}) / 2 )) -le 1 ] || return 1
+
+    if [[ "$value" == *::* ]]; then
+        compressed=1
+        left="${value%%::*}"
+        right="${value#*::}"
+        [ -z "$left" ] || IFS=':' read -r -a left_parts <<< "$left"
+        [ -z "$right" ] || IFS=':' read -r -a right_parts <<< "$right"
+        all_parts=("${left_parts[@]}" "${right_parts[@]}")
+        [ "${#all_parts[@]}" -lt 8 ] || return 1
+    else
+        [[ "$value" != :* && "$value" != *: ]] || return 1
+        IFS=':' read -r -a all_parts <<< "$value"
+        [ "${#all_parts[@]}" -eq 8 ] || return 1
+    fi
+
+    for part in "${all_parts[@]}"; do
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    [ "$compressed" -eq 1 ] || [ "${#all_parts[@]}" -eq 8 ]
+}
+
+is_valid_endpoint_hostname() {
+    local value="${1:-}" label
+    local -a labels
+
+    [ -n "$value" ] && [ "${#value}" -le 253 ] || return 1
+    [[ "$value" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$value" != .* && "$value" != *. && "$value" != *..* ]] || return 1
+    IFS='.' read -r -a labels <<< "$value"
+    for label in "${labels[@]}"; do
+        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+parse_cfip_endpoint() {
+    local input="${1:-}"
+    local host port colon_chars
+
+    case "$input" in
+        ""|1) host='cf.090227.xyz';       port=443 ;;
+        2)    host='cf.877774.xyz';        port=443 ;;
+        3)    host='cf.877771.xyz';        port=443 ;;
+        4)    host='cdns.doon.eu.org';     port=443 ;;
+        5)    host='cf.zhetengsha.eu.org'; port=443 ;;
+        6)    host='time.is';              port=443 ;;
+        \[*\]:*)
+            host="${input%%]*}"
+            host="${host#[}"
+            port="${input##*]:}"
+            ;;
+        \[*\])
+            host="${input#[}"
+            host="${host%]}"
+            port=443
+            ;;
+        *)
+            colon_chars="${input//[^:]/}"
+            if [ "${#colon_chars}" -eq 1 ]; then
+                host="${input%:*}"
+                port="${input##*:}"
+            else
+                host="$input"
+                port=443
+            fi
+            ;;
+    esac
+
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] 2>/dev/null && \
+        [ "$port" -le 65535 ] 2>/dev/null || return 1
+    if [[ "$host" == *:* ]]; then
+        is_valid_ipv6_address "$host" || return 1
+    elif [[ "$host" =~ ^[0-9.]+$ ]]; then
+        is_valid_ipv4_address "$host" || return 1
+    else
+        is_valid_endpoint_hostname "$host" || return 1
+    fi
+    printf '%s\t%s\n' "$host" "$port"
+}
+
+format_vless_endpoint() {
+    local host="${1:-}"
+    local port="${2:-}"
+
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$host" == *:* ]]; then
+        printf '[%s]:%s\n' "$host" "$port"
+    else
+        printf '%s:%s\n' "$host" "$port"
+    fi
+}
+
+update_argo_preferred_address_file() {
+    local target_file="${1:-}"
+    local host="${2:-}"
+    local port="${3:-}"
+    local mode="${4:-}"
+    local endpoint tmp_file line fragment query
+    local has_preferred=0 has_stable=0 updated=0 emitted_preferred=0
+
+    [ -s "$target_file" ] || return 0
+    [[ "$mode" == fixed || "$mode" == quick ]] || return 1
+    endpoint=$(format_vless_endpoint "$host" "$port") || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* && "$line" == *'#'* ]]; then
+            fragment="${line#*#}"
+            if [[ "$fragment" == *-preferred ]]; then
+                has_preferred=1
+            else
+                has_stable=1
+            fi
+        fi
+    done < "$target_file"
+    [ "$has_stable" -eq 1 ] || return 1
+
+    tmp_file=$(mktemp "$(dirname "$target_file")/.argo-address.XXXXXX") || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* && "$line" == *'?'* ]]; then
+            fragment="${line#*#}"
+            if [ "$mode" = quick ] && [[ "$fragment" != *-preferred ]]; then
+                line="${line%%@*}@${endpoint}?${line#*\?}"
+                updated=1
+            elif [ "$mode" = fixed ] && [[ "$fragment" == *-preferred ]]; then
+                line="${line%%@*}@${endpoint}?${line#*\?}"
+                updated=1
+                emitted_preferred=1
+            fi
+        fi
+        printf '%s\n' "$line"
+        if [ "$mode" = fixed ] && [ "$has_preferred" -eq 0 ] && \
+           [ "$emitted_preferred" -eq 0 ] && [[ "$fragment" != *-preferred ]] && \
+           [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* && "$line" == *'?'* ]]; then
+            query="${line#*\?}"
+            query="${query%%#*}"
+            printf '%s@%s?%s#%s-preferred\n' \
+                "${line%%@*}" "$endpoint" "$query" "$fragment"
+            emitted_preferred=1
+            updated=1
+        fi
+    done < "$target_file" > "$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    if [ "$updated" -ne 1 ]; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    chmod 600 "$tmp_file" 2>/dev/null || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    mv -f "$tmp_file" "$target_file"
+}
+
+rebuild_argo_client_address_set_file() {
+    local target_file="${1:-}"
+    local mode="${2:-}"
+    local stable_domain="${3:-}"
+    local fallback_host="${4:-}"
+    local fallback_port="${5:-}"
+    local line fragment template='' template_fragment base_fragment query userinfo
+    local stable_endpoint fallback_endpoint tmp_file emitted=0 file_mode
+
+    [ -s "$target_file" ] || return 1
+    [[ "$mode" == fixed || "$mode" == quick ]] || return 1
+    fallback_endpoint=$(format_vless_endpoint "$fallback_host" "$fallback_port") || return 1
+    if [ "$mode" = fixed ]; then
+        stable_endpoint=$(format_vless_endpoint "$stable_domain" "$fallback_port") || return 1
+    fi
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* && "$line" == *'?'* && "$line" == *'#'* ]] || continue
+        fragment="${line#*#}"
+        if [ -z "$template" ] || [[ "$fragment" != *-preferred ]]; then
+            template="$line"
+        fi
+        [[ "$fragment" != *-preferred ]] && break
+    done < "$target_file"
+    [ -n "$template" ] || return 1
+
+    template_fragment="${template#*#}"
+    base_fragment="${template_fragment%-preferred}"
+    query="${template#*\?}"
+    query="${query%%#*}"
+    userinfo="${template%%@*}"
+
+    tmp_file=$(mktemp "$(dirname "$target_file")/.argo-address-set.XXXXXX") || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* ]]; then
+            if [ "$emitted" -eq 0 ]; then
+                if [ "$mode" = fixed ]; then
+                    printf '%s@%s?%s#%s\n' "$userinfo" "$stable_endpoint" "$query" "$base_fragment"
+                    if [ "$fallback_endpoint" != "$stable_endpoint" ]; then
+                        printf '%s@%s?%s#%s-preferred\n' \
+                            "$userinfo" "$fallback_endpoint" "$query" "$base_fragment"
+                    fi
+                else
+                    printf '%s@%s?%s#%s\n' "$userinfo" "$fallback_endpoint" "$query" "$base_fragment"
+                fi
+                emitted=1
+            fi
+            continue
+        fi
+        printf '%s\n' "$line"
+    done < "$target_file" > "$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    [ "$emitted" -eq 1 ] || { rm -f "$tmp_file"; return 1; }
+    file_mode=$(stat -c '%a' "$target_file" 2>/dev/null) || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    chmod "$file_mode" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    mv -f "$tmp_file" "$target_file"
+}
+
+get_current_argo_preferred_endpoint() {
+    local target_file="${1:-}"
+    local allow_stable="${2:-0}"
+    local line fragment stable_line=''
+
+    [ -s "$target_file" ] || return 1
+    [[ "$allow_stable" == 0 || "$allow_stable" == 1 ]] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* && "$line" == *'?'* ]] || continue
+        fragment="${line#*#}"
+        if [[ "$fragment" == *-preferred ]]; then
+            line="${line#*@}"
+            parse_cfip_endpoint "${line%%\?*}"
+            return
+        fi
+        [ -n "$stable_line" ] || stable_line="$line"
+    done < "$target_file"
+    [ "$allow_stable" -eq 1 ] && [ -n "$stable_line" ] || return 1
+    stable_line="${stable_line#*@}"
+    parse_cfip_endpoint "${stable_line%%\?*}"
+}
+
+create_argo_transition_snapshot() {
+    local init_system="${1:-}"
+    local install_root="${2:-${ARGO_TRANSITION_ROOT:-}}"
+    local snapshot_dir service_file name source_file
+
+    [[ "$init_system" == systemd || "$init_system" == openrc ]] || return 1
+    snapshot_dir=$(mktemp -d "${work_dir}/.argo-transition.XXXXXX") || return 1
+    chmod 700 "$snapshot_dir" || { rm -rf -- "$snapshot_dir"; return 1; }
+    if [ "$init_system" = systemd ]; then
+        service_file="${install_root}/etc/systemd/system/argo.service"
+    else
+        service_file="${install_root}/etc/init.d/argo"
+    fi
+    for name in service tunnel.json tunnel.yml argo.env client cfy; do
+        case "$name" in
+            service) source_file="$service_file" ;;
+            client) source_file="$client_dir" ;;
+            cfy) source_file="${work_dir}/cfy-url.txt" ;;
+            *) source_file="${work_dir}/${name}" ;;
+        esac
+        if [ -e "$source_file" ]; then
+            [ -f "$source_file" ] && [ ! -L "$source_file" ] || {
+                rm -rf -- "$snapshot_dir"
+                return 1
+            }
+            cp -p "$source_file" "${snapshot_dir}/${name}" || {
+                rm -rf -- "$snapshot_dir"
+                return 1
+            }
+            chmod 600 "${snapshot_dir}/${name}" || {
+                rm -rf -- "$snapshot_dir"
+                return 1
+            }
+        else
+            : > "${snapshot_dir}/${name}.absent" || {
+                rm -rf -- "$snapshot_dir"
+                return 1
+            }
+            chmod 600 "${snapshot_dir}/${name}.absent" || {
+                rm -rf -- "$snapshot_dir"
+                return 1
+            }
+        fi
+    done
+    printf '%s\n' "$snapshot_dir"
+}
+
+restore_argo_transition_snapshot() {
+    local snapshot_dir="${1:-}"
+    local init_system="${2:-}"
+    local install_root="${3:-${ARGO_TRANSITION_ROOT:-}}"
+    local service_file name target_file rollback_ok=1
+
+    [ -d "$snapshot_dir" ] || return 1
+    if [ "$init_system" = systemd ]; then
+        service_file="${install_root}/etc/systemd/system/argo.service"
+    elif [ "$init_system" = openrc ]; then
+        service_file="${install_root}/etc/init.d/argo"
+    else
+        return 1
+    fi
+    for name in service tunnel.json tunnel.yml argo.env client cfy; do
+        case "$name" in
+            service) target_file="$service_file" ;;
+            client) target_file="$client_dir" ;;
+            cfy) target_file="${work_dir}/cfy-url.txt" ;;
+            *) target_file="${work_dir}/${name}" ;;
+        esac
+        if [ -f "${snapshot_dir}/${name}" ]; then
+            mkdir -p "$(dirname "$target_file")" && \
+                cp -p "${snapshot_dir}/${name}" "$target_file" || rollback_ok=0
+        elif [ -f "${snapshot_dir}/${name}.absent" ]; then
+            rm -f "$target_file" || rollback_ok=0
+        else
+            rollback_ok=0
+        fi
+    done
+    if [ "$init_system" = systemd ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || rollback_ok=0
+    fi
+    [ "$rollback_ok" -eq 1 ]
+}
+
+activate_argo_service_mode() {
+    local mode="${1:-}"
+    local init_system="${2:-}"
+    local install_root="${3:-${ARGO_TRANSITION_ROOT:-}}"
+
+    [[ "$mode" == quick || "$mode" == local || "$mode" == token ]] || return 1
+    case "$init_system" in
+        systemd)
+            write_argo_systemd_service "$mode" "$install_root" || return 1
+            systemctl daemon-reload >/dev/null 2>&1 || return 1
+            systemctl enable argo >/dev/null 2>&1 || return 1
+            ;;
+        openrc)
+            write_argo_openrc_service "$mode" "$install_root" || return 1
+            chmod +x "${install_root}/etc/init.d/argo" || return 1
+            rc-update add argo default >/dev/null 2>&1 || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    restart_argo
+}
+
+transition_to_quick_argo() {
+    local init_system old_mode snapshot_dir preferred_host preferred_port
+    local old_argo_domain="${ARGO_DOMAIN:-}" old_argo_auth="${ARGO_AUTH:-}"
+    local old_fixed_ready="${ARGO_FIXED_READY:-0}" old_runtime_domain="${ArgoDomain:-}"
+    local rollback_ok=1 https_disable_rc=0
+
+    init_system=$(detect_usable_init_system) || return 1
+    old_mode=$(detect_argo_tunnel_mode 2>/dev/null || printf 'unknown')
+    read -r preferred_host preferred_port < <(
+        get_current_argo_preferred_endpoint "$client_dir" "$([ "$old_mode" = quick ] && printf 1 || printf 0)"
+    ) || {
+        preferred_host="$CFIP"
+        preferred_port="$CFPORT"
+    }
+    snapshot_dir=$(create_argo_transition_snapshot "$init_system") || return 1
+
+    use_quick_argo_fallback
+    if activate_argo_service_mode quick "$init_system" && \
+       get_quick_tunnel && \
+       { [ ! -s "$client_dir" ] || ! grep -Fq 'path=%2Fvless-argo' "$client_dir" || \
+           rebuild_argo_client_address_set_file "$client_dir" quick "$ArgoDomain" "$preferred_host" "$preferred_port"; } && \
+       change_argo_domain; then
+        load_subscription_state
+        if [ "${SUB_HTTPS_ENABLED:-0}" = 1 ]; then
+            if disable_cf_https_subscription; then
+                https_disable_rc=0
+            else
+                https_disable_rc=$?
+            fi
+        fi
+        if [ "$https_disable_rc" -eq 0 ] && \
+           rm -f "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml" "${work_dir}/argo.env"; then
+            if ! rm -rf -- "$snapshot_dir"; then
+                yellow "Argo 临时 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
+                return 3
+            fi
+            return 0
+        fi
+    fi
+
+    restore_argo_transition_snapshot "$snapshot_dir" "$init_system" || rollback_ok=0
+    ARGO_DOMAIN="$old_argo_domain"
+    ARGO_AUTH="$old_argo_auth"
+    ARGO_FIXED_READY="$old_fixed_ready"
+    ArgoDomain="$old_runtime_domain"
+    restart_argo >/dev/null 2>&1 || rollback_ok=0
+    update_sub >/dev/null 2>&1 || rollback_ok=0
+    [ "$https_disable_rc" -ne 2 ] || rollback_ok=0
+    if [ "$rollback_ok" -eq 1 ]; then
+        rm -rf -- "$snapshot_dir" || {
+            red "Argo 模式切换失败；运行状态已恢复，但临时快照无法清理：${snapshot_dir}"
+            return 2
+        }
+        return 1
+    fi
+    red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}"
+    return 2
+}
+
+transition_to_fixed_argo() {
+    local new_domain="${1:-}" auth_type="${2:-}" auth_value="${3:-}"
+    local init_system old_mode snapshot_dir preferred_host preferred_port tunnel_id
+    local old_argo_domain="${ARGO_DOMAIN:-}" old_argo_auth="${ARGO_AUTH:-}"
+    local old_fixed_ready="${ARGO_FIXED_READY:-0}" old_runtime_domain="${ArgoDomain:-}"
+    local rollback_ok=1
+
+    [ -n "$new_domain" ] && [ -n "$auth_value" ] || return 1
+    [[ "$auth_type" == json || "$auth_type" == token ]] || return 1
+    init_system=$(detect_usable_init_system) || return 1
+    old_mode=$(detect_argo_tunnel_mode 2>/dev/null || printf 'unknown')
+    load_subscription_state
+    if [ "${SUB_HTTPS_ENABLED:-0}" = 1 ]; then
+        red "当前固定 Argo 隧道仍启用了 HTTPS 订阅。请先关闭 HTTPS 订阅，再切换固定隧道。"
+        return 1
+    fi
+    if ! read -r preferred_host preferred_port < <(
+        get_current_argo_preferred_endpoint "$client_dir" "$([ "$old_mode" = quick ] && printf 1 || printf 0)"
+    ); then
+        preferred_host="$CFIP"
+        preferred_port="$CFPORT"
+    fi
+    snapshot_dir=$(create_argo_transition_snapshot "$init_system") || return 1
+
+    ARGO_DOMAIN="$new_domain"
+    ARGO_AUTH="$auth_value"
+    ARGO_FIXED_READY=1
+    ArgoDomain="$new_domain"
+    if [ "$auth_type" = json ]; then
+        tunnel_id=$(extract_argo_tunnel_id "$auth_value" 2>/dev/null || true)
+        [ -n "$tunnel_id" ] || rollback_ok=0
+        if [ "$rollback_ok" -eq 1 ]; then
+            write_fixed_argo_credentials json "$auth_value" "${ARGO_TRANSITION_ROOT:-}" || rollback_ok=0
+            rm -f "${work_dir}/argo.env" || rollback_ok=0
+            if [ "$rollback_ok" -eq 1 ]; then
+                atomic_write_secret_file "${work_dir}/tunnel.yml" <<EOF || rollback_ok=0
+tunnel: ${tunnel_id}
+credentials-file: ${work_dir}/tunnel.json
+protocol: http2
+
+ingress:
+  - hostname: ${new_domain}
+    service: http://127.0.0.1:${ARGO_PORT}
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
+EOF
+            fi
+        fi
+    else
+        write_fixed_argo_credentials token "$auth_value" "${ARGO_TRANSITION_ROOT:-}" || rollback_ok=0
+        rm -f "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml" || rollback_ok=0
+    fi
+
+    if [ "$rollback_ok" -eq 1 ] && \
+       activate_argo_service_mode "$([ "$auth_type" = json ] && printf local || printf token)" "$init_system" && \
+       { [ ! -s "$client_dir" ] || ! grep -Fq 'path=%2Fvless-argo' "$client_dir" || \
+           rebuild_argo_client_address_set_file "$client_dir" fixed "$new_domain" "$preferred_host" "$preferred_port"; } && \
+       change_argo_domain; then
+        if ! rm -rf -- "$snapshot_dir"; then
+            yellow "Argo 固定 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
+            return 3
+        fi
+        return 0
+    fi
+
+    restore_argo_transition_snapshot "$snapshot_dir" "$init_system" || rollback_ok=0
+    ARGO_DOMAIN="$old_argo_domain"
+    ARGO_AUTH="$old_argo_auth"
+    ARGO_FIXED_READY="$old_fixed_ready"
+    ArgoDomain="$old_runtime_domain"
+    restart_argo >/dev/null 2>&1 || rollback_ok=0
+    update_sub >/dev/null 2>&1 || rollback_ok=0
+    if [ "$rollback_ok" -eq 1 ]; then
+        rm -rf -- "$snapshot_dir" || {
+            red "Argo 模式切换失败；运行状态已恢复，但临时快照无法清理：${snapshot_dir}"
+            return 2
+        }
+        return 1
+    fi
+    red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}"
+    return 2
+}
+
 change_cfip() {
+    local client_backup cfy_backup='' cfy_file="${work_dir}/cfy-url.txt"
+    local detected_mode address_mode
     clear
     yellow "修改vless-ws-tls-argo优选域名\n"
     green "1: cf.090227.xyz  2: cf.877774.xyz  3: cf.877771.xyz  4: cdns.doon.eu.org  5: cf.zhetengsha.eu.org  6: time.is\n"
     reading "请输入你的优选域名或优选IP\n(请输入1至6选项,可输入域名:端口 或 IP:端口,直接回车默认使用1): " cfip_input
 
-    case "$cfip_input" in
-        ""|"1") cfip="cf.090227.xyz";          cfport="443" ;;
-        "2")    cfip="cf.877774.xyz";           cfport="443" ;;
-        "3")    cfip="cf.877771.xyz";           cfport="443" ;;
-        "4")    cfip="cdns.doon.eu.org";        cfport="443" ;;
-        "5")    cfip="cf.zhetengsha.eu.org";    cfport="443" ;;
-        "6")    cfip="time.is";                 cfport="443" ;;
-        *)
-            if [[ "$cfip_input" =~ : ]]; then
-                cfip=$(echo "$cfip_input" | cut -d':' -f1)
-                cfport=$(echo "$cfip_input" | cut -d':' -f2)
-            else
-                cfip="$cfip_input"; cfport="443"
-            fi
-            ;;
+    read -r cfip cfport < <(parse_cfip_endpoint "$cfip_input") || {
+        red "优选域名/IP 或端口格式无效。IPv6 请使用 [IPv6]:端口，省略端口时默认 443。"
+        return 1
+    }
+    detected_mode=$(detect_argo_tunnel_mode 2>/dev/null) || {
+        red "无法识别当前 Argo Tunnel 类型，未修改优选入口。"
+        return 1
+    }
+    case "$detected_mode" in
+        quick) address_mode=quick ;;
+        local|remote) address_mode=fixed ;;
+        *) return 1 ;;
     esac
 
-    local tmp_file
-    tmp_file=$(mktemp)
-    while IFS= read -r line; do
-        if [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* ]]; then
-            line=$(printf '%s\n' "$line" | sed -E "s#^(vless://[^@]+@)[^?]+#\1${cfip}:${cfport}#")
-        fi
-        printf '%s\n' "$line"
-    done < "$client_dir" > "$tmp_file" && mv "$tmp_file" "$client_dir"
+    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
+    client_backup=$(mktemp "$(dirname "$client_dir")/.argo-preferred.rollback.XXXXXX") || return 1
+    cp -p "$client_dir" "$client_backup" || { rm -f "$client_backup"; return 1; }
+    if [ -e "$cfy_file" ]; then
+        [ -f "$cfy_file" ] && [ ! -L "$cfy_file" ] || { rm -f "$client_backup"; return 1; }
+        cfy_backup=$(mktemp "$(dirname "$cfy_file")/.argo-preferred-cfy.rollback.XXXXXX") || {
+            rm -f "$client_backup"
+            return 1
+        }
+        cp -p "$cfy_file" "$cfy_backup" || { rm -f "$client_backup" "$cfy_backup"; return 1; }
+    fi
 
-    update_sub
+    update_argo_preferred_address_file "$client_dir" "$cfip" "$cfport" "$address_mode" || {
+        rm -f "$client_backup" "$cfy_backup"
+        red "未找到可安全更新的 Argo 节点，原订阅保持不变。"
+        return 1
+    }
+    if [ -n "$cfy_backup" ]; then
+        update_argo_preferred_address_file "$cfy_file" "$cfip" "$cfport" "$address_mode" || \
+            yellow "最近一次 cfy 结果未包含可更新的优选入口；基础订阅已更新。"
+    fi
+
+    if ! update_sub; then
+        cp -p "$client_backup" "$client_dir" || true
+        [ -z "$cfy_backup" ] || cp -p "$cfy_backup" "$cfy_file" || true
+        update_sub >/dev/null 2>&1 || red "订阅发布失败，源文件已恢复；请稍后重新发布订阅。"
+        rm -f "$client_backup" "$cfy_backup"
+        return 1
+    fi
+    rm -f "$client_backup" "$cfy_backup"
     green "\nvless-ws-tls-argo节点优选域名已更新为：${purple}${cfip}:${cfport}${re}\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
 }
@@ -8928,6 +10147,45 @@ restart_singbox_checked() {
     fi
     red "sing-box 服务重启失败\n"
     return "$restart_status"
+}
+
+argo_service_is_active() {
+    if command_exists rc-service; then
+        rc-service argo status >/dev/null 2>&1
+    elif command_exists systemctl; then
+        systemctl is-active --quiet argo
+    else
+        return 1
+    fi
+}
+
+restart_argo_checked() {
+    yellow "正在重启 Argo 服务\n"
+    if command_exists rc-service; then
+        rc-service argo restart
+    elif command_exists systemctl; then
+        systemctl daemon-reload && systemctl restart argo
+    else
+        red "找不到可用的服务管理器，Argo 未重启。"
+        return 1
+    fi
+    local restart_status=$?
+    if [ "$restart_status" -eq 0 ]; then
+        green "Argo 服务已成功重启\n"
+        return 0
+    fi
+    red "Argo 服务重启失败\n"
+    return "$restart_status"
+}
+
+stop_argo_checked() {
+    if command_exists rc-service; then
+        rc-service argo stop
+    elif command_exists systemctl; then
+        systemctl stop argo
+    else
+        return 1
+    fi
 }
 
 singbox_check_config_dir() {

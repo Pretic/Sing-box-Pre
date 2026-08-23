@@ -377,8 +377,11 @@ EOF
         'change_public_inbound_port_transaction "$inbounds_file" hysteria2 "$new_port" udp' \
         'change_public_inbound_port_transaction "$inbounds_file" tuic "$new_port" udp'; do
         grep -Fq "$expected_call" <<< "$change_config_source" || \
-            fail "menu does not use synchronized port update: ${expected_call}"
+            fail "menu does not use the node transaction wrapper: ${expected_call}"
     done
+    if grep -Fq 'update_uuid_file "${work_dir}/cfy-url.txt"' <<< "$change_config_source"; then
+        fail 'UUID menu still mutates cfy-owned subscription state'
+    fi
     hop_enable_source="$(sed -n '/purple "端口跳跃需确保/,/^        5)/p' <<< "$change_config_source" || true)"
     hop_disable_source="$(sed -n '/^        5)/,/^        6)/p' <<< "$change_config_source" || true)"
     [[ -n "$hop_enable_source" ]] || fail 'Hysteria2 port-hop option 4 block is missing'

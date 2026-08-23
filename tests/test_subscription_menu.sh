@@ -33,8 +33,18 @@ grep -Fq '是否同时配置 Cloudflare HTTPS 订阅？[y/N]' <<< "$argo_source"
     exit 1
 }
 grep -Fq 'configure_cf_https_subscription' <<< "$argo_source"
-grep -Fq 'SUB_HTTPS_ENABLED=0' <<< "$argo_source" || {
-    echo 'FAIL: switching to a quick Tunnel does not suspend verified HTTPS state' >&2
+grep -Fq 'transition_to_quick_argo' <<< "$argo_source" || {
+    echo 'FAIL: switching to a quick Tunnel bypasses the transaction helper' >&2
+    exit 1
+}
+quick_transition_source="$(extract_function transition_to_quick_argo)"
+grep -Fq 'disable_cf_https_subscription' <<< "$quick_transition_source" || {
+    echo 'FAIL: quick Tunnel transaction does not remove the active HTTPS route' >&2
+    exit 1
+}
+grep -Fq '原服务、凭据、订阅与 HTTPS 状态已恢复' <<< "$argo_source" && \
+grep -Fq '自动回滚不完整' <<< "$argo_source" || {
+    echo 'FAIL: switching to a quick Tunnel does not distinguish complete and incomplete rollback' >&2
     exit 1
 }
 

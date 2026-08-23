@@ -34,6 +34,7 @@ assert_equal() {
 
 for function_name in \
     remove_managed_singbox_link \
+    perform_singbox_uninstall \
     auto_uninstall \
     uninstall_singbox \
     detect_argo_tunnel_mode \
@@ -58,6 +59,8 @@ re=''
 # Exercise the real non-interactive uninstall against isolated filesystem roots.
 # Only the two links created by supported sing-box installations may be removed.
 command_exists() { return 1; }
+remove_hy2_port_hopping() { return 0; }
+remove_managed_nginx_include() { return 0; }
 restart_nginx() { fail 'uninstall unexpectedly restarted nginx'; }
 remove_owned_firewall_rules() { :; }
 HY2_REMOVE_FAIL=0
