@@ -19,7 +19,8 @@ extract_function() {
 for function_name in \
     is_valid_ipv4_address is_valid_ipv6_address is_valid_endpoint_hostname \
     parse_cfip_endpoint format_vless_endpoint update_argo_preferred_address_file \
-    update_vless_argo_domain_file update_vless_argo_domain change_argo_domain change_cfip; do
+    update_vless_argo_domain_file update_argo_subscription_file update_cfip_subscription_file \
+    update_vless_argo_domain change_argo_domain change_cfip; do
     function_source="$(extract_function "$function_name")"
     [[ -n "$function_source" ]] || fail "$function_name is not implemented"
     source <(printf '%s\n' "$function_source")
@@ -33,6 +34,20 @@ purple() { :; }
 command_exists() { return 1; }
 publish_attempts=0
 update_sub() { publish_attempts=$((publish_attempts + 1)); return 1; }
+mutate_base_subscription() {
+    local callback="$1" staged_file publish_status
+    shift
+    staged_file=$(mktemp "${work_dir}/.argo-publish-fixture.XXXXXX") || return 1
+    cp -p -- "$client_dir" "$staged_file" || { rm -f -- "$staged_file"; return 1; }
+    "$callback" "$staged_file" "$@" || { rm -f -- "$staged_file"; return 1; }
+    if update_sub "$staged_file"; then
+        mv -f -- "$staged_file" "$client_dir"
+    else
+        publish_status=$?
+        rm -f -- "$staged_file"
+        return "$publish_status"
+    fi
+}
 detect_argo_tunnel_mode() { printf 'local\n'; }
 reading() { cfip_input='new.example.com:8443'; }
 purple=''

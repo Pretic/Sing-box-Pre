@@ -44,6 +44,9 @@ for function_name in \
     get_extra_protocol_uniform_port \
     with_subscription_lock \
     encode_subscription_source \
+    read_strict_subscription_generation_file \
+    get_base_subscription_generation_locked \
+    select_cfy_subscription_source_locked \
     publish_subscriptions_locked \
     mutate_base_subscription_locked \
     mutate_base_subscription \
