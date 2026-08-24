@@ -59,6 +59,9 @@ re=''
 # Only the two links created by supported sing-box installations may be removed.
 command_exists() { return 1; }
 restart_nginx() { fail 'uninstall unexpectedly restarted nginx'; }
+remove_owned_firewall_rules() { :; }
+HY2_REMOVE_FAIL=0
+remove_hy2_port_hopping() { [[ "$HY2_REMOVE_FAIL" -eq 0 ]]; }
 PURGE_NGINX=0
 
 run_uninstall_fixture() {
@@ -109,6 +112,19 @@ case "$(uname -s)" in
         run_uninstall_fixture regular file
         ;;
 esac
+
+# HY2 NAT cleanup owns state inside work_dir and therefore must fail closed
+# before either firewall cleanup or destructive uninstall steps.
+hy2_failure_root="${tmp_dir}/uninstall-hy2-failure"
+work_dir="${hy2_failure_root}/etc/sing-box"
+mkdir -p "$work_dir"
+printf 'owned NAT evidence\n' > "${work_dir}/hy2-nat.state"
+HY2_REMOVE_FAIL=1
+if auto_uninstall "$hy2_failure_root" >/dev/null 2>&1; then
+    fail 'auto uninstall continued after HY2 NAT cleanup failed'
+fi
+[[ -f "${work_dir}/hy2-nat.state" ]] || fail 'failed HY2 cleanup lost ownership evidence'
+HY2_REMOVE_FAIL=0
 
 # The interactive uninstaller must use the same safe shortcut cleanup as the
 # non-interactive path. A guarded rm makes the pre-fix call safe even though it

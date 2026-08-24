@@ -102,11 +102,40 @@ if grep -Fq 'pkill nginx' <<< "$add_source" || grep -Fq 'manage_service "nginx" 
 fi
 
 menu_source="$(extract_function disable_open_sub)"
-grep -Fq 'apply_nginx_subscription_config' <<< "$menu_source"
+grep -Fq 'stop_subscription_service_transaction' <<< "$menu_source"
+for status_call in \
+    restart_subscription_service_transaction \
+    configure_cf_https_subscription \
+    disable_cf_https_subscription \
+    rotate_subscription_token; do
+    grep -Fq "${status_call} || return \$?" <<< "$menu_source" || {
+        echo "FAIL: subscription menu hides ${status_call} failure status" >&2
+        exit 1
+    }
+done
 if grep -Fq 'sed -i "s|\(location = /\)' <<< "$menu_source" || \
    grep -Fq "sed -i 's/listen" <<< "$menu_source"; then
     echo 'FAIL: subscription menu edits nginx configuration without transaction validation' >&2
     exit 1
 fi
+
+# Every path that rewrites an existing subscription server must first prove
+# that the exact config is script-managed.  A parseable listen/location pair
+# alone must never authorize overwriting a user's custom Nginx server.
+for managed_writer in \
+    _configure_cf_https_subscription_locked \
+    _disable_cf_https_subscription_locked \
+    _rotate_subscription_token_locked; do
+    managed_source="$(extract_function "$managed_writer")"
+    grep -Fq 'validate_managed_subscription_runtime' <<< "$managed_source" || {
+        echo "FAIL: ${managed_writer} bypasses managed Nginx runtime validation" >&2
+        exit 1
+    }
+done
+configure_source="$(extract_function _configure_cf_https_subscription_locked)"
+grep -Fq 'NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf' <<< "$configure_source" || {
+    echo 'FAIL: HTTPS configuration ignores the configured Nginx subscription path' >&2
+    exit 1
+}
 
 echo 'Subscription nginx tests passed.'

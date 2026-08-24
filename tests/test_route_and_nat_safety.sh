@@ -40,10 +40,16 @@ source /dev/stdin <<< "$proxy_block"
 
 HAS_IPTABLES_COMMAND=1
 HAS_IP6TABLES_COMMAND=1
+HAS_NETFILTER_PERSISTENT=0
+HAS_RC_SERVICE_COMMAND=0
+HAS_SERVICE_COMMAND=0
 command_exists() {
     case "$1" in
         iptables) [[ "$HAS_IPTABLES_COMMAND" == 1 ]] ;;
         ip6tables) [[ "$HAS_IP6TABLES_COMMAND" == 1 ]] ;;
+        netfilter-persistent) [[ "$HAS_NETFILTER_PERSISTENT" == 1 ]] ;;
+        rc-service) [[ "$HAS_RC_SERVICE_COMMAND" == 1 ]] ;;
+        service) [[ "$HAS_SERVICE_COMMAND" == 1 ]] ;;
         *) command -v "$1" >/dev/null 2>&1 ;;
     esac
 }
@@ -360,8 +366,8 @@ grep -Fq "$fatal_outbound_backup" "$proxy_error_log" || \
 if grep -Eq '已恢复|已回滚' "$proxy_error_log"; then
     fail 'fatal rollback incorrectly claimed that production was restored'
 fi
-rm -rf -- "$fatal_stage_dir"
-rm -f -- "$fatal_route_backup" "$fatal_outbound_backup"
+/bin/rm -rf -- "$fatal_stage_dir"
+/bin/rm -f -- "$fatal_route_backup" "$fatal_outbound_backup"
 
 write_proxy_fixture
 printf '0\n' > "$service_state"
@@ -460,7 +466,25 @@ HAS_IPV6=1
 
 ipv4_stack_available() { [[ "$HAS_IPV4" == 1 ]]; }
 ipv6_stack_available() { [[ "$HAS_IPV6" == 1 ]]; }
-persist_hy2_nat_rules() { :; }
+
+service() {
+    printf 'service %s\n' "$*" >> "$nat_log"
+    [[ "${2:-}" == save && -x "${HY2_INITD_DIR}/${1:-}" ]]
+}
+
+rc-service() {
+    printf 'rc-service %s\n' "$*" >> "$nat_log"
+    if [[ "${1:-}" == -e ]]; then
+        [[ -x "${HY2_INITD_DIR}/${2:-}" ]]
+    else
+        [[ "${2:-}" == save && -x "${HY2_INITD_DIR}/${1:-}" ]]
+    fi
+}
+
+netfilter-persistent() {
+    printf 'netfilter-persistent %s\n' "$*" >> "$nat_log"
+    [[ "${1:-}" == save ]]
+}
 
 mock_iptables() {
     local tool="$1"
@@ -470,6 +494,18 @@ mock_iptables() {
     printf '%s %s\n' "$tool" "$joined" >> "$nat_log"
 
     case " $joined " in
+        *' -S '*)
+            chain="${joined##* -S }"
+            if ! grep -Fxq "CHAIN|$tool|$chain" "$nat_state" 2>/dev/null &&
+               ! grep -Fq "$tool|-t nat -A $chain " "$nat_state" 2>/dev/null; then
+                return 1
+            fi
+            awk -v prefix="$tool|-t nat " -v chain_prefix="$tool|-t nat -A $chain " '
+                index($0, chain_prefix) == 1 {
+                    print substr($0, length(prefix) + 1)
+                }
+            ' "$nat_state"
+            ;;
         *' -N '*)
             chain="${joined##* -N }"
             state_line="CHAIN|$tool|$chain"
@@ -509,6 +545,11 @@ ip6tables() { mock_iptables ip6tables "$@"; }
 
 : > "$nat_state"
 : > "$nat_log"
+HY2_INITD_DIR="$tmp_root/init.d"
+mkdir -p "$HY2_INITD_DIR"
+touch "$HY2_INITD_DIR/iptables" "$HY2_INITD_DIR/ip6tables"
+chmod 700 "$HY2_INITD_DIR/iptables" "$HY2_INITD_DIR/ip6tables"
+HAS_SERVICE_COMMAND=1
 printf '%s\n' 'iptables|-t nat -A PREROUTING -p tcp --dport 8443 -j REDIRECT --to-ports 9443' >> "$nat_state"
 printf '%s\n' 'ip6tables|-t nat -A PREROUTING -p tcp --dport 8443 -j ACCEPT' >> "$nat_state"
 
@@ -537,14 +578,67 @@ if grep -Eq 'SBHY2_|sb-hy2-' "$nat_state"; then
 fi
 [[ ! -e "$HY2_NAT_STATE_FILE" ]] || fail 'HY2 cleanup left ownership state'
 
+# Service/OpenRC persistence must preflight every family changed by the
+# transaction.  Missing IPv6 persistence fails before saving a partial IPv4
+# snapshot and rolls both live families back.
+: > "$nat_state"
+: > "$nat_log"
+HAS_IPV6=1
+HAS_IP6TABLES_COMMAND=1
+rm -f -- "$HY2_INITD_DIR/ip6tables"
+if add_hy2_port_hopping 50500 50600 8443; then
+    fail 'HY2 dual-stack add succeeded without IPv6 persistence service'
+fi
+if grep -Eq 'SBHY2_|sb-hy2-' "$nat_state"; then
+    fail 'HY2 live rules survived missing IPv6 persistence service'
+fi
+[[ ! -e "$HY2_NAT_STATE_FILE" ]] || fail 'failed HY2 persistence created ownership state'
+if grep -q '^service iptables save$' "$nat_log"; then
+    fail 'HY2 persistence saved IPv4 before preflighting the missing IPv6 service'
+fi
+
+: > "$nat_state"
+: > "$nat_log"
+HAS_SERVICE_COMMAND=0
+HAS_RC_SERVICE_COMMAND=1
+if add_hy2_port_hopping 50610 50690 8443; then
+    fail 'HY2 dual-stack add succeeded without the OpenRC IPv6 service'
+fi
+if grep -Eq 'SBHY2_|sb-hy2-' "$nat_state"; then
+    fail 'HY2 live rules survived missing OpenRC IPv6 service'
+fi
+if grep -q '^rc-service iptables save$' "$nat_log"; then
+    fail 'HY2 OpenRC persistence saved IPv4 before preflighting IPv6'
+fi
+
+# With no persistence mechanism at all, live rules must be rolled back and
+# the operation must fail rather than silently succeeding.
+: > "$nat_state"
+: > "$nat_log"
+HAS_RC_SERVICE_COMMAND=0
+HAS_SERVICE_COMMAND=0
+if add_hy2_port_hopping 50700 50800 8443; then
+    fail 'HY2 add succeeded without any persistence mechanism'
+fi
+if grep -Eq 'SBHY2_|sb-hy2-' "$nat_state"; then
+    fail 'HY2 live rules survived missing persistence mechanism'
+fi
+[[ ! -e "$HY2_NAT_STATE_FILE" ]] || fail 'persistence-less HY2 add created ownership state'
+
 : > "$nat_state"
 : > "$nat_log"
 HAS_IPV6=0
-HAS_IP6TABLES_COMMAND=0
+HAS_IP6TABLES_COMMAND=1
+HAS_SERVICE_COMMAND=1
+touch "$HY2_INITD_DIR/ip6tables"
+chmod 700 "$HY2_INITD_DIR/ip6tables"
 add_hy2_port_hopping 51000 51100 8443
 grep -q '^iptables ' "$nat_log" || fail 'IPv4-only host did not configure IPv4 NAT'
 if grep -q '^ip6tables ' "$nat_log"; then
     fail 'IPv4-only host configured IPv6 NAT despite the missing stack'
+fi
+if grep -q '^service ip6tables save$' "$nat_log"; then
+    fail 'IPv4-only HY2 transaction persisted untouched IPv6 rules'
 fi
 remove_hy2_port_hopping || fail 'cleanup failed merely because ip6tables was unavailable'
 

@@ -35,6 +35,9 @@ combined_client_dir="$work_dir/all-url.txt"
 conf_dir="$work_dir/conf"
 HY2_NAT_STATE_FILE="$work_dir/hy2-nat.state"
 mkdir -p "$work_dir" "$conf_dir"
+acquire_proxy_transaction_lock() { :; }
+acquire_proxy_transaction_lock_checked() { acquire_proxy_transaction_lock "$1"; }
+release_proxy_transaction_lock() { :; }
 
 HAS_IPV4=1
 HAS_IPV6=1
@@ -56,6 +59,7 @@ FAIL_TOOL=''
 FAIL_OP=''
 FAIL_MATCH=''
 FAIL_REMAINING=0
+FAIL_STATUS=1
 
 reset_firewall() {
     : > "$nat_state"
@@ -65,6 +69,7 @@ reset_firewall() {
     FAIL_OP=''
     FAIL_MATCH=''
     FAIL_REMAINING=0
+    FAIL_STATUS=1
     HAS_IPV4=1
     HAS_IPV6=1
     HAS_IPTABLES_COMMAND=1
@@ -111,7 +116,9 @@ mock_iptables() {
         esac
     done
     [[ -n "$op" && -n "$chain" ]] || return 2
-    maybe_fail_firewall "$tool" "$op" "$joined" && return 1
+    if maybe_fail_firewall "$tool" "$op" "$joined"; then
+        return "$FAIL_STATUS"
+    fi
 
     case "$op" in
         -N)
@@ -377,7 +384,115 @@ if grep -q '^ip6tables ' "$nat_log"; then
 fi
 remove_hy2_port_hopping || fail 'IPv4-only HY2 remove failed'
 
-# RED 6: menu-facing helpers stage first and roll back every committed surface.
+# RED 6: same-config is successful only for strict, live ownership covering
+# every currently usable address family.
+prepare_empty_firewall
+add_hy2_port_hopping 55200 55300 12443 || fail 'same-config stale-state fixture setup failed'
+stale_owner_snapshot=$(<"$HY2_NAT_STATE_FILE")
+awk -F'|' '$1 == "CHAIN" && $3 == "PREROUTING"' "$nat_state" > "$nat_state.tmp"
+mv -f "$nat_state.tmp" "$nat_state"
+stale_firewall_snapshot=$(firewall_snapshot)
+if add_hy2_port_hopping 55200 55300 12443; then
+    stale_status=0
+else
+    stale_status=$?
+fi
+[[ "$stale_status" -eq 2 ]] || fail "stale same-config state returned $stale_status instead of fatal status 2"
+[[ "$(firewall_snapshot)" == "$stale_firewall_snapshot" ]] || \
+    fail 'stale same-config validation mutated live firewall state'
+[[ "$(<"$HY2_NAT_STATE_FILE")" == "$stale_owner_snapshot" ]] || \
+    fail 'stale same-config validation changed ownership evidence'
+
+prepare_empty_firewall
+printf '%s\n' 'iptables|PRENET_HY2|prenet-hy2|55400|55500|12443|created|extra' > "$HY2_NAT_STATE_FILE"
+malformed_firewall_snapshot=$(firewall_snapshot)
+malformed_owner_snapshot=$(<"$HY2_NAT_STATE_FILE")
+if add_hy2_port_hopping 55400 55500 12443; then
+    malformed_status=0
+else
+    malformed_status=$?
+fi
+[[ "$malformed_status" -eq 2 ]] || \
+    fail "malformed same-config state returned $malformed_status instead of fatal status 2"
+[[ "$(firewall_snapshot)" == "$malformed_firewall_snapshot" ]] || \
+    fail 'malformed state validation mutated live firewall state'
+[[ "$(<"$HY2_NAT_STATE_FILE")" == "$malformed_owner_snapshot" ]] || \
+    fail 'malformed state validation changed ownership evidence'
+
+prepare_empty_firewall
+add_hy2_port_hopping 55600 55700 12443 || fail 'same-config query-error fixture setup failed'
+query_owner_snapshot=$(<"$HY2_NAT_STATE_FILE")
+query_firewall_snapshot=$(firewall_snapshot)
+FAIL_TOOL=iptables
+FAIL_OP=-S
+FAIL_MATCH='SBHY2_4_'
+FAIL_REMAINING=1
+FAIL_STATUS=2
+if add_hy2_port_hopping 55600 55700 12443; then
+    query_status=0
+else
+    query_status=$?
+fi
+[[ "$query_status" -eq 2 ]] || \
+    fail "same-config live-query error returned $query_status instead of fatal status 2"
+[[ "$(firewall_snapshot)" == "$query_firewall_snapshot" ]] || \
+    fail 'same-config live-query error mutated live firewall state'
+[[ "$(<"$HY2_NAT_STATE_FILE")" == "$query_owner_snapshot" ]] || \
+    fail 'same-config live-query error changed ownership evidence'
+FAIL_TOOL=''
+FAIL_OP=''
+FAIL_MATCH=''
+FAIL_REMAINING=0
+FAIL_STATUS=1
+
+prepare_empty_firewall
+HAS_IPV6=0
+HAS_IP6TABLES_COMMAND=0
+add_hy2_port_hopping 55800 55900 12443 || fail 'IPv4-only expansion fixture setup failed'
+[[ "$(wc -l < "$HY2_NAT_STATE_FILE" | tr -d ' ')" -eq 1 ]] || \
+    fail 'IPv4-only expansion fixture unexpectedly contains IPv6 ownership'
+HAS_IPV6=1
+HAS_IP6TABLES_COMMAND=1
+add_hy2_port_hopping 55800 55900 12443 || \
+    fail 'same-config did not expand ownership after IPv6 became usable'
+[[ "$(wc -l < "$HY2_NAT_STATE_FILE" | tr -d ' ')" -eq 2 ]] || \
+    fail 'dual-stack expansion did not persist exactly one record per family'
+[[ "$(grep -c '^iptables|' "$HY2_NAT_STATE_FILE")" -eq 1 ]] || \
+    fail 'dual-stack expansion did not retain exactly one IPv4 record'
+[[ "$(grep -c '^ip6tables|' "$HY2_NAT_STATE_FILE")" -eq 1 ]] || \
+    fail 'dual-stack expansion did not add exactly one IPv6 record'
+[[ "$(grep -Fc -- '--dport 55800:55900' "$nat_state")" -eq 2 ]] || \
+    fail 'dual-stack expansion did not leave one live rule per family'
+remove_hy2_port_hopping || fail 'dual-stack expansion fixture cleanup failed'
+
+# Same-config expansion must retain an already-adopted legacy family instead
+# of adopting it again and then deleting that very rule as an "old" record.
+prepare_empty_firewall
+HAS_IPV6=0
+HAS_IP6TABLES_COMMAND=0
+add_chain iptables PRENET_HY2
+add_rule iptables PRENET_HY2 \
+    '-p udp --dport 55900:55950 -m comment --comment prenet-hy2 -j DNAT --to-destination :12443'
+add_rule iptables PREROUTING \
+    '-p udp -m comment --comment prenet-hy2 -j PRENET_HY2'
+add_hy2_port_hopping 55900 55950 12443 || fail 'IPv4 legacy HY2 rule was not adopted'
+grep -q '^iptables|PRENET_HY2|prenet-hy2|55900|55950|12443|adopted$' \
+    "$HY2_NAT_STATE_FILE" || fail 'IPv4 legacy HY2 adoption state is missing'
+HAS_IPV6=1
+HAS_IP6TABLES_COMMAND=1
+add_hy2_port_hopping 55900 55950 12443 || \
+    fail 'adopted single-stack HY2 state did not expand to dual stack'
+[[ "$(grep -c '^iptables|' "$HY2_NAT_STATE_FILE")" -eq 1 ]] || \
+    fail 'adopted dual-stack expansion did not retain exactly one IPv4 record'
+[[ "$(grep -c '^ip6tables|' "$HY2_NAT_STATE_FILE")" -eq 1 ]] || \
+    fail 'adopted dual-stack expansion did not add exactly one IPv6 record'
+grep -Fqx 'RULE|iptables|PRENET_HY2|-p udp --dport 55900:55950 -m comment --comment prenet-hy2 -j DNAT --to-destination :12443' \
+    "$nat_state" || fail 'dual-stack expansion deleted the adopted IPv4 DNAT rule'
+grep -Fqx 'RULE|iptables|PREROUTING|-p udp -m comment --comment prenet-hy2 -j PRENET_HY2' \
+    "$nat_state" || fail 'dual-stack expansion deleted the adopted IPv4 jump rule'
+remove_hy2_port_hopping || fail 'adopted dual-stack expansion fixture cleanup failed'
+
+# RED 7: menu-facing helpers stage first and roll back every committed surface.
 for helper_name in \
     stage_hy2_client_file \
     restore_hy2_client_snapshot \
@@ -658,14 +773,18 @@ command_exists() {
         *) return 1 ;;
     esac
 }
+HY2_INITD_DIR="$tmp_root/persist-init.d"
+mkdir -p "$HY2_INITD_DIR"
+touch "$HY2_INITD_DIR/iptables"
+chmod 700 "$HY2_INITD_DIR/iptables"
 service() {
     [[ "${1:-}" != iptables ]]
 }
-if persist_hy2_nat_rules; then
+if persist_hy2_nat_rules iptables; then
     fail 'service iptables persistence failure was swallowed'
 fi
 
-# RED 7: service wrappers return the actual backend result, not the print result.
+# RED 8: service wrappers return the actual backend result, not the print result.
 manage_service_source=$(sed -n '/^manage_service() {/,/^}/p' "$script")
 [[ -n "$manage_service_source" ]] || fail 'manage_service is missing'
 eval "$manage_service_source"

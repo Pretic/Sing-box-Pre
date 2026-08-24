@@ -42,7 +42,7 @@ validate_port_value() {
 
 resolve_service_ports() {
     local base_port="${PORT:-}"
-    local label value seen=' '
+    local label value variable_name proto seen_tcp=' ' seen_udp=' '
 
     validate_port_value "$base_port" PORT || return 1
     vless_port="${REALITY_PORT:-$base_port}"
@@ -52,12 +52,25 @@ resolve_service_ports() {
     argo_port="${ARGO_PORT:-8001}"
 
     for label in vless nginx tuic hy2 argo; do
-        eval "value=\${${label}_port}"
+        variable_name="${label}_port"
+        value="${!variable_name}"
         validate_port_value "$value" "${label}_port" || return 1
-        case "$seen" in
-            *" $value "*) echo "端口重复: $value" >&2; return 1 ;;
+        case "$label" in
+            vless|nginx|argo) proto=tcp ;;
+            tuic|hy2) proto=udp ;;
+            *) return 1 ;;
         esac
-        seen="${seen}${value} "
+        if [ "$proto" = tcp ]; then
+            case "$seen_tcp" in
+                *" $value "*) echo "TCP 端口重复: $value" >&2; return 1 ;;
+            esac
+            seen_tcp="${seen_tcp}${value} "
+        else
+            case "$seen_udp" in
+                *" $value "*) echo "UDP 端口重复: $value" >&2; return 1 ;;
+            esac
+            seen_udp="${seen_udp}${value} "
+        fi
     done
 
     export vless_port nginx_port tuic_port hy2_port argo_port
@@ -1278,7 +1291,7 @@ apply_local_tunnel_subscription_rule() {
     local tunnel_config="${5:-${work_dir}/tunnel.yml}"
     local verify_url="${6:-}"
     local backup_file="${tunnel_config}.bak.subscription"
-    local tmp_file public_path
+    local tmp_file public_path rollback_status=0
 
     [ -r "$tunnel_config" ] || return 1
     tmp_file=$(mktemp "$(dirname "$tunnel_config")/.tunnel-apply.XXXXXX") || return 1
@@ -1296,16 +1309,18 @@ apply_local_tunnel_subscription_rule() {
             "https://${domain}${public_path}" > /dev/null 2>&1 || \
        ! restart_argo > /dev/null 2>&1 || \
        { [ -n "$verify_url" ] && ! verify_https_subscription "$verify_url"; }; then
-        cp -p "$backup_file" "$tunnel_config"
-        restart_argo > /dev/null 2>&1 || true
-        return 1
+        cp -p "$backup_file" "$tunnel_config" || rollback_status=1
+        restart_argo > /dev/null 2>&1 || rollback_status=1
+        [ "$rollback_status" -eq 0 ] && return 1
+        return 2
     fi
+    return 0
 }
 
 apply_local_tunnel_subscription_removal() {
     local tunnel_config="${1:-${work_dir}/tunnel.yml}"
     local backup_file="${tunnel_config}.bak.subscription-removal"
-    local tmp_file
+    local tmp_file rollback_status=0
 
     [ -r "$tunnel_config" ] || return 1
     tmp_file=$(mktemp "$(dirname "$tunnel_config")/.tunnel-remove.XXXXXX") || return 1
@@ -1318,10 +1333,12 @@ apply_local_tunnel_subscription_removal() {
     mv -f "$tmp_file" "$tunnel_config" || return 1
     if ! "${work_dir}/argo" tunnel --config "$tunnel_config" ingress validate > /dev/null 2>&1 || \
        ! restart_argo > /dev/null 2>&1; then
-        cp -p "$backup_file" "$tunnel_config"
-        restart_argo > /dev/null 2>&1 || true
-        return 1
+        cp -p "$backup_file" "$tunnel_config" || rollback_status=1
+        restart_argo > /dev/null 2>&1 || rollback_status=1
+        [ "$rollback_status" -eq 0 ] && return 1
+        return 2
     fi
+    return 0
 }
 
 build_remote_tunnel_config() {
@@ -1484,7 +1501,7 @@ rollback_cloudflare_dns_change() {
     local new_record_id="${3:-}"
     local response_file="${4:-}"
     local jq_bin="${JQ_BIN:-jq}"
-    local action record_id body_file
+    local action record_id body_file rc
 
     [ -r "$plan_file" ] && [ -n "$response_file" ] || return 1
     action=$("$jq_bin" -r '.action' "$plan_file") || return 1
@@ -1494,6 +1511,9 @@ rollback_cloudflare_dns_change() {
             cloudflare_api DELETE \
                 "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${new_record_id}" \
                 > "$response_file" 2>/dev/null
+            rc=$?
+            [ "$rc" -eq 0 ] && "$jq_bin" -e '.success == true' \
+                "$response_file" > /dev/null 2>&1
             ;;
         update)
             record_id=$("$jq_bin" -r '.original.id // empty' "$plan_file")
@@ -1507,9 +1527,11 @@ rollback_cloudflare_dns_change() {
             cloudflare_api PUT \
                 "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
                 "$body_file" > "$response_file" 2>/dev/null
-            local rc=$?
+            rc=$?
             rm -f "$body_file"
-            return "$rc"
+            [ "$rc" -eq 0 ] && "$jq_bin" -e '.success == true' \
+                "$response_file" > /dev/null 2>&1
+            return $?
             ;;
         noop) return 0 ;;
         *) return 1 ;;
@@ -1526,9 +1548,10 @@ apply_remote_tunnel_subscription_rule() {
     local verify_url="${7:-}"
     local jq_bin="${JQ_BIN:-jq}"
     local account_id tunnel_id zone_id CF_API_TOKEN
-    local tmp_dir get_response old_config new_config put_body put_response
+    local tmp_parent tmp_dir get_response old_config new_config put_body put_response
     local dns_response dns_records dns_plan dns_body dns_apply_response dns_action
-    local new_record_id='' remote_updated=0 dns_changed=0 operation_ok=0
+    local new_record_id='' remote_attempted=0
+    local dns_attempted=0 dns_changed=0 operation_ok=0 rollback_ok=1
 
     is_valid_subscription_domain "$domain" || return 1
     is_valid_tunnel_subscription_regex "$path_regex" || return 1
@@ -1551,7 +1574,10 @@ apply_remote_tunnel_subscription_rule() {
         return 1
     }
 
-    tmp_dir=$(mktemp -d "${work_dir}/.cf-subscription.XXXXXX") || { unset CF_API_TOKEN; return 1; }
+    CF_TUNNEL_RECOVERY_PATH=''
+    tmp_parent="${DURABLE_TX_RECOVERY_DIR:-$work_dir}"
+    [ -d "$tmp_parent" ] && [ ! -L "$tmp_parent" ] || { unset CF_API_TOKEN; return 1; }
+    tmp_dir=$(mktemp -d "${tmp_parent}/.cf-subscription.XXXXXX") || { unset CF_API_TOKEN; return 1; }
     chmod 700 "$tmp_dir" 2>/dev/null || true
     get_response="${tmp_dir}/get-response.json"
     old_config="${tmp_dir}/old-config.json"
@@ -1576,12 +1602,11 @@ apply_remote_tunnel_subscription_rule() {
             "http://127.0.0.1:${port}" "$mode" "$old_domain" "$old_path_regex" \
             > "$new_config" || break
         "$jq_bin" -cn --slurpfile config "$new_config" '{config: $config[0]}' > "$put_body" || break
+        remote_attempted=1
         cloudflare_api PUT \
             "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" \
             "$put_body" > "$put_response" 2>/dev/null || break
         "$jq_bin" -e '.success == true' "$put_response" > /dev/null || break
-        remote_updated=1
-
         if [ "$mode" = separate ]; then
             cloudflare_api GET \
                 "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=CNAME&name=${domain}" \
@@ -1593,6 +1618,7 @@ apply_remote_tunnel_subscription_rule() {
             "$jq_bin" '.desired' "$dns_plan" > "$dns_body" || break
             case "$dns_action" in
                 create)
+                    dns_attempted=1
                     cloudflare_api POST \
                         "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
                         "$dns_body" > "$dns_apply_response" 2>/dev/null || break
@@ -1605,6 +1631,7 @@ apply_remote_tunnel_subscription_rule() {
                     local existing_record_id
                     existing_record_id=$("$jq_bin" -r '.original.id // empty' "$dns_plan")
                     [ -n "$existing_record_id" ] || break
+                    dns_attempted=1
                     cloudflare_api PUT \
                         "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${existing_record_id}" \
                         "$dns_body" > "$dns_apply_response" 2>/dev/null || break
@@ -1625,27 +1652,45 @@ apply_remote_tunnel_subscription_rule() {
     done
 
     if [ "$operation_ok" != 1 ]; then
-        if [ "$dns_changed" = 1 ]; then
-            rollback_cloudflare_dns_change "$zone_id" "$dns_plan" "$new_record_id" \
-                "${tmp_dir}/dns-rollback-response.json" || true
+        if [ "$dns_attempted" = 1 ]; then
+            if [ "$dns_changed" = 1 ] || \
+               { [ -r "$dns_plan" ] && [ -n "$new_record_id" ]; }; then
+                rollback_cloudflare_dns_change "$zone_id" "$dns_plan" "$new_record_id" \
+                    "${tmp_dir}/dns-rollback-response.json" || rollback_ok=0
+            else
+                rollback_ok=0
+            fi
         fi
-        if [ "$remote_updated" = 1 ]; then
+        if [ "$remote_attempted" = 1 ]; then
             rollback_remote_tunnel_configuration "$account_id" "$tunnel_id" "$old_config" \
-                "${tmp_dir}/tunnel-rollback-response.json" || true
+                "${tmp_dir}/tunnel-rollback-response.json" || rollback_ok=0
         fi
     fi
 
     unset CF_API_TOKEN
-    rm -rf "$tmp_dir"
-    [ "$operation_ok" = 1 ]
+    if [ "$operation_ok" = 1 ]; then
+        if [ "${DURABLE_TX_ACTIVE:-0}" -eq 1 ]; then
+            CF_TUNNEL_RECOVERY_PATH="$tmp_dir"
+        else
+            rm -rf -- "$tmp_dir"
+        fi
+        return 0
+    fi
+    if [ "$rollback_ok" = 1 ]; then
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+    CF_TUNNEL_RECOVERY_PATH="$tmp_dir"
+    red "Cloudflare 远程配置结果未决，已保留不含 API token 的恢复证据：${tmp_dir}"
+    return 2
 }
 
 remove_remote_tunnel_subscription_via_api() {
     local domain="${1:-}"
     local path_regex="${2:-}"
     local jq_bin="${JQ_BIN:-jq}"
-    local account_id tunnel_id CF_API_TOKEN tmp_dir get_response old_config
-    local new_config put_body put_response operation_ok=0 remote_updated=0
+    local account_id tunnel_id CF_API_TOKEN tmp_parent tmp_dir get_response old_config
+    local new_config put_body put_response operation_ok=0 remote_attempted=0 rollback_ok=1
 
     is_valid_subscription_domain "$domain" || return 1
     is_valid_tunnel_subscription_regex "$path_regex" || return 1
@@ -1657,7 +1702,10 @@ remove_remote_tunnel_subscription_via_api() {
     echo ""
     [[ "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || { unset CF_API_TOKEN; return 1; }
 
-    tmp_dir=$(mktemp -d "${work_dir}/.cf-subscription-remove.XXXXXX") || { unset CF_API_TOKEN; return 1; }
+    CF_TUNNEL_RECOVERY_PATH=''
+    tmp_parent="${DURABLE_TX_RECOVERY_DIR:-$work_dir}"
+    [ -d "$tmp_parent" ] && [ ! -L "$tmp_parent" ] || { unset CF_API_TOKEN; return 1; }
+    tmp_dir=$(mktemp -d "${tmp_parent}/.cf-subscription-remove.XXXXXX") || { unset CF_API_TOKEN; return 1; }
     chmod 700 "$tmp_dir" 2>/dev/null || true
     get_response="${tmp_dir}/get-response.json"
     old_config="${tmp_dir}/old-config.json"
@@ -1675,34 +1723,503 @@ remove_remote_tunnel_subscription_via_api() {
         remove_remote_tunnel_subscription_rule "$(< "$old_config")" "$domain" "$path_regex" \
             > "$new_config" || break
         "$jq_bin" -cn --slurpfile config "$new_config" '{config: $config[0]}' > "$put_body" || break
+        remote_attempted=1
         cloudflare_api PUT \
             "https://api.cloudflare.com/client/v4/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" \
             "$put_body" > "$put_response" 2>/dev/null || break
         "$jq_bin" -e '.success == true' "$put_response" > /dev/null || break
-        remote_updated=1
         operation_ok=1
         break
     done
 
-    if [ "$operation_ok" != 1 ] && [ "$remote_updated" = 1 ]; then
+    if [ "$operation_ok" != 1 ] && [ "$remote_attempted" = 1 ]; then
         rollback_remote_tunnel_configuration "$account_id" "$tunnel_id" "$old_config" \
-            "${tmp_dir}/rollback-response.json" || true
+            "${tmp_dir}/rollback-response.json" || rollback_ok=0
     fi
     unset CF_API_TOKEN
-    rm -rf "$tmp_dir"
-    [ "$operation_ok" = 1 ]
+    if [ "$operation_ok" = 1 ]; then
+        if [ "${DURABLE_TX_ACTIVE:-0}" -eq 1 ]; then
+            CF_TUNNEL_RECOVERY_PATH="$tmp_dir"
+        else
+            rm -rf -- "$tmp_dir"
+        fi
+        return 0
+    fi
+    if [ "$rollback_ok" = 1 ]; then
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+    CF_TUNNEL_RECOVERY_PATH="$tmp_dir"
+    red "Cloudflare 远程路由移除结果未决，已保留不含 API token 的恢复证据：${tmp_dir}"
+    return 2
 }
 
-# 处理防火墙
-allow_port() {
-    local has_v4=0
-    local has_v6=0
-    local has_ufw=0
-    local has_firewalld=0
-    local has_iptables=0
-    local has_ip6tables=0
-    local port proto rule
+# 防火墙规则只由一个活动后端管理。本脚本仅删除记录在 firewall.state
+# 中、确认由自己创建的精确规则；HY2 NAT 继续使用独立状态文件。
+acquire_firewall_lock() {
+    local lock_file="${FIREWALL_LOCK_FILE:-${work_dir}/.firewall.lock}"
+
+    command_exists flock || { red "缺少 flock，拒绝在无锁状态修改防火墙。"; return 1; }
+    mkdir -p -- "$(dirname "$lock_file")" || return 1
+    if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
+        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    fi
+    exec {FIREWALL_LOCK_FD}>"$lock_file" || return 1
+    if ! chmod 600 "$lock_file" || ! flock -x "$FIREWALL_LOCK_FD"; then
+        exec {FIREWALL_LOCK_FD}>&-
+        unset FIREWALL_LOCK_FD
+        return 1
+    fi
+}
+
+release_firewall_lock() {
+    [ -n "${FIREWALL_LOCK_FD:-}" ] || return 0
+    flock -u "$FIREWALL_LOCK_FD" >/dev/null 2>&1 || true
+    exec {FIREWALL_LOCK_FD}>&-
+    unset FIREWALL_LOCK_FD
+}
+
+select_firewall_backend() {
+    local has_v4="${1:-0}"
+    local has_v6="${2:-0}"
+    local ufw_status firewalld_status raw_available=0 raw_missing=0
+
+    [[ "$has_v4" =~ ^[01]$ && "$has_v6" =~ ^[01]$ ]] || return 1
+    [ "$has_v4" = 1 ] || [ "$has_v6" = 1 ] || return 1
+
+    if ufw_is_active; then ufw_status=0; else ufw_status=$?; fi
+    case "$ufw_status" in 0|1) ;; *) return 1 ;; esac
+    if firewalld_is_active; then firewalld_status=0; else firewalld_status=$?; fi
+    case "$firewalld_status" in 0|1) ;; *) return 1 ;; esac
+    [ "$ufw_status" = 0 ] && [ "$firewalld_status" = 0 ] && return 1
+    if [ "$ufw_status" = 0 ]; then printf 'ufw\n'; return 0; fi
+    if [ "$firewalld_status" = 0 ]; then printf 'firewalld\n'; return 0; fi
+    if [ "$has_v4" = 1 ]; then
+        if command_exists iptables; then raw_available=1; else raw_missing=1; fi
+    fi
+    if [ "$has_v6" = 1 ]; then
+        if command_exists ip6tables; then raw_available=1; else raw_missing=1; fi
+    fi
+    if [ "$raw_available" = 0 ]; then
+        if command_exists nft; then printf 'nft-unmanaged\n'; else printf 'none\n'; fi
+        return 0
+    fi
+    if [ "$raw_missing" = 1 ]; then
+        printf 'partial-raw\n'
+        return 0
+    fi
+    printf 'raw\n'
+}
+
+read_firewall_state() {
+    local state_file="${FIREWALL_STATE_FILE:-${work_dir}/firewall.state}"
+    local line backend field2 field3 field4 field5 extra
+    local saw_header=0
+    FIREWALL_STATE_RECORDS=()
+
+    [ -e "$state_file" ] || [ -L "$state_file" ] || return 0
+    [ -f "$state_file" ] && [ ! -L "$state_file" ] && [ -r "$state_file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$saw_header" = 0 ]; then
+            [ "$line" = version=1 ] || return 1
+            saw_header=1
+            continue
+        fi
+        [ -n "$line" ] || return 1
+        IFS='|' read -r backend field2 field3 field4 field5 extra <<< "$line"
+        [ -z "${extra:-}" ] || return 1
+        case "$backend" in
+            ufw)
+                case "$field2" in 4|6) ;; *) return 1 ;; esac
+                validate_port_value "$field3" firewall_state_port >/dev/null 2>&1 || return 1
+                case "$field4" in tcp|udp) ;; *) return 1 ;; esac
+                [ -z "$field5" ] || return 1
+                ;;
+            firewalld)
+                case "$field2" in runtime|permanent) ;; *) return 1 ;; esac
+                [[ "$field3" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+                validate_port_value "$field4" firewall_state_port >/dev/null 2>&1 || return 1
+                case "$field5" in tcp|udp) ;; *) return 1 ;; esac
+                ;;
+            iptables)
+                case "$field2" in 4|6) ;; *) return 1 ;; esac
+                [ "$field3" = sing-box-pre ] || return 1
+                validate_port_value "$field4" firewall_state_port >/dev/null 2>&1 || return 1
+                case "$field5" in tcp|udp) ;; *) return 1 ;; esac
+                ;;
+            *) return 1 ;;
+        esac
+        FIREWALL_STATE_RECORDS+=("$line")
+    done < "$state_file"
+    [ "$saw_header" = 1 ]
+}
+
+write_firewall_state_records() {
+    local state_file="${FIREWALL_STATE_FILE:-${work_dir}/firewall.state}"
+    {
+        printf 'version=1\n'
+        [ "$#" -eq 0 ] || printf '%s\n' "$@"
+    } | atomic_write_secret_file "$state_file"
+}
+
+write_firewall_recovery_records() {
+    local recovery_file="${FIREWALL_RECOVERY_FILE:-${work_dir}/firewall.recovery}"
+    {
+        printf 'version=1\n'
+        [ "$#" -eq 0 ] || printf '%s\n' "$@"
+    } | atomic_write_secret_file "$recovery_file"
+}
+
+firewall_state_has_record() {
+    local wanted="${1:-}"
+    local record
+    for record in "${FIREWALL_STATE_RECORDS[@]}"; do
+        [ "$record" = "$wanted" ] && return 0
+    done
+    return 1
+}
+
+ufw_is_active() {
+    local status_output status
+
+    command_exists ufw || return 1
+    status_output=$(LC_ALL=C ufw status 2>/dev/null)
+    status=$?
+    [ "$status" -eq 0 ] || return 2
+    if printf '%s\n' "$status_output" | grep -Eqi '^Status:[[:space:]]*active[[:space:]]*$'; then
+        return 0
+    fi
+    if printf '%s\n' "$status_output" | grep -Eqi '^Status:[[:space:]]*inactive[[:space:]]*$'; then
+        return 1
+    fi
+    return 2
+}
+
+firewalld_is_active() {
+    local status_output status
+
+    command_exists firewall-cmd || return 1
+    status_output=$(LC_ALL=C firewall-cmd --state 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ] && [ "$status_output" = running ]; then
+        return 0
+    fi
+    if [ "$status_output" = 'not running' ]; then
+        return 1
+    fi
+    return 2
+}
+
+ufw_port_is_open() {
+    local family="$1" port="$2" proto="$3" status_output active_status
+    case "$family" in 4|6) ;; *) return 1 ;; esac
+    if ufw_is_active; then active_status=0; else active_status=$?; fi
+    [ "$active_status" -eq 0 ] || return 2
+    status_output=$(LC_ALL=C ufw status numbered 2>/dev/null) || return 2
+    printf '%s\n' "$status_output" | awk -v rule="${port}/${proto}" -v family="$family" '
+        {
+            line=$0
+            sub(/^[[:space:]]*\[[[:space:]]*[0-9]+\][[:space:]]*/, "", line)
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            field_count=split(line, fields, /[[:space:]]+/)
+            if (family == 4 && field_count == 4 && fields[1] == rule &&
+                toupper(fields[2]) == "ALLOW" && toupper(fields[3]) == "IN" &&
+                fields[4] == "Anywhere") {
+                found=1
+            }
+            if (family == 6 && field_count == 6 && fields[1] == rule &&
+                tolower(fields[2]) == "(v6)" && toupper(fields[3]) == "ALLOW" &&
+                toupper(fields[4]) == "IN" && fields[5] == "Anywhere" &&
+                tolower(fields[6]) == "(v6)") {
+                found=1
+            }
+        }
+        END { exit !found }
+    '
+}
+
+firewall_record_is_live() {
+    local record="$1"
+    local backend field2 field3 field4 field5 status
+    IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+    case "$backend" in
+        ufw)
+            ufw_port_is_open "$field2" "$field3" "$field4"
+            status=$?
+            ;;
+        firewalld)
+            if [ "$field2" = permanent ]; then
+                firewall-cmd --permanent --zone="$field3" --query-port="${field4}/${field5}" >/dev/null 2>&1
+            else
+                firewall-cmd --zone="$field3" --query-port="${field4}/${field5}" >/dev/null 2>&1
+            fi
+            status=$?
+            ;;
+        iptables)
+            if [ "$field2" = 4 ]; then
+                iptables -C INPUT -p "$field5" --dport "$field4" -m comment --comment "$field3" -j ACCEPT >/dev/null 2>&1
+            else
+                ip6tables -C INPUT -p "$field5" --dport "$field4" -m comment --comment "$field3" -j ACCEPT >/dev/null 2>&1
+            fi
+            status=$?
+            ;;
+        *) return 1 ;;
+    esac
+    case "$status" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+raw_port_is_open() {
+    local family="$1" port="$2" proto="$3"
+    if [ "$family" = 4 ]; then
+        iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1
+    else
+        ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1
+    fi
+}
+
+raw_input_policy_is_accept() {
+    local family="$1" policy
+    if [ "$family" = 4 ]; then
+        policy=$(iptables -S INPUT 2>/dev/null | awk '$1 == "-P" && $2 == "INPUT" { print $3; exit }')
+    else
+        policy=$(ip6tables -S INPUT 2>/dev/null | awk '$1 == "-P" && $2 == "INPUT" { print $3; exit }')
+    fi
+    [ "$policy" = ACCEPT ]
+}
+
+raw_input_chain_is_unfiltered() {
+    local family="${1:-}" rules
+
+    case "$family" in
+        4) rules=$(iptables -S INPUT 2>/dev/null) || return 2 ;;
+        6) rules=$(ip6tables -S INPUT 2>/dev/null) || return 2 ;;
+        *) return 2 ;;
+    esac
+    rules=$(printf '%s' "$rules" | tr -d '\r')
+    [ "$rules" = '-P INPUT ACCEPT' ]
+}
+
+raw_command_uses_nft() {
+    local family="${1:-}" version_output
+
+    case "$family" in
+        4) version_output=$(iptables -V 2>/dev/null) || return 2 ;;
+        6) version_output=$(ip6tables -V 2>/dev/null) || return 2 ;;
+        *) return 2 ;;
+    esac
+    [[ "$version_output" == *nf_tables* ]]
+}
+
+# Return 0 when an unmanaged nftables base chain actively handles INPUT,
+# 1 when no such hook exists (including nft not installed), and 2 when the
+# ruleset cannot be queried or parsed safely.  This helper never mutates nft.
+nft_input_filter_status() {
+    local ignore_v4="${1:-0}" ignore_v6="${2:-0}" ruleset status
+
+    [[ "$ignore_v4" =~ ^[01]$ && "$ignore_v6" =~ ^[01]$ ]] || return 2
+    command_exists nft || return 1
+    ruleset=$(nft -j list ruleset 2>/dev/null) || return 2
+    printf '%s' "$ruleset" | jq -e \
+        'type == "object" and (.nftables | type == "array")' >/dev/null 2>&1 || return 2
+    if printf '%s' "$ruleset" | jq -e --arg ignore_v4 "$ignore_v4" --arg ignore_v6 "$ignore_v6" \
+        '[.nftables[]? | .chain? |
+          select(type == "object" and .hook == "input") |
+          select((((($ignore_v4 == "1") and .family == "ip" and .table == "filter" and .name == "INPUT") or
+                   (($ignore_v6 == "1") and .family == "ip6" and .table == "filter" and .name == "INPUT"))) | not)] |
+         length > 0' \
+        >/dev/null 2>&1; then
+        return 0
+    else
+        status=$?
+    fi
+    [ "$status" -eq 1 ] && return 1
+    return 2
+}
+
+firewall_state_matches_backend() {
+    local selected_backend="${1:-}" expected_backend record record_backend
+
+    case "$selected_backend" in
+        ufw) expected_backend=ufw ;;
+        firewalld) expected_backend=firewalld ;;
+        raw) expected_backend=iptables ;;
+        none|nft-unmanaged|partial-raw)
+            [ "${#FIREWALL_STATE_RECORDS[@]}" -eq 0 ]
+            return
+            ;;
+        *) return 1 ;;
+    esac
+    for record in "${FIREWALL_STATE_RECORDS[@]}"; do
+        record_backend="${record%%|*}"
+        [ "$record_backend" = "$expected_backend" ] || return 1
+    done
+}
+
+raw_firewall_persistence_available() {
+    local family="${1:-}"
+
+    case "$family" in 4|6) ;; *) return 1 ;; esac
+    if command_exists netfilter-persistent; then
+        return 0
+    fi
+    command_exists rc-service || return 1
+    if [ "$family" = 4 ]; then
+        rc-service -e iptables >/dev/null 2>&1
+    else
+        rc-service -e ip6tables >/dev/null 2>&1
+    fi
+}
+
+add_firewall_record() {
+    local record="$1"
+    local backend field2 field3 field4 field5
+    IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+    case "$backend" in
+        ufw)
+            if [ "$field2" = 4 ]; then
+                ufw allow in proto "$field4" to 0.0.0.0/0 port "$field3" >/dev/null 2>&1
+            else
+                ufw allow in proto "$field4" to ::/0 port "$field3" >/dev/null 2>&1
+            fi
+            ;;
+        firewalld)
+            if [ "$field2" = permanent ]; then
+                firewall-cmd --permanent --zone="$field3" --add-port="${field4}/${field5}" >/dev/null 2>&1
+            else
+                firewall-cmd --zone="$field3" --add-port="${field4}/${field5}" >/dev/null 2>&1
+            fi
+            ;;
+        iptables)
+            if [ "$field2" = 4 ]; then
+                iptables -I INPUT -p "$field5" --dport "$field4" -m comment --comment "$field3" -j ACCEPT >/dev/null 2>&1
+            else
+                ip6tables -I INPUT -p "$field5" --dport "$field4" -m comment --comment "$field3" -j ACCEPT >/dev/null 2>&1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+delete_firewall_record() {
+    local record="$1"
+    local backend field2 field3 field4 field5
+    IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+    case "$backend" in
+        ufw)
+            if [ "$field2" = 4 ]; then
+                ufw delete allow in proto "$field4" to 0.0.0.0/0 port "$field3" >/dev/null 2>&1
+            else
+                ufw delete allow in proto "$field4" to ::/0 port "$field3" >/dev/null 2>&1
+            fi
+            ;;
+        firewalld)
+            if [ "$field2" = permanent ]; then
+                firewall-cmd --permanent --zone="$field3" --remove-port="${field4}/${field5}" >/dev/null 2>&1
+            else
+                firewall-cmd --zone="$field3" --remove-port="${field4}/${field5}" >/dev/null 2>&1
+            fi
+            ;;
+        iptables)
+            if [ "$field2" = 4 ]; then
+                iptables -D INPUT -p "$field5" --dport "$field4" -m comment --comment "$field3" -j ACCEPT >/dev/null 2>&1
+            else
+                ip6tables -D INPUT -p "$field5" --dport "$field4" -m comment --comment "$field3" -j ACCEPT >/dev/null 2>&1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+persist_raw_firewall_rules() {
+    local family service_name
+    local -a families=("$@")
+
+    [ "${#families[@]}" -gt 0 ] || return 0
+    if command_exists netfilter-persistent; then
+        netfilter-persistent save >/dev/null 2>&1
+        return $?
+    fi
+    command_exists rc-service || return 1
+    for family in "${families[@]}"; do
+        case "$family" in
+            4) service_name=iptables ;;
+            6) service_name=ip6tables ;;
+            *) return 1 ;;
+        esac
+        rc-service -e "$service_name" >/dev/null 2>&1 || return 1
+        rc-service "$service_name" save >/dev/null 2>&1 || return 1
+    done
+}
+
+rollback_added_firewall_records() {
+    local status=0 index
+    local -a records=("$@")
+    for ((index=${#records[@]} - 1; index >= 0; index--)); do
+        delete_firewall_record "${records[$index]}" || status=1
+    done
+    return "$status"
+}
+
+rollback_deleted_firewall_records() {
+    local status=0 record
+    for record in "$@"; do
+        add_firewall_record "$record" || status=1
+    done
+    return "$status"
+}
+
+rollback_firewall_add_transaction() {
+    local raw_families="${1:-}"
+    shift
     local status=0
+    local -a records=("$@") changed_families=()
+
+    [ -z "$raw_families" ] || IFS=',' read -r -a changed_families <<< "$raw_families"
+
+    rollback_added_firewall_records "${records[@]}" || status=1
+    [ "${#changed_families[@]}" -eq 0 ] || \
+        persist_raw_firewall_rules "${changed_families[@]}" >/dev/null 2>&1 || status=1
+    if [ "$status" = 0 ]; then
+        return 1
+    fi
+    write_firewall_recovery_records "${records[@]}" >/dev/null 2>&1 || true
+    red "防火墙新规则回滚不完整，已保留 recovery 证据。"
+    return 2
+}
+
+rollback_firewall_delete_transaction() {
+    local raw_families="${1:-}"
+    shift
+    local status=0
+    local -a records=("$@") changed_families=()
+
+    [ -z "$raw_families" ] || IFS=',' read -r -a changed_families <<< "$raw_families"
+
+    rollback_deleted_firewall_records "${records[@]}" || status=1
+    [ "${#changed_families[@]}" -eq 0 ] || \
+        persist_raw_firewall_rules "${changed_families[@]}" >/dev/null 2>&1 || status=1
+    [ "$status" = 0 ] && return 1
+    red "防火墙删除回滚不完整，已保留原 firewall.state 作为证据。"
+    return 2
+}
+
+_allow_port_locked() {
+    local has_v4=0 has_v6=0 backend zone port proto rule record family
+    local raw_changed_csv='' state_changed=0 live_status compatibility_status persistence_missing=0
+    local nft_ignore_v4=0 nft_ignore_v6=0 raw_version_status
+    local recovery_file="${FIREWALL_RECOVERY_FILE:-${work_dir}/firewall.recovery}"
+    local -a requested_rules=() added_records=() new_state_records=() created_ownership_records=() raw_changed_families=() raw_preflight_families=()
+
+    FIREWALL_LAST_ADDED_RECORDS=()
+    [ ! -e "$recovery_file" ] && [ ! -L "$recovery_file" ] || {
+        red "存在未处理的 firewall.recovery，拒绝继续修改防火墙。"
+        return 2
+    }
 
     if [ "${1:-}" = --families ]; then
         [ "$#" -ge 4 ] || return 1
@@ -1715,11 +2232,6 @@ allow_port() {
         ipv6_stack_available && has_v6=1
     fi
     [ "$has_v4" = 1 ] || [ "$has_v6" = 1 ] || return 1
-
-    command_exists ufw && has_ufw=1
-    command_exists firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1 && has_firewalld=1
-    [ "$has_v4" = 1 ] && command_exists iptables && has_iptables=1
-    [ "$has_v6" = 1 ] && command_exists ip6tables && has_ip6tables=1
 
     while [ "$#" -gt 0 ]; do
         rule="$1"
@@ -1734,44 +2246,824 @@ allow_port() {
             shift 2
         fi
         validate_port_value "$port" firewall_port || return 1
-        case "$proto" in
-            tcp|udp) ;;
-            *) red "不支持的防火墙协议: $proto"; return 1 ;;
-        esac
+        case "$proto" in tcp|udp) ;; *) red "不支持的防火墙协议: $proto"; return 1 ;; esac
+        requested_rules+=("${port}|${proto}")
+    done
+    [ "${#requested_rules[@]}" -gt 0 ] || return 1
 
-        if [ "$has_ufw" -eq 1 ]; then
-            ufw allow in "${port}/${proto}" >/dev/null 2>&1 || status=1
+    read_firewall_state || { red "firewall.state 损坏或不安全，拒绝修改防火墙。"; return 1; }
+    new_state_records=("${FIREWALL_STATE_RECORDS[@]}")
+    backend=$(select_firewall_backend "$has_v4" "$has_v6") || { red "未找到可用的防火墙后端。"; return 1; }
+    firewall_state_matches_backend "$backend" || {
+        red "当前防火墙后端与 firewall.state 的所有权记录不一致，拒绝混用后端。"
+        return 1
+    }
+    if command_exists nft; then
+        if [ "$has_v4" = 1 ] && command_exists iptables; then
+            if raw_command_uses_nft 4; then raw_version_status=0; else raw_version_status=$?; fi
+            case "$raw_version_status" in
+                0) nft_ignore_v4=1 ;;
+                1) ;;
+                *) red "无法确认 iptables 使用的后端，拒绝混用 nftables。"; return 2 ;;
+            esac
         fi
-        if [ "$has_firewalld" -eq 1 ]; then
-            firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || status=1
+        if [ "$has_v6" = 1 ] && command_exists ip6tables; then
+            if raw_command_uses_nft 6; then raw_version_status=0; else raw_version_status=$?; fi
+            case "$raw_version_status" in
+                0) nft_ignore_v6=1 ;;
+                1) ;;
+                *) red "无法确认 ip6tables 使用的后端，拒绝混用 nftables。"; return 2 ;;
+            esac
         fi
-        if [ "$has_iptables" -eq 1 ]; then
-            iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
-                iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT || status=1
+    fi
+    if [ "$backend" = none ]; then
+        yellow "未检测到本机防火墙后端；未修改本机规则，请确认云防火墙或安全组已放行所需端口。"
+        return 0
+    fi
+    if [ "$backend" = nft-unmanaged ]; then
+        if nft_input_filter_status 0 0; then compatibility_status=0; else compatibility_status=$?; fi
+        case "$compatibility_status" in
+            0)
+                red "检测到 nftables INPUT 过滤链；脚本不会接管未知规则，请手动放行所需端口。"
+                return 1
+                ;;
+            1)
+                yellow "未检测到本机防火墙后端；nftables 没有 INPUT 过滤链，未修改本机规则。"
+                return 0
+                ;;
+            *)
+                red "无法安全确认 nftables INPUT 状态，拒绝跳过防火墙检查。"
+                return 2
+                ;;
+        esac
+    fi
+    if [ "$backend" = partial-raw ]; then
+        if nft_input_filter_status "$nft_ignore_v4" "$nft_ignore_v6"; then compatibility_status=0; else compatibility_status=$?; fi
+        case "$compatibility_status" in
+            0)
+                red "双栈防火墙后端不完整，且检测到 nftables INPUT 过滤链；请手动放行端口。"
+                return 1
+                ;;
+            1) ;;
+            *)
+                red "双栈防火墙后端不完整，且无法安全确认 nftables 状态。"
+                return 2
+                ;;
+        esac
+        for family in 4 6; do
+            if [ "$family" = 4 ]; then
+                [ "$has_v4" = 1 ] && command_exists iptables || continue
+            else
+                [ "$has_v6" = 1 ] && command_exists ip6tables || continue
+            fi
+            if raw_input_chain_is_unfiltered "$family"; then compatibility_status=0; else compatibility_status=$?; fi
+            case "$compatibility_status" in
+                0) ;;
+                1)
+                    red "双栈防火墙后端不完整，且现有 INPUT 链正在过滤；请手动放行端口。"
+                    return 1
+                    ;;
+                *)
+                    red "双栈防火墙后端不完整，且无法安全读取现有 INPUT 链。"
+                    return 2
+                    ;;
+            esac
+        done
+        yellow "双栈防火墙后端不完整；现有 INPUT 链未启用过滤，本次未修改任何 family 的规则。"
+        return 0
+    fi
+    if [ "$backend" = firewalld ]; then
+        zone=$(firewall-cmd --get-default-zone 2>/dev/null) || return 1
+        [[ "$zone" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+    fi
+
+    if [ "$backend" = raw ]; then
+        if nft_input_filter_status "$nft_ignore_v4" "$nft_ignore_v6"; then
+            compatibility_status=0
+        else
+            compatibility_status=$?
         fi
-        if [ "$has_ip6tables" -eq 1 ]; then
-            ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
-                ip6tables -I INPUT -p "$proto" --dport "$port" -j ACCEPT || status=1
+        case "$compatibility_status" in
+            0)
+                red "检测到不属于 iptables 兼容层的 nftables INPUT 过滤链；请手动放行端口。"
+                return 1
+                ;;
+            1) ;;
+            *)
+                red "无法安全确认 raw 与 nftables 的 INPUT 链关系，拒绝修改防火墙。"
+                return 2
+                ;;
+        esac
+        for rule in "${requested_rules[@]}"; do
+            port="${rule%|*}"
+            proto="${rule#*|}"
+            for family in 4 6; do
+                [ "$family" = 4 ] && [ "$has_v4" = 0 ] && continue
+                [ "$family" = 6 ] && [ "$has_v6" = 0 ] && continue
+                record="iptables|${family}|sing-box-pre|${port}|${proto}"
+                if firewall_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+                case "$live_status" in
+                    0) ;;
+                    1)
+                        case " ${raw_preflight_families[*]} " in
+                            *" ${family} "*) ;;
+                            *) raw_preflight_families+=("$family") ;;
+                        esac
+                        ;;
+                    *) return 1 ;;
+                esac
+            done
+        done
+        for family in "${raw_preflight_families[@]}"; do
+            raw_firewall_persistence_available "$family" || persistence_missing=1
+        done
+        if [ "$persistence_missing" = 1 ]; then
+            [ "${#FIREWALL_STATE_RECORDS[@]}" -eq 0 ] || {
+                red "已有防火墙所有权记录，但原始规则持久化能力已丢失，拒绝静默降级。"
+                return 1
+            }
+            for family in 4 6; do
+                [ "$family" = 4 ] && [ "$has_v4" = 0 ] && continue
+                [ "$family" = 6 ] && [ "$has_v6" = 0 ] && continue
+                if raw_input_chain_is_unfiltered "$family"; then compatibility_status=0; else compatibility_status=$?; fi
+                case "$compatibility_status" in
+                    0) ;;
+                    1)
+                        red "原始防火墙缺少持久化能力，且现有 INPUT 链正在过滤；请手动放行端口。"
+                        return 1
+                        ;;
+                    *)
+                        red "原始防火墙缺少持久化能力，且无法安全读取 INPUT 链。"
+                        return 2
+                        ;;
+                esac
+            done
+            yellow "原始防火墙缺少持久化能力，但 INPUT 链未启用过滤；未插入临时规则，请确认云安全组。"
+            return 0
         fi
+    fi
+
+    for rule in "${requested_rules[@]}"; do
+        port="${rule%|*}"
+        proto="${rule#*|}"
+        case "$backend" in
+            ufw)
+                for family in 4 6; do
+                    [ "$family" = 4 ] && [ "$has_v4" = 0 ] && continue
+                    [ "$family" = 6 ] && [ "$has_v6" = 0 ] && continue
+                    record="ufw|${family}|${port}|${proto}"
+                    if firewall_state_has_record "$record"; then
+                        if firewall_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+                        case "$live_status" in
+                            0) ;;
+                            1)
+                                add_firewall_record "$record" || {
+                                    rollback_firewall_add_transaction '' "${added_records[@]}"
+                                    return $?
+                                }
+                                added_records+=("$record")
+                                ;;
+                            *)
+                                rollback_firewall_add_transaction '' "${added_records[@]}"
+                                return $?
+                                ;;
+                        esac
+                    else
+                        if firewall_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+                        case "$live_status" in
+                            0) ;;
+                            1)
+                                add_firewall_record "$record" || {
+                                    rollback_firewall_add_transaction '' "${added_records[@]}"
+                                    return $?
+                                }
+                                added_records+=("$record")
+                                new_state_records+=("$record")
+                                created_ownership_records+=("$record")
+                                state_changed=1
+                                ;;
+                            *)
+                                rollback_firewall_add_transaction '' "${added_records[@]}"
+                                return $?
+                                ;;
+                        esac
+                    fi
+                done
+                ;;
+            firewalld)
+                for family in runtime permanent; do
+                    record="firewalld|${family}|${zone}|${port}|${proto}"
+                    if firewall_state_has_record "$record"; then
+                        if firewall_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+                        case "$live_status" in
+                            0) ;;
+                            1)
+                                add_firewall_record "$record" || {
+                                    rollback_firewall_add_transaction '' "${added_records[@]}"
+                                    return $?
+                                }
+                                added_records+=("$record")
+                                ;;
+                            *)
+                                rollback_firewall_add_transaction '' "${added_records[@]}"
+                                return $?
+                                ;;
+                        esac
+                    else
+                        if firewall_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+                        case "$live_status" in
+                            0) ;;
+                            1)
+                                add_firewall_record "$record" || {
+                                    rollback_firewall_add_transaction '' "${added_records[@]}"
+                                    return $?
+                                }
+                                added_records+=("$record")
+                                new_state_records+=("$record")
+                                created_ownership_records+=("$record")
+                                state_changed=1
+                                ;;
+                            *)
+                                rollback_firewall_add_transaction '' "${added_records[@]}"
+                                return $?
+                                ;;
+                        esac
+                    fi
+                done
+                ;;
+            raw)
+                for family in 4 6; do
+                    [ "$family" = 4 ] && [ "$has_v4" = 0 ] && continue
+                    [ "$family" = 6 ] && [ "$has_v6" = 0 ] && continue
+                    record="iptables|${family}|sing-box-pre|${port}|${proto}"
+                    # INPUT's default policy and unrelated ACCEPT rules do not
+                    # prove reachability; only our head-inserted marker counts.
+                    if firewall_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+                    case "$live_status" in
+                        0) ;;
+                        1)
+                            raw_firewall_persistence_available "$family" || {
+                                raw_changed_csv=$(IFS=,; printf '%s' "${raw_changed_families[*]}")
+                                rollback_firewall_add_transaction "$raw_changed_csv" "${added_records[@]}"
+                                return $?
+                            }
+                            add_firewall_record "$record" || {
+                                raw_changed_csv=$(IFS=,; printf '%s' "${raw_changed_families[*]}")
+                                rollback_firewall_add_transaction "$raw_changed_csv" "${added_records[@]}"
+                                return $?
+                            }
+                            added_records+=("$record")
+                            case " ${raw_changed_families[*]} " in
+                                *" ${family} "*) ;;
+                                *) raw_changed_families+=("$family") ;;
+                            esac
+                            if ! firewall_state_has_record "$record"; then
+                                new_state_records+=("$record")
+                                created_ownership_records+=("$record")
+                                state_changed=1
+                            fi
+                            ;;
+                        *)
+                            raw_changed_csv=$(IFS=,; printf '%s' "${raw_changed_families[*]}")
+                            rollback_firewall_add_transaction "$raw_changed_csv" "${added_records[@]}"
+                            return $?
+                            ;;
+                    esac
+                done
+                ;;
+        esac
     done
 
-    if [ "$has_firewalld" -eq 1 ]; then
-        firewall-cmd --reload >/dev/null 2>&1 || status=1
+    raw_changed_csv=$(IFS=,; printf '%s' "${raw_changed_families[*]}")
+    if [ "${#raw_changed_families[@]}" -gt 0 ] && \
+       ! persist_raw_firewall_rules "${raw_changed_families[@]}"; then
+        rollback_firewall_add_transaction "$raw_changed_csv" "${added_records[@]}"
+        return $?
     fi
-
-    if command_exists rc-service 2>/dev/null; then
-        [ "$has_iptables" -eq 0 ] || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        [ "$has_ip6tables" -eq 0 ] || ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    else
-        if { [ "$has_iptables" -eq 1 ] || [ "$has_ip6tables" -eq 1 ]; } && command_exists netfilter-persistent; then
-            netfilter-persistent save >/dev/null 2>&1
-        elif { [ "$has_iptables" -eq 1 ] || [ "$has_ip6tables" -eq 1 ]; } && command_exists service; then
-            service iptables save 2>/dev/null
-            service ip6tables save 2>/dev/null
-        fi
+    if [ "$state_changed" = 1 ] && ! write_firewall_state_records "${new_state_records[@]}"; then
+        rollback_firewall_add_transaction "$raw_changed_csv" "${added_records[@]}"
+        return $?
     fi
+    FIREWALL_LAST_ADDED_RECORDS=("${created_ownership_records[@]}")
+}
 
+allow_port() {
+    local status
+    acquire_firewall_lock || return 1
+    _allow_port_locked "$@"
+    status=$?
+    release_firewall_lock
     return "$status"
+}
+
+firewall_record_backend_available() {
+    local record="$1" backend field2 field3 field4 field5
+    IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+    case "$backend" in
+        ufw) ufw_is_active ;;
+        firewalld) firewalld_is_active ;;
+        iptables)
+            if [ "$field2" = 4 ]; then command_exists iptables; else command_exists ip6tables; fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+_remove_owned_firewall_records_locked() {
+    local mode="${1:-}" state_file="${FIREWALL_STATE_FILE:-${work_dir}/firewall.state}"
+    shift || return 1
+    local wanted="${1:-}" record candidate backend field2 field3 field4 field5 record_rule
+    local raw_changed_csv='' selected=0 family live_status
+    local recovery_file="${FIREWALL_RECOVERY_FILE:-${work_dir}/firewall.recovery}"
+    local -a exact_records=("$@") selected_records=() remaining_records=() deleted_records=() raw_changed_families=()
+
+    [ ! -e "$recovery_file" ] && [ ! -L "$recovery_file" ] || {
+        red "存在未处理的 firewall.recovery，拒绝自动删除并保留证据。"
+        return 2
+    }
+    read_firewall_state || { red "firewall.state 损坏或不安全，拒绝删除防火墙规则。"; return 1; }
+    [ -e "$state_file" ] || return 0
+    if [ "$mode" = port ]; then
+        [[ "$wanted" == */* ]] || return 1
+        validate_port_value "${wanted%/*}" firewall_port || return 1
+        case "${wanted#*/}" in tcp|udp) ;; *) return 1 ;; esac
+    elif [ "$mode" = exact ]; then
+        [ "${#exact_records[@]}" -gt 0 ] || return 0
+    elif [ "$mode" != all ]; then
+        return 1
+    fi
+
+    for record in "${FIREWALL_STATE_RECORDS[@]}"; do
+        IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+        case "$backend" in
+            ufw) record_rule="${field3}/${field4}" ;;
+            firewalld|iptables) record_rule="${field4}/${field5}" ;;
+            *) return 1 ;;
+        esac
+        selected=0
+        if [ "$mode" = all ] || { [ "$mode" = port ] && [ "$record_rule" = "$wanted" ]; }; then
+            selected=1
+        elif [ "$mode" = exact ]; then
+            for candidate in "${exact_records[@]}"; do
+                [ "$candidate" = "$record" ] && { selected=1; break; }
+            done
+        fi
+        if [ "$selected" = 1 ]; then
+            selected_records+=("$record")
+        else
+            remaining_records+=("$record")
+        fi
+    done
+    [ "${#selected_records[@]}" -gt 0 ] || return 0
+
+    for record in "${selected_records[@]}"; do
+        firewall_record_backend_available "$record" || return 1
+        IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+        if firewall_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+        case "$live_status" in
+            0)
+                if [ "$backend" = iptables ] && ! raw_firewall_persistence_available "$field2"; then
+                    return 1
+                fi
+                ;;
+            1) ;;
+            *) return 1 ;;
+        esac
+    done
+    for record in "${selected_records[@]}"; do
+        IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+        if firewall_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+        case "$live_status" in
+            0)
+                if [ "$backend" = iptables ] && ! raw_firewall_persistence_available "$field2"; then
+                    raw_changed_csv=$(IFS=,; printf '%s' "${raw_changed_families[*]}")
+                    rollback_firewall_delete_transaction "$raw_changed_csv" "${deleted_records[@]}"
+                    return $?
+                fi
+                if ! delete_firewall_record "$record"; then
+                    raw_changed_csv=$(IFS=,; printf '%s' "${raw_changed_families[*]}")
+                    rollback_firewall_delete_transaction "$raw_changed_csv" "${deleted_records[@]}"
+                    return $?
+                fi
+                deleted_records+=("$record")
+                if [[ "$record" == iptables\|* ]]; then
+                    family="$field2"
+                    case " ${raw_changed_families[*]} " in
+                        *" ${family} "*) ;;
+                        *) raw_changed_families+=("$family") ;;
+                    esac
+                fi
+                ;;
+            1) ;;
+            *)
+                raw_changed_csv=$(IFS=,; printf '%s' "${raw_changed_families[*]}")
+                rollback_firewall_delete_transaction "$raw_changed_csv" "${deleted_records[@]}"
+                return $?
+                ;;
+        esac
+    done
+    raw_changed_csv=$(IFS=,; printf '%s' "${raw_changed_families[*]}")
+    if [ "${#raw_changed_families[@]}" -gt 0 ] && \
+       ! persist_raw_firewall_rules "${raw_changed_families[@]}"; then
+        rollback_firewall_delete_transaction "$raw_changed_csv" "${deleted_records[@]}"
+        return $?
+    fi
+
+    if [ "${#remaining_records[@]}" -gt 0 ]; then
+        if ! write_firewall_state_records "${remaining_records[@]}"; then
+            rollback_firewall_delete_transaction "$raw_changed_csv" "${deleted_records[@]}"
+            return $?
+        fi
+    elif ! rm -f -- "$state_file"; then
+        rollback_firewall_delete_transaction "$raw_changed_csv" "${deleted_records[@]}"
+        return $?
+    fi
+}
+
+_remove_owned_firewall_port_locked() {
+    if [ "${1:-}" = --all ]; then
+        _remove_owned_firewall_records_locked all
+    else
+        _remove_owned_firewall_records_locked port "$1"
+    fi
+}
+
+remove_owned_firewall_port() {
+    local status
+    acquire_firewall_lock || return 1
+    _remove_owned_firewall_port_locked "$@"
+    status=$?
+    release_firewall_lock
+    return "$status"
+}
+
+remove_owned_firewall_records_exact() {
+    local status
+    [ "$#" -gt 0 ] || return 0
+    acquire_firewall_lock || return 1
+    _remove_owned_firewall_records_locked exact "$@"
+    status=$?
+    release_firewall_lock
+    return "$status"
+}
+
+_remove_owned_firewall_ports_locked() {
+    local requested_rule record backend field2 field3 field4 field5 record_rule
+    local -a requested_rules=("$@") exact_records=()
+
+    [ "${#requested_rules[@]}" -gt 0 ] || return 0
+    for requested_rule in "${requested_rules[@]}"; do
+        [[ "$requested_rule" == */* ]] || return 1
+        validate_port_value "${requested_rule%/*}" firewall_port || return 1
+        case "${requested_rule#*/}" in tcp|udp) ;; *) return 1 ;; esac
+    done
+    read_firewall_state || return 1
+    for record in "${FIREWALL_STATE_RECORDS[@]}"; do
+        IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+        case "$backend" in
+            ufw) record_rule="${field3}/${field4}" ;;
+            firewalld|iptables) record_rule="${field4}/${field5}" ;;
+            *) return 1 ;;
+        esac
+        for requested_rule in "${requested_rules[@]}"; do
+            if [ "$record_rule" = "$requested_rule" ]; then
+                exact_records+=("$record")
+                break
+            fi
+        done
+    done
+    [ "${#exact_records[@]}" -gt 0 ] || return 0
+    _remove_owned_firewall_records_locked exact "${exact_records[@]}"
+}
+
+remove_owned_firewall_ports() {
+    local status
+
+    [ "$#" -gt 0 ] || return 0
+    acquire_firewall_lock || return 1
+    _remove_owned_firewall_ports_locked "$@"
+    status=$?
+    release_firewall_lock
+    return "$status"
+}
+
+configured_inbound_port_conflict_exists() {
+    local inbounds_file="${1:-}"
+    local port="${2:-}"
+    local proto="${3:-}"
+    local status
+
+    validate_port_value "$port" configured_inbound_port >/dev/null 2>&1 || return 2
+    case "$proto" in tcp|udp) ;; *) return 2 ;; esac
+    [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] && [ -r "$inbounds_file" ] || return 2
+    command_exists jq || return 2
+    jq -e '
+        type == "object" and
+        (.inbounds | type == "array") and
+        all(.inbounds[];
+            type == "object" and
+            ((.type // "") | type == "string") and
+            ((.listen_port // 0) | type == "number")
+        )
+    ' "$inbounds_file" >/dev/null 2>&1 || return 2
+    jq -e --argjson port "$port" --arg proto "$proto" '
+        def protocol_matches:
+            if (.type == "hysteria2" or .type == "tuic") then
+                $proto == "udp"
+            elif (.type == "socks" or .type == "shadowsocks") then
+                ($proto == "tcp" or $proto == "udp")
+            elif (.type == "vless" or .type == "vmess" or
+                  .type == "trojan" or .type == "anytls") then
+                $proto == "tcp"
+            else
+                true
+            end;
+        any(.inbounds[]; (.listen_port == $port) and protocol_matches)
+    ' "$inbounds_file" >/dev/null 2>&1
+    status=$?
+    case "$status" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+configured_inbound_firewall_consumer_exists() {
+    local inbounds_file="${1:-}"
+    local port="${2:-}"
+    local proto="${3:-}"
+    local family="${4:-any}"
+    local bindv6only=0 status
+
+    validate_port_value "$port" firewall_consumer_port >/dev/null 2>&1 || return 2
+    case "$proto" in tcp|udp) ;; *) return 2 ;; esac
+    case "$family" in 4|6|any) ;; *) return 2 ;; esac
+    [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] && [ -r "$inbounds_file" ] || return 2
+    command_exists jq || return 2
+    jq -e '
+        type == "object" and
+        (.inbounds | type == "array") and
+        all(.inbounds[];
+            type == "object" and
+            ((.type // "") | type == "string") and
+            ((.listen // "") | type == "string") and
+            ((.listen_port // 0) | type == "number")
+        )
+    ' "$inbounds_file" >/dev/null 2>&1 || return 2
+    bindv6only=$(get_bindv6only 2>/dev/null) || return 2
+    case "$bindv6only" in 0|1) ;; *) return 2 ;; esac
+
+    jq -e --argjson port "$port" --arg proto "$proto" \
+        --arg family "$family" --argjson bindv6only "$bindv6only" '
+        def protocol_matches:
+            if (.type == "hysteria2" or .type == "tuic") then
+                $proto == "udp"
+            elif (.type == "socks" or .type == "shadowsocks") then
+                ($proto == "tcp" or $proto == "udp")
+            elif (.type == "vless" or .type == "vmess" or
+                  .type == "trojan" or .type == "anytls") then
+                $proto == "tcp"
+            else
+                true
+            end;
+        def is_ipv4: test("^[0-9]+(\\.[0-9]+){3}$");
+        def is_ipv6: contains(":");
+        def is_loopback:
+            . == "localhost" or . == "::1" or test("^127\\.");
+        def listener_matches:
+            (.listen // "") as $listen |
+            if $listen == "" then
+                true
+            elif ($listen | is_loopback) then
+                false
+            elif $family == "any" then
+                true
+            elif $family == "4" then
+                ($listen == "0.0.0.0") or
+                ($listen == "::" and $bindv6only == 0) or
+                (($listen | is_ipv4) and ($listen | test("^127\\.") | not)) or
+                (($listen | is_ipv4 | not) and ($listen | is_ipv6 | not))
+            else
+                ($listen == "::") or ($listen | is_ipv6) or
+                (($listen | is_ipv4 | not) and ($listen | is_ipv6 | not))
+            end;
+        any(.inbounds[];
+            (.listen_port == $port) and protocol_matches and listener_matches
+        )
+    ' "$inbounds_file" >/dev/null 2>&1
+    status=$?
+    case "$status" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+nginx_configured_port_conflict_exists() {
+    local config_file="${1:-}"
+    local port="${2:-}"
+    local proto="${3:-}"
+
+    validate_port_value "$port" nginx_configured_port >/dev/null 2>&1 || return 2
+    case "$proto" in
+        udp) return 1 ;;
+        tcp) ;;
+        *) return 2 ;;
+    esac
+    [ -e "$config_file" ] || [ -L "$config_file" ] || return 1
+    [ -f "$config_file" ] && [ ! -L "$config_file" ] && [ -r "$config_file" ] || return 2
+    awk -v wanted_port="$port" '
+        {
+            line=$0
+            sub(/#.*/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            if (line !~ /^listen[[:space:]]+/) next
+            sub(/^listen[[:space:]]+/, "", line)
+            target=line
+            sub(/[[:space:];].*$/, "", target)
+            candidate_port=""
+            if (target ~ /^\[[^]]+\]:[0-9]+$/) {
+                candidate_port=target
+                sub(/^.*\]:/, "", candidate_port)
+            } else if (target ~ /^[0-9]+$/) {
+                candidate_port=target
+            } else if (target ~ /:[0-9]+$/) {
+                candidate_port=target
+                sub(/^.*:/, "", candidate_port)
+            }
+            if (candidate_port == wanted_port) found=1
+        }
+        END { exit !found }
+    ' "$config_file"
+}
+
+nginx_firewall_consumer_exists() {
+    local config_file="${1:-}"
+    local port="${2:-}"
+    local family="${3:-any}"
+
+    validate_port_value "$port" nginx_consumer_port >/dev/null 2>&1 || return 2
+    case "$family" in 4|6|any) ;; *) return 2 ;; esac
+    [ -e "$config_file" ] || [ -L "$config_file" ] || return 1
+    [ -f "$config_file" ] && [ ! -L "$config_file" ] && [ -r "$config_file" ] || return 2
+
+    awk -v wanted_port="$port" -v family="$family" '
+        function is_v4(value) {
+            return value ~ /^[0-9]+(\.[0-9]+){3}$/
+        }
+        function is_loopback(value) {
+            return value == "localhost" || value == "::1" || value ~ /^127\./
+        }
+        function matches_family(host, options) {
+            if (is_loopback(host)) return 0
+            if (family == "any") return 1
+            if (family == "4") {
+                if (host == "" || host == "*" || host == "0.0.0.0") return 1
+                if (host == "::") return options ~ /(^|[[:space:]])ipv6only=off([[:space:];]|$)/
+                if (is_v4(host)) return 1
+                if (index(host, ":") > 0) return 0
+                return 1
+            }
+            if (host == "::") return 1
+            if (index(host, ":") > 0) return 1
+            if (is_v4(host) || host == "" || host == "*" || host == "0.0.0.0") return 0
+            return 1
+        }
+        {
+            line=$0
+            sub(/#.*/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            if (line !~ /^listen[[:space:]]+/) next
+            sub(/^listen[[:space:]]+/, "", line)
+            target=line
+            sub(/[[:space:];].*$/, "", target)
+            options=line
+            sub(/^[^[:space:];]+[[:space:];]*/, "", options)
+            host=""
+            candidate_port=""
+            if (target ~ /^\[[^]]+\]:[0-9]+$/) {
+                host=target
+                sub(/^\[/, "", host)
+                sub(/\]:[0-9]+$/, "", host)
+                candidate_port=target
+                sub(/^.*\]:/, "", candidate_port)
+            } else if (target ~ /^[0-9]+$/) {
+                candidate_port=target
+            } else if (target ~ /:[0-9]+$/) {
+                host=target
+                sub(/:[0-9]+$/, "", host)
+                candidate_port=target
+                sub(/^.*:/, "", candidate_port)
+            } else {
+                next
+            }
+            if (candidate_port == wanted_port && matches_family(host, options)) found=1
+        }
+        END { exit !found }
+    ' "$config_file"
+}
+
+firewall_record_has_configured_consumer() {
+    local record="${1:-}"
+    local inbounds_file="${2:-}"
+    local nginx_config="${3:-}"
+    local backend field2 field3 field4 field5 family port proto status
+
+    IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+    case "$backend" in
+        ufw)
+            family="$field2"
+            port="$field3"
+            proto="$field4"
+            ;;
+        firewalld)
+            family=any
+            port="$field4"
+            proto="$field5"
+            ;;
+        iptables)
+            family="$field2"
+            port="$field4"
+            proto="$field5"
+            ;;
+        *) return 2 ;;
+    esac
+
+    if configured_inbound_firewall_consumer_exists "$inbounds_file" "$port" "$proto" "$family"; then
+        return 0
+    else
+        status=$?
+    fi
+    [ "$status" -eq 1 ] || return 2
+    if [ "$proto" = tcp ] && [ -n "$nginx_config" ]; then
+        if nginx_firewall_consumer_exists "$nginx_config" "$port" "$family"; then
+            return 0
+        else
+            status=$?
+        fi
+        [ "$status" -eq 1 ] || return 2
+    fi
+    return 1
+}
+
+_remove_owned_firewall_ports_if_unused_locked() {
+    local inbounds_file="${1:-}"
+    shift || return 1
+    local nginx_config='' requested_rule record backend field2 field3 field4 field5 record_rule status
+    local -a requested_rules=() exact_records=()
+
+    if [ "${1:-}" = --nginx-config ]; then
+        [ "$#" -ge 3 ] || return 1
+        nginx_config="$2"
+        shift 2
+    fi
+    requested_rules=("$@")
+    [ "${#requested_rules[@]}" -gt 0 ] || return 0
+    for requested_rule in "${requested_rules[@]}"; do
+        [[ "$requested_rule" == */* ]] || return 1
+        validate_port_value "${requested_rule%/*}" firewall_port || return 1
+        case "${requested_rule#*/}" in tcp|udp) ;; *) return 1 ;; esac
+    done
+    read_firewall_state || return 1
+    for record in "${FIREWALL_STATE_RECORDS[@]}"; do
+        IFS='|' read -r backend field2 field3 field4 field5 <<< "$record"
+        case "$backend" in
+            ufw) record_rule="${field3}/${field4}" ;;
+            firewalld|iptables) record_rule="${field4}/${field5}" ;;
+            *) return 1 ;;
+        esac
+        for requested_rule in "${requested_rules[@]}"; do
+            [ "$record_rule" = "$requested_rule" ] || continue
+            if firewall_record_has_configured_consumer "$record" "$inbounds_file" "$nginx_config"; then
+                status=0
+            else
+                status=$?
+            fi
+            case "$status" in
+                0) ;;
+                1) exact_records+=("$record") ;;
+                *) return 2 ;;
+            esac
+            break
+        done
+    done
+    [ "${#exact_records[@]}" -gt 0 ] || return 0
+    _remove_owned_firewall_records_locked exact "${exact_records[@]}"
+}
+
+remove_owned_firewall_ports_if_unused() {
+    local status
+
+    [ "$#" -gt 1 ] || return 1
+    acquire_firewall_lock || return 1
+    _remove_owned_firewall_ports_if_unused_locked "$@"
+    status=$?
+    release_firewall_lock
+    return "$status"
+}
+
+remove_owned_firewall_rules() {
+    remove_owned_firewall_port --all
 }
 
 configure_hy2_nat_family() {
@@ -1962,19 +3254,155 @@ write_hy2_nat_state_records() {
 }
 
 persist_hy2_nat_rules() {
-    local status=0
+    local requested_family family service_name initd_dir
+    local -a families=()
+
+    for requested_family in "$@"; do
+        case "$requested_family" in
+            4|iptables) family=iptables ;;
+            6|ip6tables) family=ip6tables ;;
+            *) return 1 ;;
+        esac
+        case " ${families[*]} " in
+            *" ${family} "*) ;;
+            *) families+=("$family") ;;
+        esac
+    done
+    [ "${#families[@]}" -gt 0 ] || return 0
 
     if command_exists netfilter-persistent; then
         netfilter-persistent save >/dev/null 2>&1
-    elif command_exists service; then
-        if command_exists iptables; then
-            service iptables save >/dev/null 2>&1 || status=1
-        fi
-        if command_exists ip6tables; then
-            service ip6tables save >/dev/null 2>&1 || status=1
-        fi
-        return "$status"
+        return $?
     fi
+
+    if command_exists rc-service; then
+        # Preflight every changed family before saving any of them, avoiding a
+        # partial on-disk generation when (for example) only iptables exists.
+        for service_name in "${families[@]}"; do
+            rc-service -e "$service_name" >/dev/null 2>&1 || return 1
+        done
+        for service_name in "${families[@]}"; do
+            rc-service "$service_name" save >/dev/null 2>&1 || return 1
+        done
+        return 0
+    fi
+
+    if command_exists service; then
+        initd_dir="${HY2_INITD_DIR:-/etc/init.d}"
+        for service_name in "${families[@]}"; do
+            [ -x "${initd_dir}/${service_name}" ] || return 1
+        done
+        for service_name in "${families[@]}"; do
+            service "$service_name" save >/dev/null 2>&1 || return 1
+        done
+        return 0
+    fi
+
+    return 1
+}
+
+read_hy2_nat_state_records() {
+    local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
+    local record delimiters family chain comment min_port max_port listen_port record_kind
+    local baseline_min='' baseline_max='' baseline_listen='' count=0 seen_v4=0 seen_v6=0
+    local -a records=() families=()
+
+    HY2_NAT_STATE_RECORDS=()
+    HY2_NAT_STATE_FAMILIES=()
+    HY2_NAT_STATE_MIN=''
+    HY2_NAT_STATE_MAX=''
+    HY2_NAT_STATE_LISTEN=''
+    [ -e "$state_file" ] || [ -L "$state_file" ] || return 1
+    [ -s "$state_file" ] && [ -f "$state_file" ] && [ ! -L "$state_file" ] && \
+        [ -r "$state_file" ] || return 2
+
+    while IFS= read -r record || [ -n "$record" ]; do
+        delimiters="${record//[!|]/}"
+        [ "${#delimiters}" -eq 6 ] || return 2
+        IFS='|' read -r family chain comment min_port max_port listen_port record_kind <<< "$record"
+        case "$family" in
+            iptables) [ "$seen_v4" -eq 0 ] || return 2; seen_v4=1 ;;
+            ip6tables) [ "$seen_v6" -eq 0 ] || return 2; seen_v6=1 ;;
+            *) return 2 ;;
+        esac
+        [ "${#chain}" -le 28 ] || return 2
+        case "$record_kind" in
+            created)
+                if [ "$family" = iptables ]; then
+                    [[ "$chain" =~ ^SBHY2_4_[0-9a-f]+_[0-9]{2}$ ]] || return 2
+                else
+                    [[ "$chain" =~ ^SBHY2_6_[0-9a-f]+_[0-9]{2}$ ]] || return 2
+                fi
+                [ "$comment" = "sb-hy2-${chain}" ] || return 2
+                ;;
+            adopted)
+                [ "$chain" = PRENET_HY2 ] && [ "$comment" = prenet-hy2 ] || return 2
+                ;;
+            *) return 2 ;;
+        esac
+        validate_port_value "$min_port" hy2_state_min_port >/dev/null 2>&1 || return 2
+        validate_port_value "$max_port" hy2_state_max_port >/dev/null 2>&1 || return 2
+        validate_port_value "$listen_port" hy2_state_listen_port >/dev/null 2>&1 || return 2
+        [ "$min_port" -lt "$max_port" ] || return 2
+        if [ "$count" -eq 0 ]; then
+            baseline_min="$min_port"
+            baseline_max="$max_port"
+            baseline_listen="$listen_port"
+        elif [ "$min_port" != "$baseline_min" ] || [ "$max_port" != "$baseline_max" ] || \
+             [ "$listen_port" != "$baseline_listen" ]; then
+            return 2
+        fi
+        records+=("$record")
+        families+=("$family")
+        count=$((count + 1))
+    done < "$state_file"
+    [ "$count" -gt 0 ] || return 2
+
+    HY2_NAT_STATE_RECORDS=("${records[@]}")
+    HY2_NAT_STATE_FAMILIES=("${families[@]}")
+    HY2_NAT_STATE_MIN="$baseline_min"
+    HY2_NAT_STATE_MAX="$baseline_max"
+    HY2_NAT_STATE_LISTEN="$baseline_listen"
+}
+
+hy2_nat_record_is_live() {
+    local record="${1:-}"
+    local firewall_cmd chain comment min_port max_port listen_port record_kind
+    local chain_rules prerouting_rules command_status dnat_count jump_count chain_rule_count
+    local expected_dnat expected_jump
+
+    IFS='|' read -r firewall_cmd chain comment min_port max_port listen_port record_kind <<< "$record"
+    command_exists "$firewall_cmd" || return 2
+    if chain_rules=$("$firewall_cmd" -t nat -S "$chain" 2>/dev/null); then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    case "$command_status" in 0) ;; 1) return 1 ;; *) return 2 ;; esac
+    if prerouting_rules=$("$firewall_cmd" -t nat -S PREROUTING 2>/dev/null); then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    case "$command_status" in 0) ;; 1) return 1 ;; *) return 2 ;; esac
+
+    expected_dnat="-A ${chain} -p udp --dport ${min_port}:${max_port} -m comment --comment ${comment} -j DNAT --to-destination :${listen_port}"
+    expected_jump="-A PREROUTING -p udp -m comment --comment ${comment} -j ${chain}"
+    chain_rule_count=$(printf '%s\n' "$chain_rules" | grep -c '^-A ' || true)
+    dnat_count=$(printf '%s\n' "$chain_rules" | grep -Fxc -- "$expected_dnat" || true)
+    jump_count=$(printf '%s\n' "$prerouting_rules" | grep -Fxc -- "$expected_jump" || true)
+    if [ "$dnat_count" -eq 0 ] && [ "$chain_rule_count" -eq 0 ]; then
+        return 1
+    fi
+    [ "$dnat_count" -eq 1 ] && [ "$chain_rule_count" -eq 1 ] || return 2
+    case "$jump_count" in 1) return 0 ;; 0) return 1 ;; *) return 2 ;; esac
+}
+
+get_desired_hy2_nat_families() {
+    HY2_DESIRED_NAT_FAMILIES=()
+    ipv4_stack_available && command_exists iptables && HY2_DESIRED_NAT_FAMILIES+=(iptables)
+    ipv6_stack_available && command_exists ip6tables && HY2_DESIRED_NAT_FAMILIES+=(ip6tables)
+    [ "${#HY2_DESIRED_NAT_FAMILIES[@]}" -gt 0 ]
 }
 
 add_hy2_port_hopping() {
@@ -1984,99 +3412,178 @@ add_hy2_port_hopping() {
     local configured=0
     local -a configured_families=()
     local -a configured_records=()
+    local -a new_records=()
     local -a old_records=()
+    local -a records_to_remove=()
     local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
-    local same_configuration=1 record family chain comment old_min old_max old_listen old_kind
+    local same_configuration=1 exact_family_set=1 record family live_status state_status
+    local desired_v4=0 desired_v6=0 state_v4=0 state_v6=0
 
     validate_port_value "$min_port" hy2_hop_min_port || return 1
     validate_port_value "$max_port" hy2_hop_max_port || return 1
     validate_port_value "$listen_port" hy2_listen_port || return 1
     [ "$min_port" -lt "$max_port" ] || return 1
 
-    if [ -s "$state_file" ]; then
-        mapfile -t old_records < "$state_file" || return 1
-        [ "${#old_records[@]}" -gt 0 ] || return 1
-        for record in "${old_records[@]}"; do
-            IFS='|' read -r family chain comment old_min old_max old_listen old_kind <<< "$record"
-            case "$family" in iptables|ip6tables) ;; *) return 1 ;; esac
-            [ -n "$chain" ] && [ -n "$comment" ] || return 1
-            validate_port_value "$old_min" hy2_state_min_port >/dev/null 2>&1 || return 1
-            validate_port_value "$old_max" hy2_state_max_port >/dev/null 2>&1 || return 1
-            validate_port_value "$old_listen" hy2_state_listen_port >/dev/null 2>&1 || return 1
-            if [ "$old_min" != "$min_port" ] || [ "$old_max" != "$max_port" ] || \
-                [ "$old_listen" != "$listen_port" ]; then
-                same_configuration=0
-            fi
-        done
-        if [ "$same_configuration" -eq 1 ]; then
-            persist_hy2_nat_rules
-            return $?
-        fi
-    fi
+    get_desired_hy2_nat_families || return 1
+    for family in "${HY2_DESIRED_NAT_FAMILIES[@]}"; do
+        case "$family" in iptables) desired_v4=1 ;; ip6tables) desired_v6=1 ;; esac
+    done
 
-    if ipv4_stack_available && command_exists iptables; then
+    if read_hy2_nat_state_records; then
+        state_status=0
+    else
+        state_status=$?
+    fi
+    case "$state_status" in
+        0)
+            old_records=("${HY2_NAT_STATE_RECORDS[@]}")
+            [ "$HY2_NAT_STATE_MIN" = "$min_port" ] && \
+                [ "$HY2_NAT_STATE_MAX" = "$max_port" ] && \
+                [ "$HY2_NAT_STATE_LISTEN" = "$listen_port" ] || same_configuration=0
+            for family in "${HY2_NAT_STATE_FAMILIES[@]}"; do
+                case "$family" in iptables) state_v4=1 ;; ip6tables) state_v6=1 ;; esac
+            done
+            [ "$desired_v4" -eq "$state_v4" ] && [ "$desired_v6" -eq "$state_v6" ] || \
+                exact_family_set=0
+            for record in "${old_records[@]}"; do
+                if hy2_nat_record_is_live "$record"; then live_status=0; else live_status=$?; fi
+                case "$live_status" in
+                    0) ;;
+                    *) return 2 ;;
+                esac
+            done
+            if [ "$same_configuration" -eq 1 ] && [ "$exact_family_set" -eq 1 ]; then
+                return 0
+            fi
+            if [ "$same_configuration" -eq 1 ]; then
+                for record in "${old_records[@]}"; do
+                    family="${record%%|*}"
+                    if { [ "$family" = iptables ] && [ "$desired_v4" -eq 1 ]; } || \
+                       { [ "$family" = ip6tables ] && [ "$desired_v6" -eq 1 ]; }; then
+                        configured_records+=("$record")
+                        configured=1
+                    else
+                        records_to_remove+=("$record")
+                    fi
+                done
+            else
+                records_to_remove=("${old_records[@]}")
+            fi
+            ;;
+        1) ;;
+        *) return 2 ;;
+    esac
+
+    if [ "$desired_v4" -eq 1 ] && \
+       { [ "$same_configuration" -eq 0 ] || [ "$state_v4" -eq 0 ]; }; then
         if ! configure_hy2_nat_family iptables "$min_port" "$max_port" "$listen_port"; then
             return 1
         fi
-        configured_families+=(iptables)
         configured_records+=("$HY2_NAT_CONFIGURED_RECORD")
+        new_records+=("$HY2_NAT_CONFIGURED_RECORD")
+        [[ "$HY2_NAT_CONFIGURED_RECORD" != *'|created' ]] || configured_families+=(iptables)
         configured=1
     fi
-    if ipv6_stack_available && command_exists ip6tables; then
+    if [ "$desired_v6" -eq 1 ] && \
+       { [ "$same_configuration" -eq 0 ] || [ "$state_v6" -eq 0 ]; }; then
         if ! configure_hy2_nat_family ip6tables "$min_port" "$max_port" "$listen_port"; then
-            rollback_new_hy2_nat_records "${configured_records[@]}"
+            rollback_new_hy2_nat_records "${new_records[@]}"
             return 1
         fi
-        configured_families+=(ip6tables)
         configured_records+=("$HY2_NAT_CONFIGURED_RECORD")
+        new_records+=("$HY2_NAT_CONFIGURED_RECORD")
+        [[ "$HY2_NAT_CONFIGURED_RECORD" != *'|created' ]] || configured_families+=(ip6tables)
         configured=1
     fi
     [ "$configured" -eq 1 ] || return 1
-    if ! persist_hy2_nat_rules; then
-        rollback_new_hy2_nat_records "${configured_records[@]}"
+    if ! persist_hy2_nat_rules "${configured_families[@]}"; then
+        rollback_new_hy2_nat_records "${new_records[@]}"
+        persist_hy2_nat_rules "${configured_families[@]}" >/dev/null 2>&1 || true
         return 1
     fi
     if ! write_hy2_nat_state_records "${configured_records[@]}"; then
-        rollback_new_hy2_nat_records "${configured_records[@]}"
-        persist_hy2_nat_rules >/dev/null 2>&1 || true
+        rollback_new_hy2_nat_records "${new_records[@]}"
+        persist_hy2_nat_rules "${configured_families[@]}" >/dev/null 2>&1 || true
         return 1
     fi
 
-    if [ "${#old_records[@]}" -gt 0 ]; then
-        if ! remove_hy2_nat_records "${old_records[@]}"; then
-            rollback_new_hy2_nat_records "${configured_records[@]}"
+    if [ "${#records_to_remove[@]}" -gt 0 ]; then
+        local -a old_families=()
+        for record in "${records_to_remove[@]}"; do
+            family="${record%%|*}"
+            case " ${old_families[*]} " in
+                *" ${family} "*) ;;
+                *) old_families+=("$family") ;;
+            esac
+        done
+        if ! remove_hy2_nat_records "${records_to_remove[@]}"; then
+            rollback_new_hy2_nat_records "${new_records[@]}"
             write_hy2_nat_state_records "${old_records[@]}" >/dev/null 2>&1 || true
-            persist_hy2_nat_rules >/dev/null 2>&1 || true
+            persist_hy2_nat_rules "${old_families[@]}" "${configured_families[@]}" >/dev/null 2>&1 || true
             return 1
         fi
-        if ! persist_hy2_nat_rules; then
-            restore_hy2_nat_records "${old_records[@]}" || true
-            rollback_new_hy2_nat_records "${configured_records[@]}"
+        if ! persist_hy2_nat_rules "${old_families[@]}"; then
+            restore_hy2_nat_records "${records_to_remove[@]}" || true
+            rollback_new_hy2_nat_records "${new_records[@]}"
             write_hy2_nat_state_records "${old_records[@]}" >/dev/null 2>&1 || true
-            persist_hy2_nat_rules >/dev/null 2>&1 || true
+            persist_hy2_nat_rules "${old_families[@]}" "${configured_families[@]}" >/dev/null 2>&1 || true
             return 1
         fi
     fi
 }
 
+read_active_hy2_port_hopping() {
+    local expected_listen="${1:-}"
+    local state_status
+
+    HY2_ACTIVE_HOP_MIN=''
+    HY2_ACTIVE_HOP_MAX=''
+    HY2_ACTIVE_HOP_LISTEN=''
+    if [ -n "$expected_listen" ]; then
+        validate_port_value "$expected_listen" hy2_expected_listen >/dev/null 2>&1 || return 2
+    fi
+    if read_hy2_nat_state_records; then state_status=0; else state_status=$?; fi
+    case "$state_status" in 0) ;; 1) return 1 ;; *) return 2 ;; esac
+    [ -z "$expected_listen" ] || [ "$HY2_NAT_STATE_LISTEN" = "$expected_listen" ] || return 2
+    HY2_ACTIVE_HOP_MIN="$HY2_NAT_STATE_MIN"
+    HY2_ACTIVE_HOP_MAX="$HY2_NAT_STATE_MAX"
+    HY2_ACTIVE_HOP_LISTEN="$HY2_NAT_STATE_LISTEN"
+}
+
 remove_hy2_port_hopping() {
-    local status=0
+    local status=0 state_status
     local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
-    local -a records=()
+    local -a records=() changed_families=()
     local record family chain comment min_port max_port listen_port record_kind
 
-    [ -r "$state_file" ] || return 0
+    if read_active_hy2_port_hopping; then
+        state_status=0
+    else
+        state_status=$?
+    fi
+    case "$state_status" in
+        0) ;;
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
     mapfile -t records < "$state_file" || return 1
+    for record in "${records[@]}"; do
+        family="${record%%|*}"
+        case " ${changed_families[*]} " in
+            *" ${family} "*) ;;
+            *) changed_families+=("$family") ;;
+        esac
+    done
 
     remove_hy2_nat_records "${records[@]}" || return 1
-    if ! persist_hy2_nat_rules; then
+    if ! persist_hy2_nat_rules "${changed_families[@]}"; then
         restore_hy2_nat_records "${records[@]}" || true
-        persist_hy2_nat_rules >/dev/null 2>&1 || true
+        persist_hy2_nat_rules "${changed_families[@]}" >/dev/null 2>&1 || true
         return 1
     fi
     if ! rm -f -- "$state_file"; then
         restore_hy2_nat_records "${records[@]}" || true
-        persist_hy2_nat_rules >/dev/null 2>&1 || true
+        persist_hy2_nat_rules "${changed_families[@]}" >/dev/null 2>&1 || true
         return 1
     fi
     return "$status"
@@ -2247,24 +3754,46 @@ restore_hy2_subscription_snapshot() {
 restore_hy2_nat_snapshot() {
     local backup_dir="${1:-}"
     local state_file="${HY2_NAT_STATE_FILE:-${work_dir}/hy2-nat.state}"
-    local -a current_records=() old_records=()
+    local record family
+    local -a current_records=() old_records=() changed_families=()
 
     if [ -s "$state_file" ]; then
         mapfile -t current_records < "$state_file" || return 1
+        for record in "${current_records[@]}"; do
+            family="${record%%|*}"
+            case " ${changed_families[*]} " in
+                *" ${family} "*) ;;
+                *) changed_families+=("$family") ;;
+            esac
+        done
         remove_hy2_nat_records "${current_records[@]}" || return 1
     fi
     if [ -e "${backup_dir}/nat.present" ]; then
         mapfile -t old_records < "${backup_dir}/nat.state" || return 1
+        for record in "${old_records[@]}"; do
+            family="${record%%|*}"
+            case " ${changed_families[*]} " in
+                *" ${family} "*) ;;
+                *) changed_families+=("$family") ;;
+            esac
+        done
         restore_hy2_nat_records "${old_records[@]}" || return 1
-        persist_hy2_nat_rules || return 1
+        persist_hy2_nat_rules "${changed_families[@]}" || return 1
         write_hy2_nat_state_records "${old_records[@]}" || return 1
     elif [ -s "${backup_dir}/nat.baseline" ]; then
         mapfile -t old_records < "${backup_dir}/nat.baseline" || return 1
+        for record in "${old_records[@]}"; do
+            family="${record%%|*}"
+            case " ${changed_families[*]} " in
+                *" ${family} "*) ;;
+                *) changed_families+=("$family") ;;
+            esac
+        done
         restore_hy2_nat_records "${old_records[@]}" || return 1
-        persist_hy2_nat_rules || return 1
+        persist_hy2_nat_rules "${changed_families[@]}" || return 1
         rm -f -- "$state_file" || return 1
     else
-        persist_hy2_nat_rules || return 1
+        persist_hy2_nat_rules "${changed_families[@]}" || return 1
         rm -f -- "$state_file" || return 1
     fi
 }
@@ -2312,7 +3841,7 @@ handle_hy2_menu_transaction_failure() {
     return 2
 }
 
-enable_hy2_port_hopping_transaction() {
+_enable_hy2_port_hopping_transaction_locked() {
     local min_port="${1:-}"
     local max_port="${2:-}"
     local listen_port server_ip fingerprint node_label backup_dir staged_file was_active=0
@@ -2353,7 +3882,19 @@ enable_hy2_port_hopping_transaction() {
     rm -rf -- "$backup_dir"
 }
 
-disable_hy2_port_hopping_transaction() {
+enable_hy2_port_hopping_transaction() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "Hysteria2 端口跳跃操作"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _enable_hy2_port_hopping_transaction_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+_disable_hy2_port_hopping_transaction_locked() {
     local backup_dir staged_file was_active=0
 
     stage_hy2_client_file disable || return 1
@@ -2379,6 +3920,18 @@ disable_hy2_port_hopping_transaction() {
     fi
 
     rm -rf -- "$backup_dir"
+}
+
+disable_hy2_port_hopping_transaction() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "Hysteria2 端口跳跃操作"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _disable_hy2_port_hopping_transaction_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
 }
 
 render_vless_reality_inbound() {
@@ -2547,6 +4100,20 @@ render_inbounds_config() {
     printf '%s\n' '  ]' '}'
 }
 
+# Preserve allow_port's tri-state result: 0=committed/no local mutation needed,
+# 1=safe failure, 2=firewall state unknown or recovery required.
+open_install_firewall_ports() {
+    local has_v4="${1:-0}" has_v6="${2:-0}" status
+
+    if allow_port --families "$has_v4" "$has_v6" \
+        "$vless_port/tcp" "$nginx_port/tcp" "$tuic_port/udp" "$hy2_port/udp"; then
+        return 0
+    else
+        status=$?
+    fi
+    return "$status"
+}
+
 # 下载并安装 sing-box,cloudflared
 install_singbox() {
     local has_v4=0
@@ -2554,6 +4121,7 @@ install_singbox() {
     local bindv6only=0
     local dns_strategy
     local inbounds_json
+    local firewall_status
 
     clear
     purple "正在安装sing-box中，请稍后..."
@@ -2608,9 +4176,12 @@ install_singbox() {
     public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
     [ -n "$uuid" ] && [ -n "$password" ] && [ -n "$private_key" ] && [ -n "$public_key" ] || return 1
 
-    allow_port --families "$has_v4" "$has_v6" \
-        "$vless_port/tcp" "$nginx_port/tcp" "$tuic_port/udp" "$hy2_port/udp" \
-        > /dev/null 2>&1 || return 1
+    if open_install_firewall_ports "$has_v4" "$has_v6"; then
+        firewall_status=0
+    else
+        firewall_status=$?
+    fi
+    [ "$firewall_status" -eq 0 ] || return "$firewall_status"
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || return 1
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com" || return 1
@@ -3071,6 +4642,81 @@ get_nginx_subscription_paths() {
     done < <(sed -n 's/^[[:space:]]*location = \(\/[^[:space:]]*\)[[:space:]]*{.*/\1/p' "$config_file")
 }
 
+# Return 0 only for the exact Nginx server shape rendered and owned by this
+# script, 1 when no config exists, and 2 for an unsafe/unmanaged config.  A
+# parseable listen/location pair alone is not proof that we may overwrite it.
+classify_nginx_subscription_config() {
+    local config_file="${1:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
+    local port https_path=''
+    local -a paths=()
+
+    [ -e "$config_file" ] || [ -L "$config_file" ] || return 1
+    [ -f "$config_file" ] && [ ! -L "$config_file" ] && [ -r "$config_file" ] || return 2
+    port=$(get_nginx_subscription_port "$config_file") || return 2
+    mapfile -t paths < <(get_nginx_subscription_paths "$config_file")
+    [ "${#paths[@]}" -ge 1 ] && [ "${#paths[@]}" -le 2 ] || return 2
+    if [ "${#paths[@]}" -eq 2 ]; then
+        [ "${paths[0]}" != "${paths[1]}" ] || return 2
+        https_path="${paths[1]}"
+    fi
+
+    if cmp -s -- "$config_file" <(render_nginx_subscription_server \
+        "$port" "${paths[0]}" "$https_path" 0); then
+        return 0
+    fi
+    if cmp -s -- "$config_file" <(render_nginx_subscription_server \
+        "$port" "${paths[0]}" "$https_path" 1); then
+        return 0
+    fi
+    return 2
+}
+
+# Validate the script-owned Nginx server together with its persisted state.
+# One HTTP-only path may be a legacy install with no state file.  A managed
+# state file must match that path exactly.  Two paths are accepted only when a
+# complete enabled HTTPS state names both paths, preventing a stale origin from
+# being started or rewritten after state loss.
+validate_managed_subscription_runtime() {
+    local config_file="${1:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
+    local expected_mode="${2:-any}"
+    local config_status state_exists=0 token_from_http token_from_https
+    local -a paths=()
+
+    case "$expected_mode" in any|http|https) ;; *) return 2 ;; esac
+    classify_nginx_subscription_config "$config_file"
+    config_status=$?
+    [ "$config_status" -eq 0 ] || return "$config_status"
+    mapfile -t paths < <(get_nginx_subscription_paths "$config_file")
+    [ "${#paths[@]}" -ge 1 ] && [ "${#paths[@]}" -le 2 ] || return 2
+
+    if [ -e "$subscription_state_file" ] || [ -L "$subscription_state_file" ]; then
+        [ -f "$subscription_state_file" ] && [ ! -L "$subscription_state_file" ] &&
+            [ -r "$subscription_state_file" ] || return 2
+        state_exists=1
+    fi
+    load_subscription_state
+
+    if [ "${#paths[@]}" -eq 1 ]; then
+        [ "$expected_mode" != https ] || return 2
+        if [ "$state_exists" -eq 0 ]; then
+            return 0
+        fi
+        [ "$SUB_HTTPS_ENABLED" = 0 ] || return 2
+        [ "$SUB_HTTP_PATH" = "${paths[0]}" ] || return 2
+        is_valid_subscription_token "$SUB_TOKEN" || return 2
+        token_from_http="${paths[0]##*/}"
+        [ "$SUB_TOKEN" = "$token_from_http" ] || return 2
+        return 0
+    fi
+
+    [ "$expected_mode" != http ] || return 2
+    [ "$state_exists" -eq 1 ] && [ "$SUB_HTTPS_ENABLED" = 1 ] || return 2
+    [ "$SUB_HTTP_PATH" = "${paths[0]}" ] && [ "$SUB_HTTPS_PATH" = "${paths[1]}" ] || return 2
+    token_from_http="${paths[0]##*/}"
+    token_from_https="${paths[1]##*/}"
+    [ "$SUB_TOKEN" = "$token_from_http" ] && [ "$SUB_TOKEN" = "$token_from_https" ] || return 2
+}
+
 select_nginx_http_subscription_path() {
     local config_file="${1:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
     local path
@@ -3102,11 +4748,13 @@ apply_nginx_subscription_config() {
     local port="${1:-}"
     local http_path="${2:-}"
     local https_path="${3:-}"
-    local config_file="${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"
+    local config_file="${5:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
     local config_dir tmp_file backup_file had_config=0
+    local preserve_service_state="${4:-start}"
     local has_ipv6=0
 
     command_exists nginx || { red "nginx未安装，无法配置订阅服务"; return 1; }
+    case "$preserve_service_state" in 0|1|start) ;; *) return 1 ;; esac
     config_dir=$(dirname "$config_file")
     mkdir -p "$config_dir" || return 1
     tmp_file=$(mktemp "${config_dir}/.sing-box.conf.XXXXXX") || return 1
@@ -3137,7 +4785,9 @@ apply_nginx_subscription_config() {
         return 1
     fi
 
-    if command_exists rc-service; then
+    if [ "$preserve_service_state" = 0 ]; then
+        return 0
+    elif command_exists rc-service; then
         if ! rc-service nginx reload > /dev/null 2>&1 && ! rc-service nginx restart > /dev/null 2>&1; then
             if [ "$had_config" = 1 ]; then
                 cp -p "$backup_file" "$config_file"
@@ -3147,7 +4797,9 @@ apply_nginx_subscription_config() {
             rc-service nginx restart > /dev/null 2>&1 || true
             return 1
         fi
-    elif ! nginx -s reload > /dev/null 2>&1 && ! start_nginx > /dev/null 2>&1; then
+    elif ! nginx -s reload > /dev/null 2>&1 && \
+         { [ "$preserve_service_state" = 1 ] && ! restart_nginx > /dev/null 2>&1 ||
+           [ "$preserve_service_state" = start ] && ! start_nginx > /dev/null 2>&1; }; then
         if [ "$had_config" = 1 ]; then
             cp -p "$backup_file" "$config_file"
         else
@@ -3158,6 +4810,260 @@ apply_nginx_subscription_config() {
     fi
 
     return 0
+}
+
+# Capture every local file and service state owned by the subscription
+# frontend before a multi-step mutation.  The returned directory is kept
+# separate from the durable registry so it also remains useful as recovery
+# evidence after an unclean process death.
+backup_subscription_frontend_snapshot() {
+    local config_file="${1:-}"
+    local state_file="${2:-}"
+    local tunnel_file="${3:-}"
+    local evidence_parent="${4:-}"
+    local snapshot_dir nginx_was_active=0 argo_was_active=0
+
+    [ -n "$config_file" ] && [ -n "$state_file" ] || return 1
+    [ -d "$evidence_parent" ] && [ ! -L "$evidence_parent" ] || return 1
+    for target in "$config_file" "$state_file"; do
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            [ -f "$target" ] && [ ! -L "$target" ] && [ -r "$target" ] || return 1
+        fi
+    done
+    if [ -n "$tunnel_file" ] && { [ -e "$tunnel_file" ] || [ -L "$tunnel_file" ]; }; then
+        [ -f "$tunnel_file" ] && [ ! -L "$tunnel_file" ] && [ -r "$tunnel_file" ] || return 1
+    fi
+
+    snapshot_dir=$(mktemp -d "${evidence_parent}/.subscription-frontend.XXXXXX") || return 1
+    chmod 700 "$snapshot_dir" || { rm -rf -- "$snapshot_dir"; return 1; }
+    if [ -e "$config_file" ]; then
+        cp -p -- "$config_file" "$snapshot_dir/nginx.conf" || {
+            rm -rf -- "$snapshot_dir"
+            return 1
+        }
+        chmod 600 "$snapshot_dir/nginx.conf" || { rm -rf -- "$snapshot_dir"; return 1; }
+        : > "$snapshot_dir/nginx.present"
+    fi
+    if [ -e "$state_file" ]; then
+        cp -p -- "$state_file" "$snapshot_dir/subscription.state" || {
+            rm -rf -- "$snapshot_dir"
+            return 1
+        }
+        chmod 600 "$snapshot_dir/subscription.state" || { rm -rf -- "$snapshot_dir"; return 1; }
+        : > "$snapshot_dir/state.present"
+    fi
+    nginx_service_is_active && nginx_was_active=1
+    printf '%s\n' "$nginx_was_active" > "$snapshot_dir/nginx.active" || {
+        rm -rf -- "$snapshot_dir"
+        return 1
+    }
+
+    if [ -n "$tunnel_file" ]; then
+        : > "$snapshot_dir/tunnel.enabled"
+        if [ -e "$tunnel_file" ]; then
+            cp -p -- "$tunnel_file" "$snapshot_dir/tunnel.yml" || {
+                rm -rf -- "$snapshot_dir"
+                return 1
+            }
+            chmod 600 "$snapshot_dir/tunnel.yml" || { rm -rf -- "$snapshot_dir"; return 1; }
+            : > "$snapshot_dir/tunnel.present"
+        fi
+        if declare -F check_argo >/dev/null 2>&1 && check_argo >/dev/null 2>&1; then
+            argo_was_active=1
+        fi
+        printf '%s\n' "$argo_was_active" > "$snapshot_dir/argo.active" || {
+            rm -rf -- "$snapshot_dir"
+            return 1
+        }
+    fi
+    printf '%s\n' "$snapshot_dir"
+}
+
+subscription_frontend_snapshot_file_digest() {
+    local target="${1:-}"
+
+    [ -n "$target" ] || return 1
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        printf 'absent\n'
+        return 0
+    fi
+    [ -f "$target" ] && [ ! -L "$target" ] && [ -r "$target" ] || return 1
+    sha256sum "$target" | awk '{print $1}'
+}
+
+# Detect a valid-but-different managed frontend swapped in while an interactive
+# prompt was open.  Both the live files and the just-created snapshot must
+# still match the baseline captured before that prompt.
+verify_subscription_frontend_snapshot_baseline() {
+    local snapshot_dir="${1:-}"
+    local config_file="${2:-}"
+    local state_file="${3:-}"
+    local tunnel_file="${4:-}"
+    local baseline_config="${5:-}"
+    local baseline_state="${6:-}"
+    local baseline_tunnel="${7:-}"
+    local current snapshot
+
+    [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+    current=$(subscription_frontend_snapshot_file_digest "$config_file") || return 1
+    [ "$current" = "$baseline_config" ] || return 1
+    if [ -e "$snapshot_dir/nginx.present" ]; then
+        snapshot=$(subscription_frontend_snapshot_file_digest "$snapshot_dir/nginx.conf") || return 1
+    else
+        snapshot=absent
+    fi
+    [ "$snapshot" = "$baseline_config" ] || return 1
+
+    current=$(subscription_frontend_snapshot_file_digest "$state_file") || return 1
+    [ "$current" = "$baseline_state" ] || return 1
+    if [ -e "$snapshot_dir/state.present" ]; then
+        snapshot=$(subscription_frontend_snapshot_file_digest \
+            "$snapshot_dir/subscription.state") || return 1
+    else
+        snapshot=absent
+    fi
+    [ "$snapshot" = "$baseline_state" ] || return 1
+
+    if [ -n "$tunnel_file" ]; then
+        current=$(subscription_frontend_snapshot_file_digest "$tunnel_file") || return 1
+        [ "$current" = "$baseline_tunnel" ] || return 1
+        if [ -e "$snapshot_dir/tunnel.present" ]; then
+            snapshot=$(subscription_frontend_snapshot_file_digest "$snapshot_dir/tunnel.yml") || return 1
+        else
+            snapshot=absent
+        fi
+        [ "$snapshot" = "$baseline_tunnel" ] || return 1
+    fi
+}
+
+cleanup_subscription_frontend_snapshot() {
+    local snapshot_dir="${1:-}"
+
+    [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+    case "$(basename "$snapshot_dir")" in
+        .subscription-frontend.*) ;;
+        *) return 1 ;;
+    esac
+    rm -f -- \
+        "$snapshot_dir/nginx.conf" "$snapshot_dir/nginx.present" \
+        "$snapshot_dir/subscription.state" "$snapshot_dir/state.present" \
+        "$snapshot_dir/tunnel.yml" "$snapshot_dir/tunnel.present" \
+        "$snapshot_dir/tunnel.enabled" "$snapshot_dir/nginx.active" \
+        "$snapshot_dir/argo.active" || return 1
+    rmdir -- "$snapshot_dir"
+}
+
+restore_subscription_frontend_snapshot() {
+    local snapshot_dir="${1:-}"
+    local config_file="${2:-}"
+    local state_file="${3:-}"
+    local tunnel_file="${4:-}"
+    local nginx_was_active argo_was_active=0 status=0
+
+    [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+    [ -n "$config_file" ] && [ -n "$state_file" ] || return 1
+    [ ! -L "$config_file" ] && [ ! -L "$state_file" ] || return 1
+    [ -f "$snapshot_dir/nginx.active" ] && [ ! -L "$snapshot_dir/nginx.active" ] || return 1
+    nginx_was_active=$(cat "$snapshot_dir/nginx.active") || return 1
+    case "$nginx_was_active" in 0|1) ;; *) return 1 ;; esac
+
+    if [ -e "$snapshot_dir/nginx.present" ]; then
+        [ -f "$snapshot_dir/nginx.conf" ] && [ ! -L "$snapshot_dir/nginx.conf" ] || return 1
+        cp -p -- "$snapshot_dir/nginx.conf" "$config_file" || status=1
+    else
+        rm -f -- "$config_file" || status=1
+    fi
+    if [ -e "$snapshot_dir/state.present" ]; then
+        [ -f "$snapshot_dir/subscription.state" ] && \
+            [ ! -L "$snapshot_dir/subscription.state" ] || return 1
+        cp -p -- "$snapshot_dir/subscription.state" "$state_file" || status=1
+    else
+        rm -f -- "$state_file" || status=1
+    fi
+
+    if [ -e "$snapshot_dir/tunnel.enabled" ]; then
+        [ -n "$tunnel_file" ] && [ ! -L "$tunnel_file" ] || return 1
+        if [ -e "$snapshot_dir/tunnel.present" ]; then
+            [ -f "$snapshot_dir/tunnel.yml" ] && [ ! -L "$snapshot_dir/tunnel.yml" ] || return 1
+            cp -p -- "$snapshot_dir/tunnel.yml" "$tunnel_file" || status=1
+        else
+            rm -f -- "$tunnel_file" || status=1
+        fi
+        [ -f "$snapshot_dir/argo.active" ] && [ ! -L "$snapshot_dir/argo.active" ] || return 1
+        argo_was_active=$(cat "$snapshot_dir/argo.active") || return 1
+        case "$argo_was_active" in 0|1) ;; *) return 1 ;; esac
+        if [ "$argo_was_active" -eq 1 ]; then
+            restart_argo >/dev/null 2>&1 || status=1
+        elif declare -F check_argo >/dev/null 2>&1 && check_argo >/dev/null 2>&1; then
+            stop_argo >/dev/null 2>&1 || status=1
+        fi
+    fi
+
+    if command_exists nginx; then
+        nginx -t >/dev/null 2>&1 || status=1
+        if [ "$nginx_was_active" -eq 1 ]; then
+            nginx -s reload >/dev/null 2>&1 || restart_nginx >/dev/null 2>&1 || status=1
+        elif nginx_service_is_active; then
+            stop_nginx_checked >/dev/null 2>&1 || status=1
+        fi
+    fi
+    [ "$status" -eq 0 ]
+}
+
+rollback_subscription_frontend_signal_transaction() {
+    local snapshot_dir="${1:-}"
+    local config_file="${2:-}"
+    local state_file="${3:-}"
+    local tunnel_file="${4:-}"
+    local pending_state="${5:-}"
+    local status=0
+
+    restore_subscription_frontend_snapshot "$snapshot_dir" "$config_file" \
+        "$state_file" "$tunnel_file" || status=1
+    if [ "${#DURABLE_TX_OWNED_RECORDS[@]}" -gt 0 ]; then
+        remove_owned_firewall_records_exact "${DURABLE_TX_OWNED_RECORDS[@]}" || status=1
+    fi
+    if [ -n "$pending_state" ]; then
+        rm -f -- "$pending_state" || status=1
+    fi
+    if [ "$status" -eq 0 ]; then
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || status=1
+    fi
+    [ "$status" -eq 0 ]
+}
+
+prepare_subscription_frontend_state_transaction() {
+    local state_target="${1:-}"
+    local pending_parent="${2:-}"
+    local state_dir pending_state original_state_file
+
+    [ -n "$state_target" ] && [ ! -L "$state_target" ] || return 1
+    state_dir=$(dirname "$state_target")
+    [ -d "$state_dir" ] && [ ! -L "$state_dir" ] || return 1
+    [ -n "$pending_parent" ] || pending_parent="$state_dir"
+    [ -d "$pending_parent" ] && [ ! -L "$pending_parent" ] || return 1
+    pending_state=$(mktemp "${pending_parent}/.subscription-state-pending.XXXXXX") || return 1
+    rm -f -- "$pending_state" || return 1
+    original_state_file="$subscription_state_file"
+    subscription_state_file="$pending_state"
+    if ! save_subscription_state; then
+        subscription_state_file="$original_state_file"
+        rm -f -- "$pending_state"
+        return 1
+    fi
+    subscription_state_file="$original_state_file"
+    chmod 600 "$pending_state" || { rm -f -- "$pending_state"; return 1; }
+    printf '%s\n' "$pending_state"
+}
+
+commit_subscription_frontend_state_transaction() {
+    local pending_state="${1:-}"
+    local state_target="${2:-}"
+
+    [ -f "$pending_state" ] && [ ! -L "$pending_state" ] || return 1
+    [ -n "$state_target" ] && [ ! -L "$state_target" ] || return 1
+    mv -f -- "$pending_state" "$state_target" || return 1
+    chmod 600 "$state_target"
 }
 
 add_nginx_conf() {
@@ -3300,9 +5206,35 @@ restart_argo()   { manage_service "argo" "restart"; }
 start_nginx()    { manage_service "nginx" "start"; }
 restart_nginx()  { manage_service "nginx" "restart"; }
 
+nginx_service_is_active() {
+    if command_exists rc-service; then
+        rc-service nginx status >/dev/null 2>&1
+    elif command_exists systemctl; then
+        systemctl is-active --quiet nginx
+    else
+        return 1
+    fi
+}
+
+stop_nginx_checked() {
+    if command_exists rc-service; then
+        rc-service nginx stop >/dev/null 2>&1
+    elif command_exists systemctl; then
+        systemctl stop nginx >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
 validate_singbox_config() {
     [ -x "${work_dir}/${server_name}" ] || return 0
     [ -d "${conf_dir}" ] || return 0
+    "${work_dir}/${server_name}" check -C "${conf_dir}" >/dev/null 2>&1
+}
+
+validate_installed_singbox_config_strict() {
+    [ -x "${work_dir}/${server_name}" ] || return 1
+    [ -d "${conf_dir}" ] && [ ! -L "${conf_dir}" ] || return 1
     "${work_dir}/${server_name}" check -C "${conf_dir}" >/dev/null 2>&1
 }
 
@@ -3350,14 +5282,17 @@ update_public_inbound_port() {
     case "$protocol" in
         reality)
             apply_jq_config "$target_file" --arg port "$port" \
-                '(.inbounds[] | select(.tag == "vless-reality" or .tag == "vless-reality-ipv6").listen_port) = ($port | tonumber)'
+                '(.inbounds[] |
+                    select(.type == "vless" and ((.tag? // "") | startswith("vless-reality"))) |
+                    .listen_port) = ($port | tonumber)'
             ;;
         hysteria2|tuic)
             apply_jq_config "$target_file" --arg protocol "$protocol" --arg port "$port" \
                 '(.inbounds[] | select(.type == $protocol).listen_port) = ($port | tonumber)'
             ;;
         *) return 1 ;;
-    esac
+    esac || return 1
+    validate_installed_singbox_config_strict
 }
 
 get_uniform_inbound_port() {
@@ -3366,7 +5301,15 @@ get_uniform_inbound_port() {
     local port
 
     port=$(jq -er --arg protocol "$protocol" '
-        [.inbounds[] | select(.type == $protocol) | .listen_port] as $ports |
+        [.inbounds[] |
+            select(
+                if $protocol == "reality" then
+                    (.type == "vless" and ((.tag? // "") | startswith("vless-reality")))
+                else
+                    .type == $protocol
+                end
+            ) |
+            .listen_port] as $ports |
         if (($ports | length) > 0 and ($ports | unique | length) == 1)
         then $ports[0]
         else empty
@@ -3374,6 +5317,394 @@ get_uniform_inbound_port() {
     ' "$target_file") || return 1
     validate_port_value "$port" "${protocol}_port" || return 1
     printf '%s\n' "$port"
+}
+
+rewrite_public_client_port() {
+    local protocol="${1:-}"
+    local port="${2:-}"
+    local target_file="${3:-${client_dir}}"
+    local target_dir tmp_file pattern
+
+    validate_port_value "$port" "${protocol}_port" || return 1
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
+    case "$protocol" in
+        reality) pattern='/flow=xtls-rprx-vision/' ;;
+        hysteria2) pattern='/^hysteria2:\/\//' ;;
+        tuic) pattern='/^tuic:\/\//' ;;
+        *) return 1 ;;
+    esac
+    sed -n "${pattern}p" "$target_file" | grep -q . || return 1
+    target_dir=$(dirname "$target_file") || return 1
+    tmp_file=$(mktemp "${target_dir}/.port-client.XXXXXX") || return 1
+    case "$protocol" in
+        reality)
+            sed -E '/flow=xtls-rprx-vision/ s#(vless://[^@]*@)(\[[^]]+\]|[^:/?#]+):[0-9]{1,5}#\1\2:'"$port"'#' \
+                "$target_file" > "$tmp_file"
+            ;;
+        hysteria2)
+            sed -E '/^hysteria2:\/\// {
+                s#(hysteria2://[^@]*@)(\[[^]]+\]|[^:/?#]+):[0-9]{1,5}#\1\2:'"$port"'#
+                s#([?&]mport=)[0-9]{1,5}(,)#\1'"$port"'\2#
+            }' \
+                "$target_file" > "$tmp_file"
+            ;;
+        tuic)
+            sed -E '/^tuic:\/\// s#(tuic://[^@]*@)(\[[^]]+\]|[^:/?#]+):[0-9]{1,5}#\1\2:'"$port"'#' \
+                "$target_file" > "$tmp_file"
+            ;;
+    esac
+    if [ "$?" -ne 0 ] || ! chmod --reference="$target_file" "$tmp_file" 2>/dev/null || \
+       ! mv -f -- "$tmp_file" "$target_file"; then
+        rm -f -- "$tmp_file"
+        return 1
+    fi
+}
+
+public_port_conflicts() {
+    local inbounds_file="${1:-}"
+    local protocol="${2:-}"
+    local port="${3:-}"
+    local transport="${4:-}"
+    local subscription_port jq_status
+
+    validate_port_value "$port" conflict_port || return 2
+    case "$protocol" in reality|hysteria2|tuic) ;; *) return 2 ;; esac
+    case "$transport" in tcp|udp) ;; *) return 2 ;; esac
+    [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] || return 2
+
+    subscription_port=$(get_nginx_subscription_port \
+        "${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}" 2>/dev/null || true)
+    if [ "$transport" = tcp ] && [ -n "$subscription_port" ] && [ "$subscription_port" = "$port" ]; then
+        return 0
+    fi
+    port_is_listening "$port" "$transport" && return 0
+
+    jq -e --arg protocol "$protocol" --arg transport "$transport" --argjson port "$port" '
+        def transport_matches:
+            if (.type == "hysteria2" or .type == "tuic") then
+                $transport == "udp"
+            elif (.type == "socks" or .type == "shadowsocks") then
+                ($transport == "tcp" or $transport == "udp")
+            elif (.type == "vless" or .type == "vmess" or
+                  .type == "trojan" or .type == "anytls") then
+                $transport == "tcp"
+            else
+                true
+            end;
+        [.inbounds[] |
+            select(
+                if $protocol == "reality" then
+                    (.type != "vless" or (((.tag? // "") | startswith("vless-reality")) | not))
+                else
+                    .type != $protocol
+                end
+            ) |
+            select(transport_matches) |
+            .listen_port
+        ] | any(. == $port)
+    ' "$inbounds_file" >/dev/null 2>&1
+    jq_status=$?
+    case "$jq_status" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+acquire_public_port_change_lock() {
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "公共入站端口修改"
+}
+
+release_public_port_change_lock() {
+    release_proxy_transaction_lock
+}
+
+cleanup_public_port_backup() {
+    local backup_file="${1:-}"
+
+    [ -n "$backup_file" ] && [ -f "$backup_file" ] && [ ! -L "$backup_file" ] || return 1
+    rm -f -- "$backup_file"
+}
+
+apply_public_port_service_state() {
+    local was_active="${1:-}"
+
+    validate_installed_singbox_config_strict || return 1
+    case "$was_active" in
+        1)
+            restart_singbox >/dev/null 2>&1 || return 1
+            singbox_service_is_active
+            ;;
+        0) ! singbox_service_is_active ;;
+        *) return 1 ;;
+    esac
+}
+
+restore_public_port_service_state() {
+    local was_active="${1:-}"
+
+    validate_installed_singbox_config_strict || return 1
+    case "$was_active" in
+        1)
+            restart_singbox >/dev/null 2>&1 || return 1
+            singbox_service_is_active
+            ;;
+        0)
+            if singbox_service_is_active; then
+                stop_singbox_checked >/dev/null 2>&1 || return 1
+            fi
+            ! singbox_service_is_active
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+rollback_public_port_signal_transaction() {
+    local backup_file="${1:-}"
+    local inbounds_file="${2:-}"
+    local protocol="${3:-}"
+    local old_port="${4:-}"
+    local hy2_min="${5:-}"
+    local hy2_max="${6:-}"
+    local was_active="${7:-0}"
+    local status=0
+
+    if [ "${PUBLIC_TX_CONFIG_MUTATED:-0}" = 1 ]; then
+        cp -p -- "$backup_file" "$client_dir" || status=1
+        update_public_inbound_port "$inbounds_file" "$protocol" "$old_port" || status=1
+        if [ "${PUBLIC_TX_HY2_NAT_MIGRATED:-0}" = 1 ]; then
+            add_hy2_port_hopping "$hy2_min" "$hy2_max" "$old_port" || status=1
+        fi
+        restore_public_port_service_state "$was_active" || status=1
+        update_sub || status=1
+    fi
+    if [ "${#DURABLE_TX_OWNED_RECORDS[@]}" -gt 0 ]; then
+        remove_owned_firewall_records_exact "${DURABLE_TX_OWNED_RECORDS[@]}" || status=1
+    fi
+    cleanup_public_port_backup "$backup_file" || status=1
+    return "$status"
+}
+
+_change_public_inbound_port_transaction_locked() {
+    local inbounds_file="${1:-}"
+    local protocol="${2:-}"
+    local new_port="${3:-}"
+    local transport="${4:-}"
+    local old_port backup_file rollback_status=0 conflict_status firewall_status current_port
+    local hy2_status=1 hy2_hopping_active=0 hy2_nat_migrated=0 transaction_ok=1
+    local failure_status=1 operation_status=0
+    local hy2_min='' hy2_max=''
+    local was_active=0
+    local -a new_firewall_records=()
+
+    PUBLIC_PORT_RECOVERY_PATH=''
+    validate_port_value "$new_port" "${protocol}_port" || return 1
+    case "$transport" in tcp|udp) ;; *) return 1 ;; esac
+    old_port=$(get_uniform_inbound_port "$inbounds_file" "$protocol") || return 1
+    [ "$old_port" != "$new_port" ] || return 0
+    if [ "$protocol" = hysteria2 ]; then
+        if read_active_hy2_port_hopping "$old_port"; then
+            hy2_status=0
+        else
+            hy2_status=$?
+        fi
+        case "$hy2_status" in
+            0)
+                hy2_hopping_active=1
+                hy2_min="$HY2_ACTIVE_HOP_MIN"
+                hy2_max="$HY2_ACTIVE_HOP_MAX"
+                ;;
+            1) ;;
+            *) red "Hysteria2 端口跳跃状态损坏或与当前入站不一致。"; return 1 ;;
+        esac
+    fi
+    public_port_conflicts "$inbounds_file" "$protocol" "$new_port" "$transport"
+    conflict_status=$?
+    if [ "$conflict_status" = 0 ]; then
+        red "新端口 ${new_port} 已被其他入站、订阅或系统服务使用。"
+        return 1
+    fi
+    [ "$conflict_status" = 1 ] || return 1
+    backup_file=$(mktemp "$(dirname "$client_dir")/.port-client-backup.XXXXXX") || return 1
+    if ! cp -p -- "$client_dir" "$backup_file"; then
+        rm -f -- "$backup_file"
+        return 1
+    fi
+    if ! chmod 600 "$backup_file"; then
+        rm -f -- "$backup_file"
+        return 1
+    fi
+    singbox_service_is_active && was_active=1
+    PUBLIC_TX_CONFIG_MUTATED=0
+    PUBLIC_TX_HY2_NAT_MIGRATED=0
+    if ! arm_durable_transaction public-port "$(dirname "$backup_file")" "$backup_file" \
+        PUBLIC_PORT_RECOVERY_PATH rollback_public_port_signal_transaction \
+        "$was_active" "$old_port" "$new_port" \
+        "$backup_file" "$inbounds_file" "$protocol" "$old_port" \
+        "$hy2_min" "$hy2_max" "$was_active"; then
+        cleanup_public_port_backup "$backup_file" || {
+            PUBLIC_PORT_RECOVERY_PATH="$backup_file"
+            return 2
+        }
+        return 1
+    fi
+
+    if ! durable_transaction_checkpoint firewall-mutating; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    allow_port "${new_port}/${transport}"
+    firewall_status=$?
+    if [ "$firewall_status" -ne 0 ]; then
+        if [ "$firewall_status" -eq 2 ]; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            red "防火墙事务状态未决，已保留公共端口恢复证据。"
+            return 2
+        fi
+        if ! cleanup_public_port_backup "$backup_file"; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            red "端口防火墙预检失败且客户端备份未能清理：${backup_file}"
+            return 2
+        fi
+        if ! disarm_durable_transaction cleanup; then
+            return 2
+        fi
+        return "$firewall_status"
+    fi
+    new_firewall_records=("${FIREWALL_LAST_ADDED_RECORDS[@]}")
+    if ! durable_transaction_set_owned_records "${new_firewall_records[@]}" || \
+       ! durable_transaction_checkpoint precommit; then
+        rollback_public_port_signal_transaction "$backup_file" "$inbounds_file" "$protocol" \
+            "$old_port" "$hy2_min" "$hy2_max" "$was_active" || {
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        }
+        disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+        return 1
+    fi
+    # Mark before entering a helper that can mutate successfully and then fail
+    # validation.  Signal rollback is intentionally idempotent.
+    PUBLIC_TX_CONFIG_MUTATED=1
+    update_public_inbound_port "$inbounds_file" "$protocol" "$new_port" || {
+        failure_status=$?
+        transaction_ok=0
+    }
+    if [ "$transaction_ok" = 1 ]; then
+        durable_transaction_checkpoint config-mutated || {
+            failure_status=2
+            transaction_ok=0
+        }
+    fi
+    if [ "$transaction_ok" = 1 ] && [ "$hy2_hopping_active" = 1 ]; then
+        # add_hy2_port_hopping may change live NAT before a later persistence
+        # step fails, so rollback ownership begins before the call.
+        PUBLIC_TX_HY2_NAT_MIGRATED=1
+        if add_hy2_port_hopping "$hy2_min" "$hy2_max" "$new_port"; then
+            hy2_nat_migrated=1
+        else
+            failure_status=$?
+            transaction_ok=0
+        fi
+    fi
+    if [ "$transaction_ok" = 1 ]; then
+        apply_public_port_service_state "$was_active" || {
+            failure_status=$?
+            transaction_ok=0
+        }
+    fi
+    if [ "$transaction_ok" = 1 ]; then
+        rewrite_public_client_port "$protocol" "$new_port" || {
+            failure_status=$?
+            transaction_ok=0
+        }
+    fi
+    if [ "$transaction_ok" = 1 ]; then
+        durable_transaction_checkpoint publishing || {
+            failure_status=2
+            transaction_ok=0
+        }
+    fi
+    if [ "$transaction_ok" = 1 ]; then
+        update_sub
+        operation_status=$?
+        if [ "$operation_status" -ne 0 ]; then
+            failure_status="$operation_status"
+            transaction_ok=0
+        fi
+    fi
+    if [ "$transaction_ok" = 1 ]; then
+        current_port=$(get_uniform_inbound_port "$inbounds_file" "$protocol") || current_port=''
+        if [ "$current_port" != "$new_port" ]; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            red "端口事务完成前配置发生并发变化，已保留证据且未删除旧规则。"
+            return 2
+        fi
+        public_port_conflicts "$inbounds_file" "$protocol" "$old_port" "$transport"
+        conflict_status=$?
+        if [ "$conflict_status" = 0 ]; then
+            durable_transaction_checkpoint committed || {
+                PUBLIC_PORT_RECOVERY_PATH="$backup_file"
+                disarm_durable_transaction keep >/dev/null 2>&1 || true
+                return 2
+            }
+            if ! cleanup_public_port_backup "$backup_file"; then
+                disarm_durable_transaction keep >/dev/null 2>&1 || true
+                red "新端口已提交，但客户端备份未能清理：${backup_file}"
+                return 3
+            fi
+            if ! disarm_durable_transaction cleanup; then
+                return 3
+            fi
+            yellow "旧端口 ${old_port} 仍被其他服务使用，已保留其防火墙规则。"
+            return 0
+        fi
+        if [ "$conflict_status" = 1 ] && remove_owned_firewall_port "${old_port}/${transport}"; then
+            durable_transaction_checkpoint committed || {
+                PUBLIC_PORT_RECOVERY_PATH="$backup_file"
+                disarm_durable_transaction keep >/dev/null 2>&1 || true
+                return 2
+            }
+            if ! cleanup_public_port_backup "$backup_file"; then
+                disarm_durable_transaction keep >/dev/null 2>&1 || true
+                red "新端口已提交，但客户端备份未能清理：${backup_file}"
+                return 3
+            fi
+            if ! disarm_durable_transaction cleanup; then
+                return 3
+            fi
+            return 0
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        red "新端口已生效，但旧端口的脚本所有规则未能安全删除；已保留客户端备份：${backup_file}"
+        return 2
+    fi
+
+    rollback_public_port_signal_transaction "$backup_file" "$inbounds_file" "$protocol" \
+        "$old_port" "$hy2_min" "$hy2_max" "$was_active" || rollback_status=1
+    if [ "$rollback_status" = 0 ]; then
+        if ! disarm_durable_transaction cleanup; then
+            red "端口修改已回滚，但事务证据未能清理。"
+            return 2
+        fi
+        [ "$failure_status" -ge 1 ] 2>/dev/null || failure_status=1
+        [ "$failure_status" -ne 2 ] || failure_status=1
+        return "$failure_status"
+    fi
+    disarm_durable_transaction keep >/dev/null 2>&1 || true
+    red "端口修改失败且回滚不完整，已保留客户端备份：${backup_file}"
+    return 2
+}
+
+change_public_inbound_port_transaction() {
+    local status
+
+    acquire_public_port_change_lock
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _change_public_inbound_port_transaction_locked "$@"
+    status=$?
+    release_public_port_change_lock
+    return "$status"
 }
 
 purge_nginx_package() {
@@ -3407,6 +5738,14 @@ uninstall_singbox() {
     case "${choice}" in
         y|Y)
             yellow "正在卸载 sing-box"
+            if ! remove_hy2_port_hopping; then
+                red "Hysteria2 端口跳跃状态无法安全清理，卸载已中止。"
+                return 1
+            fi
+            if ! remove_owned_firewall_rules; then
+                red "防火墙所有权状态无法安全清理，卸载已中止。"
+                return 1
+            fi
             if command_exists rc-service; then
                 rc-service sing-box stop; rc-service argo stop
                 rm -f "${uninstall_root}/etc/init.d/sing-box" \
@@ -3707,56 +6046,118 @@ change_hosts() {
     sed -i '2s/.*/::1         localhost/' /etc/hosts
 }
 
+rollback_failed_install_firewall_records() {
+    local -a records=("$@")
+
+    [ "${#records[@]}" -gt 0 ] || return 0
+    if remove_owned_firewall_records_exact "${records[@]}"; then
+        return 0
+    fi
+    red "安装失败后的防火墙回滚未能确认完成；firewall.state 已保留恢复证据。"
+    return 2
+}
+
+handle_failed_install_stage() {
+    local failure_status="${1:-1}"
+    local message="${2:-安装失败，安装中止。}"
+    shift 2 || return 2
+
+    red "$message"
+    rollback_failed_install_firewall_records "$@" || return 2
+    return "$failure_status"
+}
+
 # Fail-fast install orchestration shared by interactive and non-interactive paths.
 run_install_flow() {
+    local stage_status
+    local -a install_firewall_records=()
+
+    FIREWALL_LAST_ADDED_RECORDS=()
     clear_install_complete_marker || {
         red "无法清除旧的安装完成标记，安装中止。"
         return 1
     }
-    manage_packages install nginx jq tar openssl lsof coreutils || {
+    manage_packages install nginx jq tar openssl lsof coreutils util-linux || {
         red "依赖安装失败，安装中止。"
         return 1
     }
-    install_singbox || {
-        red "sing-box 配置安装失败，安装中止。"
-        return 1
-    }
+    if install_singbox; then stage_status=0; else stage_status=$?; fi
+    install_firewall_records=("${FIREWALL_LAST_ADDED_RECORDS[@]}")
+    if [ "$stage_status" -ne 0 ]; then
+        handle_failed_install_stage "$stage_status" \
+            "sing-box 配置安装失败，安装中止。" "${install_firewall_records[@]}"
+        return $?
+    fi
     validate_singbox_config || {
-        red "sing-box 配置检查失败，安装中止。"
-        return 1
+        handle_failed_install_stage 1 "sing-box 配置检查失败，安装中止。" \
+            "${install_firewall_records[@]}"
+        return $?
     }
 
     if command_exists systemctl; then
         main_systemd_services || {
             red "systemd 服务安装或启动失败，安装中止。"
+            yellow "服务可能已部分启动；保留已登记的防火墙规则，避免现有连接被误断。"
             return 1
         }
         systemctl is-active --quiet sing-box && systemctl is-active --quiet argo || {
             red "sing-box 或 Argo 服务未处于 active 状态，安装中止。"
+            yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
             return 1
         }
     elif command_exists rc-update; then
         alpine_openrc_services || {
             red "OpenRC 服务安装失败，安装中止。"
+            yellow "服务可能已部分注册；保留已登记的防火墙规则供重试或卸载清理。"
             return 1
         }
-        change_hosts || return 1
-        rc-service sing-box restart || return 1
-        rc-service argo restart || return 1
+        change_hosts || {
+            red "OpenRC 主机初始化失败，安装中止。"
+            yellow "服务已进入配置阶段；保留已登记的防火墙规则供重试或卸载清理。"
+            return 1
+        }
+        rc-service sing-box restart || {
+            red "sing-box OpenRC 服务启动失败，安装中止。"
+            yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
+            return 1
+        }
+        rc-service argo restart || {
+            red "Argo OpenRC 服务启动失败，安装中止。"
+            yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
+            return 1
+        }
         rc-service sing-box status >/dev/null 2>&1 && rc-service argo status >/dev/null 2>&1 || {
             red "sing-box 或 Argo 服务未启动，安装中止。"
+            yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
             return 1
         }
     else
-        red "不支持的 init 系统，安装中止。"
-        return 1
+        handle_failed_install_stage 1 "不支持的 init 系统，安装中止。" \
+            "${install_firewall_records[@]}"
+        return $?
     fi
 
     sleep 5
-    add_nginx_conf || { red "Nginx 订阅配置失败，安装中止。"; return 1; }
-    get_info || { red "节点信息生成失败，安装中止。"; return 1; }
-    create_shortcut || { red "快捷指令创建失败，安装中止。"; return 1; }
-    mark_install_complete || { red "安装完成标记写入失败，安装中止。"; return 1; }
+    add_nginx_conf || {
+        red "Nginx 订阅配置失败，安装中止。"
+        yellow "核心服务已经启动；保留已登记的防火墙规则，避免现有连接被误断。"
+        return 1
+    }
+    get_info || {
+        red "节点信息生成失败，安装中止。"
+        yellow "核心服务已经启动；保留已登记的防火墙规则，避免现有连接被误断。"
+        return 1
+    }
+    create_shortcut || {
+        red "快捷指令创建失败，安装中止。"
+        yellow "核心服务已经启动；保留已登记的防火墙规则，避免现有连接被误断。"
+        return 1
+    }
+    mark_install_complete || {
+        red "安装完成标记写入失败，安装中止。"
+        yellow "核心服务已经启动；保留已登记的防火墙规则，避免现有连接被误断。"
+        return 1
+    }
     green "\nsing-box 安装完成\n"
 }
 
@@ -3801,6 +6202,15 @@ auto_uninstall() {
     local uninstall_root="${1:-}"
 
     green "Starting non-interactive sing-box uninstall..."
+
+    if ! remove_hy2_port_hopping; then
+        red "Unable to safely clean Hysteria2 port-hopping rules; uninstall aborted."
+        return 1
+    fi
+    if ! remove_owned_firewall_rules; then
+        red "Unable to safely clean owned firewall rules; uninstall aborted."
+        return 1
+    fi
 
     if command_exists rc-service; then
         rc-service sing-box stop  > /dev/null 2>&1
@@ -3848,6 +6258,7 @@ auto_uninstall() {
 change_config() {
     local singbox_status=$(check_singbox 2>/dev/null)
     local singbox_installed=$?
+    local port_change_status
 
     if [ $singbox_installed -eq 2 ]; then
         yellow "sing-box 尚未安装！"; sleep 1; menu; return
@@ -3894,33 +6305,27 @@ change_config() {
                 1)
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    update_public_inbound_port "$inbounds_file" reality "$new_port" || return
-                    restart_singbox
-                    allow_port "$new_port/tcp" > /dev/null 2>&1 || return
-                    sed -i '/flow=xtls-rprx-vision/ s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    update_sub
+                    change_public_inbound_port_transaction "$inbounds_file" reality "$new_port" tcp
+                    port_change_status=$?
+                    [ "$port_change_status" -eq 0 ] || return "$port_change_status"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
                     ;;
                 2)
                     reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    update_public_inbound_port "$inbounds_file" hysteria2 "$new_port" || return
-                    restart_singbox
-                    allow_port "$new_port/udp" > /dev/null 2>&1 || return
-                    sed -i 's/\(hysteria2:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    update_sub
+                    change_public_inbound_port_transaction "$inbounds_file" hysteria2 "$new_port" udp
+                    port_change_status=$?
+                    [ "$port_change_status" -eq 0 ] || return "$port_change_status"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 3)
                     reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    update_public_inbound_port "$inbounds_file" tuic "$new_port" || return
-                    restart_singbox
-                    allow_port "$new_port/udp" > /dev/null 2>&1 || return
-                    sed -i 's/\(tuic:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    update_sub
+                    change_public_inbound_port_transaction "$inbounds_file" tuic "$new_port" udp
+                    port_change_status=$?
+                    [ "$port_change_status" -eq 0 ] || return "$port_change_status"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
                     ;;
@@ -4062,12 +6467,16 @@ change_config() {
     esac
 }
 
-configure_cf_https_subscription() {
+_configure_cf_https_subscription_locked() {
     local force_rotate="${1:-0}"
     local tunnel_mode domain_mode domain choice token port http_path https_path path_regex https_url
-    local old_domain old_https_path old_path_regex config_file nginx_backup pending_state state_target
-    local old_http_path tunnel_id dns_choice confirm apply_method manual_confirm operation_ok=0
+    local old_domain old_https_path old_path_regex config_file pending_state snapshot_dir tunnel_file=''
+    local old_http_path tunnel_id dns_choice confirm apply_method manual_confirm
+    local config_status nginx_was_active=0 operation_status=0 rollback_status=0 dns_mutated=0
+    local baseline_config_digest baseline_state_digest baseline_tunnel_digest=''
+    local current_tunnel_mode
 
+    FRONTEND_RECOVERY_PATH=''
     load_subscription_state
     tunnel_mode=$(detect_argo_tunnel_mode 2>/dev/null || true)
     if [ "$tunnel_mode" = quick ] || [ -z "$tunnel_mode" ]; then
@@ -4080,9 +6489,9 @@ configure_cf_https_subscription() {
     old_path_regex=""
     is_valid_subscription_path "$old_https_path" && old_path_regex="^${old_https_path}$"
 
-    if [ "$force_rotate" = 1 ] && [ "$SUB_HTTPS_ENABLED" = 1 ]; then
-        domain_mode="$SUB_HTTPS_DOMAIN_MODE"
-        domain="$SUB_HTTPS_DOMAIN"
+    if [ "$force_rotate" = 1 ]; then
+        domain_mode=''
+        domain=''
     else
         green "\nHTTPS 订阅域名模式："
         green "1. 复用现有固定 Argo 域名（推荐，无需新增域名）"
@@ -4111,13 +6520,44 @@ configure_cf_https_subscription() {
         is_valid_subscription_domain "$domain" || { red "订阅域名格式无效"; return 1; }
     fi
 
-    config_file="/etc/nginx/conf.d/sing-box.conf"
+    config_file="${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"
+    validate_managed_subscription_runtime "$config_file" any
+    config_status=$?
+    case "$config_status" in
+        0) ;;
+        1) red "未找到 Nginx HTTP 订阅配置，请先开启节点订阅。"; return 1 ;;
+        *) red "现有 Nginx 配置不是脚本可确认拥有的完整订阅配置，已拒绝覆盖。"; return 1 ;;
+    esac
     port=$(get_nginx_subscription_port "$config_file" 2>/dev/null || true)
     old_http_path=$(get_nginx_subscription_paths "$config_file" 2>/dev/null | head -1)
     [ -n "$port" ] && is_valid_http_subscription_path "$old_http_path" || {
         red "未找到有效的 Nginx HTTP 订阅配置，请先开启节点订阅。"
         return 1
     }
+    if ! nginx_service_is_active; then
+        yellow "HTTPS 公网验证要求订阅服务正在运行；当前未修改任何配置。"
+        return 1
+    fi
+    nginx_was_active=1
+    if [ "$force_rotate" = 1 ]; then
+        [ "$SUB_HTTPS_ENABLED" = 1 ] || {
+            red "HTTPS 订阅状态已变化，已拒绝继续轮换。"
+            return 2
+        }
+        domain_mode="$SUB_HTTPS_DOMAIN_MODE"
+        domain="$SUB_HTTPS_DOMAIN"
+    fi
+    old_domain="${SUB_HTTPS_DOMAIN:-}"
+    old_https_path="${SUB_HTTPS_PATH:-}"
+    old_path_regex=''
+    is_valid_subscription_path "$old_https_path" && old_path_regex="^${old_https_path}$"
+    [ "$tunnel_mode" = local ] && tunnel_file="${work_dir}/tunnel.yml"
+    baseline_config_digest=$(subscription_frontend_snapshot_file_digest "$config_file") || return 2
+    baseline_state_digest=$(subscription_frontend_snapshot_file_digest \
+        "$subscription_state_file") || return 2
+    if [ -n "$tunnel_file" ]; then
+        baseline_tunnel_digest=$(subscription_frontend_snapshot_file_digest "$tunnel_file") || return 2
+    fi
 
     token="${SUB_TOKEN:-}"
     if [ "$force_rotate" = 1 ] || ! is_valid_subscription_token "$token"; then
@@ -4137,23 +6577,25 @@ configure_cf_https_subscription() {
             "${work_dir}/tunnel.yml" | head -1)
         green "\n独立域名需要 CNAME：${purple}${domain}${re} -> ${purple}${tunnel_id}.cfargotunnel.com${re}（已代理）"
         reading "是否尝试由 cloudflared 自动创建 DNS？[y/N]: " dns_choice
-        if [[ "$dns_choice" =~ ^[Yy]$ ]] && \
-           ! "${work_dir}/argo" tunnel route dns "$tunnel_id" "$domain"; then
-            yellow "自动创建 DNS 失败，请在 Cloudflare Dashboard 手动创建上述 CNAME。"
+        if [[ ! "$dns_choice" =~ ^[Yy]$ ]]; then
+            reading "确认 DNS 已配置后输入 y 继续: " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || return 1
         fi
-        reading "确认 DNS 已配置后输入 y 继续: " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || return 1
     fi
 
-    nginx_backup=$(mktemp "/etc/nginx/conf.d/.sing-box-https-backup.XXXXXX") || return 1
-    cp -p "$config_file" "$nginx_backup" || { rm -f "$nginx_backup"; return 1; }
-    chmod 600 "$nginx_backup" 2>/dev/null || true
-    pending_state=$(mktemp "${work_dir}/.subscription-state-pending.XXXXXX") || {
-        rm -f "$nginx_backup"
-        return 1
-    }
-    rm -f "$pending_state"
-
+    snapshot_dir=$(backup_subscription_frontend_snapshot "$config_file" \
+        "$subscription_state_file" "$tunnel_file" "$conf_dir") || return 1
+    current_tunnel_mode=$(detect_argo_tunnel_mode 2>/dev/null || true)
+    if [ "$current_tunnel_mode" != "$tunnel_mode" ] || \
+       ! verify_subscription_frontend_snapshot_baseline "$snapshot_dir" "$config_file" \
+            "$subscription_state_file" "$tunnel_file" "$baseline_config_digest" \
+            "$baseline_state_digest" "$baseline_tunnel_digest" || \
+       ! validate_managed_subscription_runtime "$config_file" any; then
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        red "订阅配置在确认期间发生变化，已拒绝覆盖。"
+        return 2
+    fi
     SUB_TOKEN="$token"
     SUB_HTTP_PATH="$http_path"
     SUB_HTTPS_ENABLED=1
@@ -4162,26 +6604,61 @@ configure_cf_https_subscription() {
     SUB_HTTPS_PATH="$https_path"
     SUB_TUNNEL_MODE="$tunnel_mode"
     SUB_HTTPS_VERIFIED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    state_target="$subscription_state_file"
-    subscription_state_file="$pending_state"
-    if ! save_subscription_state; then
-        subscription_state_file="$state_target"
-        rm -f "$nginx_backup" "$pending_state"
+    pending_state=$(prepare_subscription_frontend_state_transaction \
+        "$subscription_state_file" "$snapshot_dir") || {
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
         red "无法预写订阅状态，配置未改变。"
         return 1
-    fi
-    subscription_state_file="$state_target"
-
-    if ! apply_nginx_subscription_config "$port" "$http_path" "$https_path"; then
-        rm -f "$nginx_backup" "$pending_state"
-        load_subscription_state
+    }
+    if ! arm_durable_transaction subscription-https "$conf_dir" "$snapshot_dir" \
+        FRONTEND_RECOVERY_PATH rollback_subscription_frontend_signal_transaction \
+        "$nginx_was_active" "$port" "$port" \
+        "$snapshot_dir" "$config_file" "$subscription_state_file" \
+        "$tunnel_file" "$pending_state"; then
+        rm -f -- "$pending_state"
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
         return 1
     fi
+    apply_nginx_subscription_config "$port" "$http_path" "$https_path" \
+        "$nginx_was_active" "$config_file" || operation_status=$?
+    if [ "$operation_status" -eq 0 ]; then
+        durable_transaction_checkpoint config-mutated || operation_status=2
+    fi
+    if [ "$operation_status" -eq 0 ]; then
+        durable_transaction_checkpoint publishing || operation_status=2
+    fi
+    if [ "$operation_status" -ne 0 ]; then
+        rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+            "$subscription_state_file" "$tunnel_file" "$pending_state"
+        rollback_status=$?
+        load_subscription_state
+        if [ "$rollback_status" -eq 0 ]; then
+            disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+            return 1
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
 
+    if [ "$tunnel_mode" = local ] && [ "$domain_mode" = separate ] && \
+       [[ "$dns_choice" =~ ^[Yy]$ ]]; then
+        dns_mutated=1
+        if ! "${work_dir}/argo" tunnel route dns "$tunnel_id" "$domain"; then
+            yellow "自动创建 DNS 失败或结果未知，请在 Cloudflare Dashboard 核对 CNAME。"
+            reading "确认 DNS 已正确配置后输入 y 继续: " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                disarm_durable_transaction keep >/dev/null 2>&1 || true
+                return 2
+            fi
+        fi
+    fi
     case "$tunnel_mode" in
         local)
             apply_local_tunnel_subscription_rule "$domain" "$path_regex" "$port" \
-                "$domain_mode" "${work_dir}/tunnel.yml" "$https_url" && operation_ok=1
+                "$domain_mode" "${work_dir}/tunnel.yml" "$https_url"
+            operation_status=$?
             ;;
         remote)
             green "\n远程管理 Tunnel 配置方式："
@@ -4190,7 +6667,8 @@ configure_cf_https_subscription() {
             reading "请选择 [1-2，默认2]: " apply_method
             if [ "$apply_method" = 1 ]; then
                 apply_remote_tunnel_subscription_rule "$domain" "$path_regex" "$port" \
-                    "$domain_mode" "$old_domain" "$old_path_regex" "$https_url" && operation_ok=1
+                    "$domain_mode" "$old_domain" "$old_path_regex" "$https_url"
+                operation_status=$?
             else
                 print_manual_https_route "$domain" "$path_regex" "$port"
                 if [ -n "$old_domain" ] && [ -n "$old_path_regex" ] && \
@@ -4198,103 +6676,302 @@ configure_cf_https_subscription() {
                     yellow "轮换完成后，请删除旧路由：Hostname=${old_domain}, Path=${old_path_regex}"
                 fi
                 reading "完成 Dashboard 配置后输入 y 进行公网验证: " manual_confirm
-                [[ "$manual_confirm" =~ ^[Yy]$ ]] && \
-                    verify_https_subscription "$https_url" && operation_ok=1
+                if [[ "$manual_confirm" =~ ^[Yy]$ ]]; then
+                    verify_https_subscription "$https_url" || operation_status=2
+                else
+                    operation_status=1
+                fi
             fi
             ;;
     esac
 
-    if [ "$operation_ok" != 1 ]; then
-        cp -p "$nginx_backup" "$config_file"
-        nginx -t > /dev/null 2>&1 && { nginx -s reload > /dev/null 2>&1 || restart_nginx > /dev/null 2>&1; }
-        rm -f "$nginx_backup" "$pending_state"
-        load_subscription_state
-        red "HTTPS 订阅配置或验证失败，Nginx 已恢复，原 HTTP 订阅保持可用。"
-        return 1
+    if [ "$operation_status" -ne 0 ]; then
+        if [ "$operation_status" -eq 1 ] && [ "$dns_mutated" -eq 0 ] && \
+           { [ "$tunnel_mode" = local ] || \
+             { [ "$tunnel_mode" = remote ] && [ "$apply_method" = 1 ]; }; }; then
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "$tunnel_file" "$pending_state"
+            rollback_status=$?
+            load_subscription_state
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                red "HTTPS 订阅配置或验证失败，原订阅前端已恢复。"
+                return 1
+            fi
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        red "HTTPS 发布结果未决，已保留恢复证据并阻止后续配置事务。"
+        return 2
     fi
-
-    if ! mv -f "$pending_state" "$subscription_state_file"; then
-        cp -p "$nginx_backup" "$config_file"
-        nginx -t > /dev/null 2>&1 && { nginx -s reload > /dev/null 2>&1 || restart_nginx > /dev/null 2>&1; }
-        [ "$tunnel_mode" = local ] && [ -r "${work_dir}/tunnel.yml.bak.subscription" ] && {
-            cp -p "${work_dir}/tunnel.yml.bak.subscription" "${work_dir}/tunnel.yml"
-            restart_argo > /dev/null 2>&1 || true
-        }
-        rm -f "$nginx_backup" "$pending_state"
-        load_subscription_state
-        red "状态文件提交失败，已尽力恢复原配置。"
-        return 1
+    if ! commit_subscription_frontend_state_transaction "$pending_state" \
+        "$subscription_state_file"; then
+        if [ "$tunnel_mode" = local ] && [ "$dns_mutated" -eq 0 ]; then
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "$tunnel_file" "$pending_state"
+            rollback_status=$?
+            load_subscription_state
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                return 1
+            fi
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        red "HTTPS 已发布但本地状态提交失败，已保留恢复证据。"
+        return 2
     fi
-    chmod 600 "$subscription_state_file" 2>/dev/null || true
-    rm -f "$nginx_backup"
+    if ! validate_managed_subscription_runtime "$config_file" https; then
+        if [ "$tunnel_mode" = local ] && [ "$dns_mutated" -eq 0 ]; then
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "$tunnel_file" ""
+            rollback_status=$?
+            load_subscription_state
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                return 1
+            fi
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! durable_transaction_checkpoint committed; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! disarm_durable_transaction cleanup; then
+        return 3
+    fi
+    if ! cleanup_subscription_frontend_snapshot "$snapshot_dir"; then
+        FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        return 3
+    fi
     green "\nCloudflare HTTPS 订阅已启用并通过内容验证：\n${purple}${https_url}${re}\n"
 }
 
-disable_cf_https_subscription() {
-    local tunnel_mode path_regex method confirm port http_path
+configure_cf_https_subscription() {
+    local status
 
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "HTTPS 订阅操作"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _configure_cf_https_subscription_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+_disable_cf_https_subscription_locked() {
+    local tunnel_mode path_regex method confirm port http_path config_file config_status
+    local old_domain old_https_path snapshot_dir pending_state tunnel_file=''
+    local nginx_was_active=0 operation_status=0 rollback_status=0
+    local baseline_config_digest baseline_state_digest baseline_tunnel_digest=''
+    local current_tunnel_mode
+
+    FRONTEND_RECOVERY_PATH=''
     load_subscription_state
+    config_file="${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"
     if [ "$SUB_HTTPS_ENABLED" != 1 ]; then
-        yellow "Cloudflare HTTPS 订阅尚未启用。"
-        return 0
+        validate_managed_subscription_runtime "$config_file" any
+        config_status=$?
+        case "$config_status" in
+            0|1) yellow "Cloudflare HTTPS 订阅尚未启用。"; return 0 ;;
+            *) red "Nginx 配置与订阅状态不一致，已拒绝修改。"; return 2 ;;
+        esac
     fi
+    validate_managed_subscription_runtime "$config_file" https
+    config_status=$?
+    case "$config_status" in
+        0) ;;
+        1) red "Nginx 订阅配置缺失，已拒绝修改 Tunnel 路由或状态。"; return 1 ;;
+        *) red "现有 Nginx 配置不是脚本可确认拥有的完整订阅配置，已拒绝修改。"; return 1 ;;
+    esac
     tunnel_mode="${SUB_TUNNEL_MODE:-$(detect_argo_tunnel_mode 2>/dev/null || true)}"
-    path_regex="^${SUB_HTTPS_PATH}$"
+    old_domain="$SUB_HTTPS_DOMAIN"
+    old_https_path="$SUB_HTTPS_PATH"
+    path_regex="^${old_https_path}$"
+    port=$(get_nginx_subscription_port "$config_file" 2>/dev/null || true)
+    http_path="$SUB_HTTP_PATH"
+    [ -n "$port" ] && is_valid_http_subscription_path "$http_path" || return 2
+    nginx_service_is_active && nginx_was_active=1
+    [ "$tunnel_mode" = local ] && tunnel_file="${work_dir}/tunnel.yml"
+    baseline_config_digest=$(subscription_frontend_snapshot_file_digest "$config_file") || return 2
+    baseline_state_digest=$(subscription_frontend_snapshot_file_digest \
+        "$subscription_state_file") || return 2
+    if [ -n "$tunnel_file" ]; then
+        baseline_tunnel_digest=$(subscription_frontend_snapshot_file_digest "$tunnel_file") || return 2
+    fi
 
     case "$tunnel_mode" in
-        local)
-            apply_local_tunnel_subscription_removal "${work_dir}/tunnel.yml" || {
-                red "本地 Tunnel 订阅路由移除失败，状态未改变。"
-                return 1
-            }
-            ;;
+        local) ;;
         remote)
             green "1. 使用 Cloudflare API token 自动移除路由"
             green "2. 在 Dashboard 手动移除路由"
             reading "请选择 [1-2，默认2]: " method
-            if [ "$method" = 1 ]; then
-                remove_remote_tunnel_subscription_via_api "$SUB_HTTPS_DOMAIN" "$path_regex" || return 1
-            else
-                yellow "请删除路由：Hostname=${SUB_HTTPS_DOMAIN}, Path=${path_regex}"
-                reading "确认已删除后输入 y: " confirm
-                [[ "$confirm" =~ ^[Yy]$ ]] || return 1
-            fi
             ;;
         *) red "无法识别原固定 Tunnel 类型，未修改状态。"; return 1 ;;
     esac
 
-    port=$(get_nginx_subscription_port 2>/dev/null || true)
-    http_path="${SUB_HTTP_PATH:-$(get_nginx_subscription_paths 2>/dev/null | head -1)}"
-    if [ -n "$port" ] && is_valid_http_subscription_path "$http_path"; then
-        apply_nginx_subscription_config "$port" "$http_path" "" || \
-            yellow "HTTPS 路由已关闭，但 Nginx 未能移除额外 HTTPS origin 路径。"
+    snapshot_dir=$(backup_subscription_frontend_snapshot "$config_file" \
+        "$subscription_state_file" "$tunnel_file" "$conf_dir") || return 1
+    current_tunnel_mode=$(detect_argo_tunnel_mode 2>/dev/null || true)
+    if [ "$current_tunnel_mode" != "$tunnel_mode" ] || \
+       ! verify_subscription_frontend_snapshot_baseline "$snapshot_dir" "$config_file" \
+            "$subscription_state_file" "$tunnel_file" "$baseline_config_digest" \
+            "$baseline_state_digest" "$baseline_tunnel_digest" || \
+       ! validate_managed_subscription_runtime "$config_file" https; then
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        red "订阅配置在确认期间发生变化，已拒绝覆盖。"
+        return 2
     fi
-
     SUB_HTTPS_ENABLED=0
     SUB_HTTPS_DOMAIN=''
     SUB_HTTPS_DOMAIN_MODE=''
     SUB_HTTPS_PATH=''
     SUB_TUNNEL_MODE=''
     SUB_HTTPS_VERIFIED_AT=''
-    save_subscription_state || return 1
+    pending_state=$(prepare_subscription_frontend_state_transaction \
+        "$subscription_state_file" "$snapshot_dir") || {
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        return 1
+    }
+    if ! arm_durable_transaction subscription-https-disable "$conf_dir" "$snapshot_dir" \
+        FRONTEND_RECOVERY_PATH rollback_subscription_frontend_signal_transaction \
+        "$nginx_was_active" "$port" "$port" \
+        "$snapshot_dir" "$config_file" "$subscription_state_file" \
+        "$tunnel_file" "$pending_state"; then
+        rm -f -- "$pending_state"
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        return 1
+    fi
+    apply_nginx_subscription_config "$port" "$http_path" "" \
+        "$nginx_was_active" "$config_file" || operation_status=$?
+    if [ "$operation_status" -eq 0 ]; then
+        durable_transaction_checkpoint config-mutated || operation_status=2
+    fi
+    if [ "$operation_status" -eq 0 ]; then
+        durable_transaction_checkpoint publishing || operation_status=2
+    fi
+    if [ "$operation_status" -ne 0 ]; then
+        rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+            "$subscription_state_file" "$tunnel_file" "$pending_state"
+        rollback_status=$?
+        load_subscription_state
+        if [ "$rollback_status" -eq 0 ]; then
+            disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+            return 1
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+
+    case "$tunnel_mode" in
+        local)
+            apply_local_tunnel_subscription_removal "$tunnel_file"
+            operation_status=$?
+            ;;
+        remote)
+            if [ "$method" = 1 ]; then
+                remove_remote_tunnel_subscription_via_api "$old_domain" "$path_regex"
+                operation_status=$?
+            else
+                yellow "请删除路由：Hostname=${old_domain}, Path=${path_regex}"
+                reading "确认已删除后输入 y: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || operation_status=1
+            fi
+            ;;
+    esac
+    if [ "$operation_status" -ne 0 ]; then
+        if [ "$operation_status" -eq 1 ] && \
+           { [ "$tunnel_mode" = local ] || \
+             { [ "$tunnel_mode" = remote ] && [ "$method" = 1 ]; }; }; then
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "$tunnel_file" "$pending_state"
+            rollback_status=$?
+            load_subscription_state
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                return 1
+            fi
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! commit_subscription_frontend_state_transaction "$pending_state" \
+        "$subscription_state_file"; then
+        if [ "$tunnel_mode" = local ]; then
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "$tunnel_file" "$pending_state"
+            rollback_status=$?
+            load_subscription_state
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                return 1
+            fi
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! validate_managed_subscription_runtime "$config_file" http; then
+        if [ "$tunnel_mode" = local ]; then
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "$tunnel_file" ""
+            rollback_status=$?
+            load_subscription_state
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                return 1
+            fi
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! durable_transaction_checkpoint committed; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! disarm_durable_transaction cleanup; then
+        return 3
+    fi
+    if ! cleanup_subscription_frontend_snapshot "$snapshot_dir"; then
+        FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        return 3
+    fi
     green "Cloudflare HTTPS 订阅已关闭；HTTP 订阅仍保留。"
+}
+
+disable_cf_https_subscription() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "HTTPS 订阅操作"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _disable_cf_https_subscription_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
 }
 
 update_cf_https_subscription_origin() {
     local port="${1:-}"
-    local tunnel_mode path_regex https_url method confirm operation_ok=0
+    local verify_mode="${2:-1}"
+    local tunnel_mode path_regex https_url verify_url method confirm operation_status=0
 
     load_subscription_state
     [ "$SUB_HTTPS_ENABLED" = 1 ] || return 0
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+    case "$verify_mode" in 0|1) ;; *) return 1 ;; esac
     tunnel_mode="${SUB_TUNNEL_MODE:-$(detect_argo_tunnel_mode 2>/dev/null || true)}"
     path_regex="^${SUB_HTTPS_PATH}$"
     https_url=$(build_https_subscription_url "$SUB_HTTPS_DOMAIN" "$SUB_HTTPS_PATH") || return 1
+    [ "$verify_mode" = 1 ] && verify_url="$https_url" || verify_url=''
 
     case "$tunnel_mode" in
         local)
             apply_local_tunnel_subscription_rule "$SUB_HTTPS_DOMAIN" "$path_regex" "$port" \
-                "$SUB_HTTPS_DOMAIN_MODE" "${work_dir}/tunnel.yml" "$https_url" && operation_ok=1
+                "$SUB_HTTPS_DOMAIN_MODE" "${work_dir}/tunnel.yml" "$verify_url"
+            operation_status=$?
             ;;
         remote)
             green "HTTPS 订阅已启用，端口变化还需要更新远程 Tunnel origin。"
@@ -4303,43 +6980,337 @@ update_cf_https_subscription_origin() {
             reading "请选择 [1-2，默认2]: " method
             if [ "$method" = 1 ]; then
                 apply_remote_tunnel_subscription_rule "$SUB_HTTPS_DOMAIN" "$path_regex" "$port" \
-                    "$SUB_HTTPS_DOMAIN_MODE" "$SUB_HTTPS_DOMAIN" "$path_regex" "$https_url" && operation_ok=1
+                    "$SUB_HTTPS_DOMAIN_MODE" "$SUB_HTTPS_DOMAIN" "$path_regex" "$verify_url"
+                operation_status=$?
             else
                 print_manual_https_route "$SUB_HTTPS_DOMAIN" "$path_regex" "$port"
-                reading "更新完成后输入 y 进行公网验证: " confirm
-                [[ "$confirm" =~ ^[Yy]$ ]] && verify_https_subscription "$https_url" && operation_ok=1
+                if [ "$verify_mode" = 1 ]; then
+                    reading "更新完成后输入 y 进行公网验证: " confirm
+                    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                        verify_https_subscription "$https_url" || operation_status=2
+                    else
+                        operation_status=1
+                    fi
+                else
+                    reading "确认 Dashboard origin 已更新后输入 y: " confirm
+                    [[ "$confirm" =~ ^[Yy]$ ]] || operation_status=1
+                fi
             fi
             ;;
         *) return 1 ;;
     esac
 
-    [ "$operation_ok" = 1 ] || return 1
-    SUB_HTTPS_VERIFIED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    save_subscription_state
+    [ "$operation_status" -eq 0 ] || return "$operation_status"
+    if [ "$verify_mode" = 1 ]; then
+        SUB_HTTPS_VERIFIED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    else
+        SUB_HTTPS_VERIFIED_AT=''
+    fi
+    save_subscription_state || return 2
 }
 
-rotate_subscription_token() {
-    local port old_path token new_path host link confirm
+restore_subscription_port_snapshot() {
+    local backup_file="${1:-}"
+    local config_file="${2:-}"
+    local was_active="${3:-1}"
 
+    [ -f "$backup_file" ] && [ ! -L "$backup_file" ] || return 1
+    [ -n "$config_file" ] && [ ! -L "$config_file" ] || return 1
+    cp -p -- "$backup_file" "$config_file" || return 1
+    nginx -t >/dev/null 2>&1 || return 1
+    case "$was_active" in
+        1)
+            nginx -s reload >/dev/null 2>&1 || restart_nginx >/dev/null 2>&1 || return 1
+            nginx_service_is_active
+            ;;
+        0)
+            if nginx_service_is_active; then
+                stop_nginx_checked || return 1
+            fi
+            ! nginx_service_is_active
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+rollback_subscription_port_transaction() {
+    local backup_file="${1:-}"
+    local config_file="${2:-}"
+    local old_port="${3:-}"
+    local was_active="${4:-1}"
+    local origin_attempted="${5:-0}"
+    shift 5 || return 2
+    local status=0
+    local -a firewall_records=("$@")
+
+    restore_subscription_port_snapshot "$backup_file" "$config_file" "$was_active" || status=1
+    if [ "$origin_attempted" = 1 ]; then
+        update_cf_https_subscription_origin "$old_port" "$was_active" || status=1
+    fi
+    if [ "${#firewall_records[@]}" -gt 0 ]; then
+        remove_owned_firewall_records_exact "${firewall_records[@]}" || status=1
+    fi
+    if [ "$status" -eq 0 ]; then
+        if rm -f -- "$backup_file"; then
+            return 1
+        fi
+        SUBSCRIPTION_PORT_RECOVERY_PATH="$backup_file"
+        red "订阅端口已恢复，但 Nginx 备份未能清理：${backup_file}"
+        return 2
+    fi
+
+    SUBSCRIPTION_PORT_RECOVERY_PATH="$backup_file"
+    red "订阅端口事务回滚不完整，已保留 Nginx 备份：${backup_file}"
+    return 2
+}
+
+rollback_subscription_port_signal_transaction() {
+    local backup_file="${1:-}"
+    local config_file="${2:-}"
+    local old_port="${3:-}"
+    local was_active="${4:-0}"
+    local rollback_status=0
+
+    if [ "${SUBSCRIPTION_TX_CONFIG_MUTATED:-0}" = 1 ]; then
+        rollback_subscription_port_transaction "$backup_file" "$config_file" "$old_port" \
+            "$was_active" "${SUBSCRIPTION_TX_ORIGIN_ATTEMPTED:-0}" \
+            "${DURABLE_TX_OWNED_RECORDS[@]}"
+        rollback_status=$?
+        [ "$rollback_status" -eq 1 ] && return 0
+        return 1
+    fi
+    if [ "${#DURABLE_TX_OWNED_RECORDS[@]}" -gt 0 ]; then
+        remove_owned_firewall_records_exact "${DURABLE_TX_OWNED_RECORDS[@]}" || return 1
+    fi
+    rm -f -- "$backup_file"
+}
+
+_change_subscription_port_transaction_locked() {
+    local config_file="${1:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
+    local new_port="${2:-}"
+    local http_path="${3:-}"
+    local https_path="${4:-}"
+    local old_port backup_file operation_status origin_attempted=0 nginx_was_active=0 config_status
+    local inbounds_file="${conf_dir}/inbounds.json" conflict_status
+    local -a new_firewall_records=() current_paths=()
+
+    SUBSCRIPTION_PORT_RECOVERY_PATH=''
+    validate_port_value "$new_port" subscription_port || return 1
+    validate_managed_subscription_runtime "$config_file" any
+    config_status=$?
+    [ "$config_status" -eq 0 ] || {
+        red "现有 Nginx 配置不是脚本可确认拥有的完整订阅配置，已拒绝修改端口。"
+        return 1
+    }
+    mapfile -t current_paths < <(get_nginx_subscription_paths "$config_file")
+    [ "${#current_paths[@]}" -ge 1 ] && [ "${#current_paths[@]}" -le 2 ] || return 2
+    http_path="${current_paths[0]}"
+    https_path=''
+    [ "${#current_paths[@]}" -eq 1 ] || https_path="${current_paths[1]}"
+    is_valid_http_subscription_path "$http_path" || return 2
+    [ -z "$https_path" ] || is_valid_http_subscription_path "$https_path" || return 2
+    old_port=$(get_nginx_subscription_port "$config_file") || return 1
+    [ "$old_port" != "$new_port" ] || return 0
+    nginx_service_is_active && nginx_was_active=1
+
+    if configured_inbound_port_conflict_exists "$inbounds_file" "$new_port" tcp; then
+        red "端口 ${new_port}/tcp 已被 sing-box 配置占用。"
+        return 1
+    else
+        conflict_status=$?
+    fi
+    [ "$conflict_status" -eq 1 ] || return 2
+    if port_is_listening "$new_port" tcp; then
+        red "端口 ${new_port}/tcp 已被其他进程监听。"
+        return 1
+    fi
+
+    backup_file=$(mktemp "$(dirname "$config_file")/.subscription-port-backup.XXXXXX") || return 1
+    if ! cp -p -- "$config_file" "$backup_file"; then
+        rm -f -- "$backup_file"
+        return 1
+    fi
+    if ! chmod 600 "$backup_file"; then
+        rm -f -- "$backup_file"
+        return 1
+    fi
+    SUBSCRIPTION_TX_CONFIG_MUTATED=0
+    SUBSCRIPTION_TX_ORIGIN_ATTEMPTED=0
+    if ! arm_durable_transaction subscription-port "$(dirname "$backup_file")" "$backup_file" \
+        SUBSCRIPTION_PORT_RECOVERY_PATH rollback_subscription_port_signal_transaction \
+        "$nginx_was_active" "$old_port" "$new_port" \
+        "$backup_file" "$config_file" "$old_port" "$nginx_was_active"; then
+        if ! rm -f -- "$backup_file"; then
+            SUBSCRIPTION_PORT_RECOVERY_PATH="$backup_file"
+            return 2
+        fi
+        return 1
+    fi
+
+    if ! durable_transaction_checkpoint firewall-mutating; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    allow_port "${new_port}/tcp"
+    operation_status=$?
+    if [ "$operation_status" -ne 0 ]; then
+        if [ "$operation_status" -eq 2 ]; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            red "防火墙事务状态未决，已保留订阅端口恢复证据。"
+            return 2
+        fi
+        if ! rm -f -- "$backup_file"; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        fi
+        if ! disarm_durable_transaction cleanup; then
+            return 2
+        fi
+        return "$operation_status"
+    fi
+    new_firewall_records=("${FIREWALL_LAST_ADDED_RECORDS[@]}")
+    if ! durable_transaction_set_owned_records "${new_firewall_records[@]}" || \
+       ! durable_transaction_checkpoint precommit; then
+        rollback_subscription_port_signal_transaction "$backup_file" "$config_file" \
+            "$old_port" "$nginx_was_active" || {
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        }
+        disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+        return 1
+    fi
+
+    SUBSCRIPTION_TX_CONFIG_MUTATED=1
+    apply_nginx_subscription_config "$new_port" "$http_path" "$https_path" \
+        "$nginx_was_active" "$config_file"
+    operation_status=$?
+    if [ "$operation_status" -ne 0 ]; then
+        rollback_subscription_port_transaction "$backup_file" "$config_file" "$old_port" \
+            "$nginx_was_active" 0 \
+            "${new_firewall_records[@]}"
+        operation_status=$?
+        if [ "$operation_status" -eq 1 ]; then
+            disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+        else
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+        fi
+        return "$operation_status"
+    fi
+    if ! durable_transaction_checkpoint config-mutated; then
+        rollback_subscription_port_signal_transaction "$backup_file" "$config_file" \
+            "$old_port" "$nginx_was_active" || {
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        }
+        disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+        return 1
+    fi
+
+    if ! durable_transaction_checkpoint publishing; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    origin_attempted=1
+    SUBSCRIPTION_TX_ORIGIN_ATTEMPTED=1
+    update_cf_https_subscription_origin "$new_port" "$nginx_was_active"
+    operation_status=$?
+    if [ "$operation_status" -ne 0 ]; then
+        if [ "$operation_status" -eq 2 ]; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            red "远程 HTTPS origin 状态未决，已保留订阅端口恢复证据。"
+            return 2
+        fi
+        rollback_subscription_port_transaction "$backup_file" "$config_file" "$old_port" \
+            "$nginx_was_active" "$origin_attempted" "${new_firewall_records[@]}"
+        operation_status=$?
+        if [ "$operation_status" -eq 1 ]; then
+            disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+        else
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+        fi
+        return "$operation_status"
+    fi
+
+    remove_owned_firewall_ports_if_unused "$inbounds_file" --nginx-config "$config_file" \
+        "${old_port}/tcp"
+    operation_status=$?
+    if [ "$operation_status" -ne 0 ]; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        red "新订阅端口已生效，但旧端口规则未能安全清理；已保留 Nginx 备份：${backup_file}"
+        return 2
+    fi
+    if ! durable_transaction_checkpoint committed; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! rm -f -- "$backup_file"; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        red "订阅端口已健康提交，但事务备份未能清理：${backup_file}"
+        return 3
+    fi
+    if ! disarm_durable_transaction cleanup; then
+        return 3
+    fi
+}
+
+change_subscription_port_transaction() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅端口修改"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _change_subscription_port_transaction_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+_rotate_subscription_token_locked() {
+    local port old_path token new_path host link confirm config_file config_status
+    local snapshot_dir pending_state nginx_was_active=0 operation_status rollback_status
+    local baseline_config_digest baseline_state_digest
+
+    FRONTEND_RECOVERY_PATH=''
     load_subscription_state
     if [ "$SUB_HTTPS_ENABLED" = 1 ]; then
-        configure_cf_https_subscription 1
+        _configure_cf_https_subscription_locked 1
         return $?
     fi
 
-    port=$(get_nginx_subscription_port 2>/dev/null || true)
-    old_path=$(get_nginx_subscription_paths 2>/dev/null | head -1)
+    config_file="${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"
+    validate_managed_subscription_runtime "$config_file" http
+    config_status=$?
+    case "$config_status" in
+        0) ;;
+        1) red "未找到有效的 HTTP 订阅，无法轮换密钥。"; return 1 ;;
+        *) red "现有 Nginx 配置不是脚本可确认拥有的完整订阅配置，已拒绝轮换。"; return 1 ;;
+    esac
+    port=$(get_nginx_subscription_port "$config_file" 2>/dev/null || true)
+    old_path=$(get_nginx_subscription_paths "$config_file" 2>/dev/null | head -1)
     [ -n "$port" ] && is_valid_http_subscription_path "$old_path" || {
         red "未找到有效的 HTTP 订阅，无法轮换密钥。"
         return 1
     }
+    baseline_config_digest=$(subscription_frontend_snapshot_file_digest "$config_file") || return 2
+    baseline_state_digest=$(subscription_frontend_snapshot_file_digest \
+        "$subscription_state_file") || return 2
     yellow "轮换后旧 HTTP 订阅 URL 将立即失效。"
     reading "确认继续？[y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return 1
     token=$(generate_subscription_token) || return 1
     new_path="/${token}"
-    apply_nginx_subscription_config "$port" "$new_path" "" || return 1
-
+    nginx_service_is_active && nginx_was_active=1
+    snapshot_dir=$(backup_subscription_frontend_snapshot "$config_file" \
+        "$subscription_state_file" "" "$conf_dir") || return 1
+    if ! verify_subscription_frontend_snapshot_baseline "$snapshot_dir" "$config_file" \
+        "$subscription_state_file" "" "$baseline_config_digest" \
+        "$baseline_state_digest" "" || \
+       ! validate_managed_subscription_runtime "$config_file" http; then
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        red "订阅配置在确认期间发生变化，已拒绝轮换。"
+        return 2
+    fi
     SUB_TOKEN="$token"
     SUB_HTTP_PATH="$new_path"
     SUB_HTTPS_ENABLED=0
@@ -4348,10 +7319,357 @@ rotate_subscription_token() {
     SUB_HTTPS_PATH=''
     SUB_TUNNEL_MODE=''
     SUB_HTTPS_VERIFIED_AT=''
-    save_subscription_state || return 1
+    pending_state=$(prepare_subscription_frontend_state_transaction \
+        "$subscription_state_file" "$snapshot_dir") || {
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        return 1
+    }
+    if ! arm_durable_transaction subscription-token "$conf_dir" "$snapshot_dir" \
+        FRONTEND_RECOVERY_PATH rollback_subscription_frontend_signal_transaction \
+        "$nginx_was_active" "$port" "$port" \
+        "$snapshot_dir" "$config_file" "$subscription_state_file" "" "$pending_state"; then
+        rm -f -- "$pending_state"
+        cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+            FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        return 1
+    fi
+
+    apply_nginx_subscription_config "$port" "$new_path" "" \
+        "$nginx_was_active" "$config_file"
+    operation_status=$?
+    if [ "$operation_status" -eq 0 ]; then
+        durable_transaction_checkpoint config-mutated || operation_status=2
+    fi
+    if [ "$operation_status" -eq 0 ]; then
+        durable_transaction_checkpoint publishing || operation_status=2
+    fi
+    if [ "$operation_status" -eq 0 ]; then
+        commit_subscription_frontend_state_transaction "$pending_state" \
+            "$subscription_state_file" || operation_status=1
+    fi
+    if [ "$operation_status" -ne 0 ]; then
+        rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+            "$subscription_state_file" "" "$pending_state"
+        rollback_status=$?
+        load_subscription_state
+        if [ "$rollback_status" -eq 0 ]; then
+            disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+            return 1
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! validate_managed_subscription_runtime "$config_file" http; then
+        rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+            "$subscription_state_file" "" ""
+        rollback_status=$?
+        load_subscription_state
+        if [ "$rollback_status" -eq 0 ]; then
+            disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+            return 1
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! durable_transaction_checkpoint committed; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! disarm_durable_transaction cleanup; then
+        return 3
+    fi
+    if ! cleanup_subscription_frontend_snapshot "$snapshot_dir"; then
+        FRONTEND_RECOVERY_PATH="$snapshot_dir"
+        return 3
+    fi
     host=$(get_subscription_host 2>/dev/null || true)
     link=$(build_http_subscription_url "$host" "$port" "$new_path" 2>/dev/null || true)
     green "订阅密钥已轮换，新 HTTP 订阅：${purple}${link}${re}"
+}
+
+rotate_subscription_token() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅密钥轮换"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _rotate_subscription_token_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+_stop_subscription_service_locked() {
+    local status
+
+    if command_exists nginx; then
+        if command_exists rc-service 2>/dev/null; then
+            if rc-service nginx status 2>/dev/null | grep -q "started"; then
+                rc-service nginx stop || return 1
+                if rc-service nginx status 2>/dev/null | grep -q "started"; then
+                    return 1
+                fi
+            else
+                red "nginx not running"
+            fi
+        else
+            systemctl is-active --quiet nginx
+            status=$?
+            case "$status" in
+                0)
+                    systemctl stop nginx || return 1
+                    systemctl is-active --quiet nginx && return 1
+                    ;;
+                3) red "nginx not running" ;;
+                *) return 1 ;;
+            esac
+        fi
+    else
+        yellow "nginx未安装，节点订阅本来就未运行。"
+    fi
+}
+
+stop_subscription_service_transaction() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅服务停止"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _stop_subscription_service_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+_start_subscription_service_locked() {
+    local config_file="${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"
+    local http_path link token server_ip sub_port input_port conflict_status config_status
+    local snapshot_dir pending_state nginx_was_active=0 operation_status=0 rollback_status=0
+    local baseline_config_digest baseline_state_digest current_config_digest current_state_digest
+    local -a new_firewall_records=()
+
+    baseline_config_digest=$(subscription_frontend_snapshot_file_digest "$config_file") || return 2
+    baseline_state_digest=$(subscription_frontend_snapshot_file_digest \
+        "$subscription_state_file") || return 2
+    classify_nginx_subscription_config "$config_file"
+    config_status=$?
+    case "$config_status" in
+        0)
+            validate_managed_subscription_runtime "$config_file" any || {
+                red "Nginx 订阅配置与订阅状态不一致，已拒绝启动。"
+                return 2
+            }
+            sub_port=$(get_nginx_subscription_port "$config_file") || return 2
+            http_path=$(get_nginx_subscription_paths "$config_file" | head -1)
+            is_valid_http_subscription_path "$http_path" || return 2
+            ;;
+        1)
+            if [ -e "$subscription_state_file" ] || [ -L "$subscription_state_file" ]; then
+                red "订阅状态文件存在但 Nginx 配置缺失；为避免覆盖残留状态，已拒绝自动重建。"
+                return 1
+            fi
+            ;;
+        *)
+            red "现有 Nginx 配置不是脚本可确认拥有的完整订阅配置，已拒绝覆盖。"
+            return 1
+            ;;
+    esac
+    current_config_digest=$(subscription_frontend_snapshot_file_digest "$config_file") || return 2
+    current_state_digest=$(subscription_frontend_snapshot_file_digest \
+        "$subscription_state_file") || return 2
+    if [ "$current_config_digest" != "$baseline_config_digest" ] || \
+       [ "$current_state_digest" != "$baseline_state_digest" ]; then
+        red "订阅配置在启动检查期间发生变化，已拒绝继续。"
+        return 2
+    fi
+
+    server_ip=$(get_subscription_host) || return 1
+    [ -n "$server_ip" ] || return 1
+
+    if [ "$config_status" -eq 0 ]; then
+        current_config_digest=$(subscription_frontend_snapshot_file_digest "$config_file") || return 2
+        current_state_digest=$(subscription_frontend_snapshot_file_digest \
+            "$subscription_state_file") || return 2
+        if [ "$current_config_digest" != "$baseline_config_digest" ] || \
+           [ "$current_state_digest" != "$baseline_state_digest" ] || \
+           ! validate_managed_subscription_runtime "$config_file" any; then
+            red "订阅配置在主机信息获取期间发生变化，已拒绝启动。"
+            return 2
+        fi
+        start_nginx || return 1
+        nginx_service_is_active || return 1
+    else
+        token=$(generate_subscription_token) || { red "订阅密钥生成失败"; return 1; }
+        http_path="/$token"
+        while :; do
+            reading "请输入订阅监听端口（NAT 机器请输入已分配端口，回车随机）: " input_port
+            if [ -z "$input_port" ]; then
+                input_port=$(shuf -i 2000-65000 -n 1) || return 1
+            fi
+            if ! validate_port_value "$input_port" subscription_port; then
+                red "端口必须是 1-65535 的整数"
+                continue
+            fi
+            if configured_inbound_port_conflict_exists "${conf_dir}/inbounds.json" "$input_port" tcp; then
+                red "端口 ${input_port}/tcp 已被 sing-box 配置占用。"
+                continue
+            else
+                conflict_status=$?
+            fi
+            [ "$conflict_status" -eq 1 ] || return 2
+            if port_is_listening "$input_port" tcp; then
+                red "端口 ${input_port}/tcp 已被其他进程监听。"
+                continue
+            fi
+            sub_port="$input_port"
+            break
+        done
+
+        SUBSCRIPTION_CREATE_RECOVERY_PATH=''
+        nginx_service_is_active && nginx_was_active=1
+        snapshot_dir=$(backup_subscription_frontend_snapshot "$config_file" \
+            "$subscription_state_file" "" "$conf_dir") || return 1
+        if ! verify_subscription_frontend_snapshot_baseline "$snapshot_dir" "$config_file" \
+            "$subscription_state_file" "" "$baseline_config_digest" \
+            "$baseline_state_digest" ""; then
+            cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+                SUBSCRIPTION_CREATE_RECOVERY_PATH="$snapshot_dir"
+            red "订阅配置在端口确认期间发生变化，已拒绝覆盖。"
+            return 2
+        fi
+        SUB_TOKEN="$token"
+        SUB_HTTP_PATH="$http_path"
+        SUB_HTTPS_ENABLED=0
+        SUB_HTTPS_DOMAIN=''
+        SUB_HTTPS_DOMAIN_MODE=''
+        SUB_HTTPS_PATH=''
+        SUB_TUNNEL_MODE=''
+        SUB_HTTPS_VERIFIED_AT=''
+        pending_state=$(prepare_subscription_frontend_state_transaction \
+            "$subscription_state_file" "$snapshot_dir") || {
+            cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+                SUBSCRIPTION_CREATE_RECOVERY_PATH="$snapshot_dir"
+            return 1
+        }
+        if ! arm_durable_transaction subscription-create "$conf_dir" "$snapshot_dir" \
+            SUBSCRIPTION_CREATE_RECOVERY_PATH rollback_subscription_frontend_signal_transaction \
+            "$nginx_was_active" "" "$sub_port" \
+            "$snapshot_dir" "$config_file" "$subscription_state_file" "" "$pending_state"; then
+            rm -f -- "$pending_state"
+            cleanup_subscription_frontend_snapshot "$snapshot_dir" || \
+                SUBSCRIPTION_CREATE_RECOVERY_PATH="$snapshot_dir"
+            return 1
+        fi
+        if ! durable_transaction_checkpoint firewall-mutating; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        fi
+
+        allow_port "${sub_port}/tcp"
+        operation_status=$?
+        if [ "$operation_status" -ne 0 ]; then
+            if [ "$operation_status" -eq 2 ]; then
+                disarm_durable_transaction keep >/dev/null 2>&1 || true
+                return 2
+            fi
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "" "$pending_state"
+            rollback_status=$?
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                return "$operation_status"
+            fi
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        fi
+        new_firewall_records=("${FIREWALL_LAST_ADDED_RECORDS[@]}")
+        if ! durable_transaction_set_owned_records "${new_firewall_records[@]}" || \
+           ! durable_transaction_checkpoint precommit; then
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "" "$pending_state"
+            rollback_status=$?
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                return 1
+            fi
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        fi
+        apply_nginx_subscription_config "$sub_port" "$http_path" "" start "$config_file" || \
+            operation_status=$?
+        if [ "$operation_status" -eq 0 ]; then
+            durable_transaction_checkpoint config-mutated || operation_status=2
+        fi
+        if [ "$operation_status" -eq 0 ]; then
+            commit_subscription_frontend_state_transaction "$pending_state" \
+                "$subscription_state_file" || operation_status=1
+        fi
+        if [ "$operation_status" -eq 0 ]; then
+            link=$(build_http_subscription_url "$server_ip" "$sub_port" "$http_path") || \
+                operation_status=$?
+        fi
+        if [ "$operation_status" -eq 0 ]; then
+            nginx_service_is_active || operation_status=1
+        fi
+        if [ "$operation_status" -eq 0 ]; then
+            validate_managed_subscription_runtime "$config_file" http || operation_status=2
+        fi
+        if [ "$operation_status" -ne 0 ]; then
+            rollback_subscription_frontend_signal_transaction "$snapshot_dir" "$config_file" \
+                "$subscription_state_file" "" "$pending_state"
+            rollback_status=$?
+            load_subscription_state
+            if [ "$rollback_status" -eq 0 ]; then
+                disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+                return 1
+            fi
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        fi
+        if ! durable_transaction_checkpoint committed; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        fi
+        if ! disarm_durable_transaction cleanup; then
+            return 3
+        fi
+        if ! cleanup_subscription_frontend_snapshot "$snapshot_dir"; then
+            SUBSCRIPTION_CREATE_RECOVERY_PATH="$snapshot_dir"
+            return 3
+        fi
+    fi
+
+    [ -n "${link:-}" ] || link=$(build_http_subscription_url "$server_ip" "$sub_port" "$http_path") || return 1
+    green "\n已开启节点订阅\n节点订阅链接：${purple}${link}${re}\n"
+}
+
+start_subscription_service_transaction() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅服务启动"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _start_subscription_service_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+_restart_subscription_service_locked() {
+    restart_nginx
+}
+
+restart_subscription_service_transaction() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅服务重启"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _restart_subscription_service_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
 }
 
 disable_open_sub() {
@@ -4385,42 +7703,11 @@ disable_open_sub() {
     reading "请输入选择: " choice
     case "${choice}" in
         1)
-            if command_exists nginx; then
-                if command_exists rc-service 2>/dev/null; then
-                    rc-service nginx status | grep -q "started" && rc-service nginx stop || red "nginx not running"
-                else
-                    [ "$(systemctl is-active nginx)" = "active" ] && systemctl stop nginx || red "nginx not running"
-                fi
-            else
-                yellow "nginx未安装，节点订阅本来就未运行。"
-            fi
+            stop_subscription_service_transaction || return $?
             green "\n已关闭节点订阅；HTTP 与 Cloudflare HTTPS 订阅都会停止响应。\n"
             ;;
         2)
-            local config_file="/etc/nginx/conf.d/sing-box.conf"
-            local http_path link token
-            server_ip=$(get_subscription_host)
-            sub_port=$(get_nginx_subscription_port "$config_file" 2>/dev/null || true)
-            http_path=$(get_nginx_subscription_paths "$config_file" 2>/dev/null | head -1)
-
-            if [ -n "$sub_port" ] && [ -n "$http_path" ]; then
-                start_nginx
-            else
-                token=$(generate_subscription_token) || { red "订阅密钥生成失败"; return 1; }
-                http_path="/$token"
-                sub_port=$(shuf -i 2000-65000 -n 1)
-                apply_nginx_subscription_config "$sub_port" "$http_path" "" || {
-                    red "节点订阅开启失败，原配置未改变"
-                    return 1
-                }
-                load_subscription_state
-                SUB_TOKEN="$token"
-                SUB_HTTP_PATH="$http_path"
-                save_subscription_state || true
-            fi
-
-            link=$(build_http_subscription_url "$server_ip" "$sub_port" "$http_path" 2>/dev/null || true)
-            green "\n已开启节点订阅\n节点订阅链接：${purple}${link}${re}\n"
+            start_subscription_service_transaction || return $?
             ;;
         3)
             reading "请输入新的订阅端口(1-65535,直接回车随机生成):" sub_port
@@ -4438,34 +7725,30 @@ disable_open_sub() {
                 done
             done
             green "新的订阅端口为：${purple}${sub_port}${re}"
-            local -a current_paths
-            mapfile -t current_paths < <(get_nginx_subscription_paths "/etc/nginx/conf.d/sing-box.conf")
-            [ "${#current_paths[@]}" -gt 0 ] || { red "未找到有效的 Nginx 订阅路径"; return 1; }
-            local current_http_path="${current_paths[0]}"
-            local current_https_path=""
-            [ "${#current_paths[@]}" -gt 1 ] && current_https_path="${current_paths[1]}"
-            server_ip=$(get_subscription_host)
-            allow_port $sub_port/tcp > /dev/null 2>&1
-            if apply_nginx_subscription_config "$sub_port" "$current_http_path" "$current_https_path"; then
-                if ! update_cf_https_subscription_origin "$sub_port"; then
-                    [ -r "/etc/nginx/conf.d/sing-box.conf.bak.sb" ] && \
-                        cp -p "/etc/nginx/conf.d/sing-box.conf.bak.sb" "/etc/nginx/conf.d/sing-box.conf"
-                    nginx -t > /dev/null 2>&1 && { nginx -s reload > /dev/null 2>&1 || restart_nginx > /dev/null 2>&1; }
-                    red "Tunnel origin 更新失败，订阅端口已恢复。"
-                    return 1
-                fi
-                link=$(build_http_subscription_url "$server_ip" "$sub_port" "$current_http_path" 2>/dev/null || true)
+            if change_subscription_port_transaction "/etc/nginx/conf.d/sing-box.conf" \
+                "$sub_port"; then
+                local -a final_paths
+                mapfile -t final_paths < <(get_nginx_subscription_paths "/etc/nginx/conf.d/sing-box.conf")
+                [ "${#final_paths[@]}" -gt 0 ] || {
+                    red "端口已修改，但无法读取最终订阅路径，请检查 Nginx 配置。"
+                    return 2
+                }
+                server_ip=$(get_subscription_host) || return 2
+                [ -n "$server_ip" ] || return 2
+                link=$(build_http_subscription_url "$server_ip" "$sub_port" "${final_paths[0]}" 2>/dev/null || true)
                 green "\n订阅端口更换成功\n新的订阅链接为：${purple}${link}${re}\n"
             else
-                red "nginx配置测试失败，已恢复原配置"
-                return 1
+                local port_change_status=$?
+                [ "$port_change_status" -eq 2 ] && \
+                    red "订阅端口事务未能完整收尾，请按上方备份路径人工检查。"
+                return "$port_change_status"
             fi
             ;;
-        4) restart_nginx ;;
+        4) restart_subscription_service_transaction || return $? ;;
         5) show_subscription_status ;;
-        6) configure_cf_https_subscription ;;
-        7) disable_cf_https_subscription ;;
-        8) rotate_subscription_token ;;
+        6) configure_cf_https_subscription || return $? ;;
+        7) disable_cf_https_subscription || return $? ;;
+        8) rotate_subscription_token || return $? ;;
         0) menu ;;
         *) red "无效的选项！" ;;
     esac
@@ -4588,7 +7871,9 @@ EOF
             fi
             if [ "$ARGO_FIXED_READY" = 1 ] && [ -t 0 ]; then
                 reading "是否同时配置 Cloudflare HTTPS 订阅？[y/N]: " enable_https_subscription
-                [[ "$enable_https_subscription" =~ ^[Yy]$ ]] && configure_cf_https_subscription
+                if [[ "$enable_https_subscription" =~ ^[Yy]$ ]]; then
+                    configure_cf_https_subscription || return $?
+                fi
             fi
             ;;
         5)
@@ -5675,10 +8960,167 @@ atomic_replace_config_file() {
     mv -f -- "$staged_file" "$target_file"
 }
 
+proxy_transaction_reaper_hook() {
+    :
+}
+
+reap_stale_proxy_transaction_lock() {
+    local lock_path="${1:-}"
+    local reaper_path owner='' status=1 guard_acquired=0 guard_stale=0
+    local stale_seconds="${PROXY_TX_REAPER_STALE_SECONDS:-5}"
+    local main_stale_seconds="${PROXY_TX_LOCK_STALE_SECONDS:-5}"
+    local now='' reaper_mtime='' lock_mtime='' tombstone_path='' entry=''
+    local main_stale=0
+    local attempt=0
+
+    [ -d "$lock_path" ] && [ ! -L "$lock_path" ] || return 1
+    [[ "$stale_seconds" =~ ^[1-9][0-9]*$ ]] || return 2
+    [[ "$main_stale_seconds" =~ ^[1-9][0-9]*$ ]] || return 2
+    reaper_path="${lock_path}.reaper"
+
+    while [ "$attempt" -lt 4 ]; do
+        attempt=$((attempt + 1))
+        if (umask 077 && mkdir -- "$reaper_path" 2>/dev/null); then
+            if ! chmod 700 "$reaper_path"; then
+                rmdir -- "$reaper_path" 2>/dev/null || return 2
+                return 2
+            fi
+            proxy_transaction_reaper_hook guard-created
+            if ! printf '%s\n' "$BASHPID" > "$reaper_path/owner" ||
+               ! chmod 600 "$reaper_path/owner"; then
+                rm -f -- "$reaper_path/owner" 2>/dev/null || true
+                rmdir -- "$reaper_path" 2>/dev/null || return 2
+                return 2
+            fi
+            guard_acquired=1
+            proxy_transaction_reaper_hook acquired
+            break
+        fi
+
+        # A competing reaper may have removed its guard between mkdir(2) and
+        # this inspection.  Retry that harmless race, but fail closed for a
+        # non-directory or symlink at the guard path.
+        if [ ! -e "$reaper_path" ] && [ ! -L "$reaper_path" ]; then
+            continue
+        fi
+        [ -d "$reaper_path" ] && [ ! -L "$reaper_path" ] || return 2
+
+        guard_stale=0
+        owner=''
+        if [ -e "$reaper_path/owner" ] || [ -L "$reaper_path/owner" ]; then
+            [ -f "$reaper_path/owner" ] && [ ! -L "$reaper_path/owner" ] &&
+                [ -r "$reaper_path/owner" ] || return 2
+            owner=$(cat "$reaper_path/owner" 2>/dev/null || true)
+            if [[ "$owner" =~ ^[1-9][0-9]*$ ]]; then
+                kill -0 "$owner" 2>/dev/null && return 1
+                guard_stale=1
+            fi
+        fi
+
+        # Missing or partially written owner metadata is an initialization
+        # window, not proof of a dead owner.  Reclaim it only after a short
+        # grace period so a slow creator cannot have its live guard stolen.
+        if [ "$guard_stale" -eq 0 ]; then
+            now=$(date +%s 2>/dev/null) || return 2
+            reaper_mtime=$(stat -c '%Y' -- "$reaper_path" 2>/dev/null) || return 2
+            [[ "$now" =~ ^[0-9]+$ && "$reaper_mtime" =~ ^[0-9]+$ ]] || return 2
+            [ "$now" -ge "$reaper_mtime" ] || return 1
+            [ "$((now - reaper_mtime))" -ge "$stale_seconds" ] || return 1
+            guard_stale=1
+        fi
+
+        # The guard owns only one metadata file.  Unknown contents indicate
+        # damage or interference and must never be recursively deleted.
+        for entry in "$reaper_path"/* "$reaper_path"/.[!.]* "$reaper_path"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            [ "$entry" = "$reaper_path/owner" ] || return 2
+        done
+
+        # Rename is the ownership hand-off: only the process that atomically
+        # moves the stale guard may clean it.  A fresh guard created at the
+        # original path can therefore never be removed by an older reaper.
+        tombstone_path="${reaper_path}.stale.${BASHPID}.${RANDOM}.${attempt}"
+        [ ! -e "$tombstone_path" ] && [ ! -L "$tombstone_path" ] || return 2
+        if mv -- "$reaper_path" "$tombstone_path" 2>/dev/null; then
+            rm -f -- "$tombstone_path/owner" 2>/dev/null || return 2
+            rmdir -- "$tombstone_path" 2>/dev/null || return 2
+            continue
+        fi
+    done
+    [ "$guard_acquired" -eq 1 ] || return 1
+
+    # Re-read only after winning the independent guard.  Another reaper may
+    # have removed the stale lock and a new live owner may already have
+    # acquired the main path while we were waiting.
+    main_stale=0
+    owner=''
+    if [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+        status=0
+    elif [ ! -d "$lock_path" ] || [ -L "$lock_path" ]; then
+        status=2
+    else
+        if [ -e "$lock_path/owner" ] || [ -L "$lock_path/owner" ]; then
+            if [ ! -f "$lock_path/owner" ] || [ -L "$lock_path/owner" ] ||
+               [ ! -r "$lock_path/owner" ]; then
+                status=2
+            else
+                owner=$(cat "$lock_path/owner" 2>/dev/null || true)
+                if [[ "$owner" =~ ^[1-9][0-9]*$ ]]; then
+                    if kill -0 "$owner" 2>/dev/null; then
+                        main_stale=-1
+                    else
+                        main_stale=1
+                    fi
+                fi
+            fi
+        fi
+
+        # As with the reaper guard, a missing or partially written main owner
+        # is initially treated as live initialization.  It becomes reapable
+        # only after the bounded grace period.
+        if [ "$status" -ne 2 ] && [ "$main_stale" -eq 0 ]; then
+            now=$(date +%s 2>/dev/null) || status=2
+            if [ "$status" -ne 2 ]; then
+                lock_mtime=$(stat -c '%Y' -- "$lock_path" 2>/dev/null) || status=2
+            fi
+            if [ "$status" -ne 2 ]; then
+                if ! [[ "$now" =~ ^[0-9]+$ && "$lock_mtime" =~ ^[0-9]+$ ]]; then
+                    status=2
+                elif [ "$now" -ge "$lock_mtime" ] &&
+                     [ "$((now - lock_mtime))" -ge "$main_stale_seconds" ]; then
+                    main_stale=1
+                fi
+            fi
+        fi
+
+        if [ "$status" -ne 2 ] && [ "$main_stale" -eq 1 ]; then
+            for entry in "$lock_path"/* "$lock_path"/.[!.]* "$lock_path"/..?*; do
+                [ -e "$entry" ] || [ -L "$entry" ] || continue
+                if [ "$entry" != "$lock_path/owner" ]; then
+                    status=2
+                    break
+                fi
+            done
+            if [ "$status" -ne 2 ]; then
+                if rm -f -- "$lock_path/owner" && rmdir -- "$lock_path"; then
+                    status=0
+                    proxy_transaction_reaper_hook after-delete
+                else
+                    status=2
+                fi
+            fi
+        fi
+    fi
+    if ! rm -f -- "$reaper_path/owner" || ! rmdir -- "$reaper_path"; then
+        return 2
+    fi
+    return "$status"
+}
+
 acquire_proxy_transaction_lock() {
     local transaction_conf_dir="${1:-}"
     local timeout_seconds="${PROXY_TX_LOCK_TIMEOUT_SECONDS:-30}"
-    local lock_owner='' started_at
+    local lock_owner='' started_at reaper_status=0
 
     [ -d "$transaction_conf_dir" ] && [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
     PROXY_TX_LOCK_KIND=''
@@ -5699,6 +9141,14 @@ acquire_proxy_transaction_lock() {
             return 1
         fi
         PROXY_TX_LOCK_KIND='flock'
+        if declare -F assert_no_pending_durable_transaction >/dev/null 2>&1; then
+            assert_no_pending_durable_transaction "$transaction_conf_dir"
+            lock_owner=$?
+            if [ "$lock_owner" -ne 0 ]; then
+                release_proxy_transaction_lock
+                return "$lock_owner"
+            fi
+        fi
         return 0
     fi
 
@@ -5710,6 +9160,9 @@ acquire_proxy_transaction_lock() {
                 rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
                 return 1
             }
+            if declare -F proxy_transaction_reaper_hook >/dev/null 2>&1; then
+                proxy_transaction_reaper_hook main-lock-created
+            fi
             printf '%s\n' "$BASHPID" > "$PROXY_TX_LOCK_PATH/owner" || {
                 rm -f -- "$PROXY_TX_LOCK_PATH/owner"
                 rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
@@ -5721,21 +9174,53 @@ acquire_proxy_transaction_lock() {
                 return 1
             }
             PROXY_TX_LOCK_KIND='mkdir'
+            if declare -F assert_no_pending_durable_transaction >/dev/null 2>&1; then
+                assert_no_pending_durable_transaction "$transaction_conf_dir"
+                lock_owner=$?
+                if [ "$lock_owner" -ne 0 ]; then
+                    release_proxy_transaction_lock
+                    return "$lock_owner"
+                fi
+            fi
             return 0
         fi
 
-        if [ -d "$PROXY_TX_LOCK_PATH" ] && [ ! -L "$PROXY_TX_LOCK_PATH" ] && \
-           [ -r "$PROXY_TX_LOCK_PATH/owner" ]; then
-            lock_owner=$(cat "$PROXY_TX_LOCK_PATH/owner" 2>/dev/null || true)
-            if [[ "$lock_owner" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
-                rm -f -- "$PROXY_TX_LOCK_PATH/owner" 2>/dev/null || true
-                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
-                continue
-            fi
-        fi
+        reaper_status=0
+        reap_stale_proxy_transaction_lock "$PROXY_TX_LOCK_PATH" || reaper_status=$?
+        case "$reaper_status" in
+            0) continue ;;
+            1) ;;
+            *) return 2 ;;
+        esac
         [ "$((SECONDS - started_at))" -lt "$timeout_seconds" ] || return 1
         sleep 0.1
     done
+}
+
+acquire_proxy_transaction_lock_checked() {
+    local transaction_conf_dir="${1:-}"
+    local operation_name="${2:-配置事务}"
+    local lock_status
+
+    acquire_proxy_transaction_lock "$transaction_conf_dir"
+    lock_status=$?
+    case "$lock_status" in
+        0)
+            return 0
+            ;;
+        1)
+            red "另一个配置事务仍在运行，${operation_name}已安全中止。"
+            return 1
+            ;;
+        2)
+            red "检测到未决或损坏的事务恢复材料，${operation_name}已停止；请先按上方路径完成恢复。"
+            return 2
+            ;;
+        *)
+            red "无法安全确认配置事务锁状态，${operation_name}已停止。"
+            return 2
+            ;;
+    esac
 }
 
 release_proxy_transaction_lock() {
@@ -5754,6 +9239,297 @@ release_proxy_transaction_lock() {
     PROXY_TX_LOCK_KIND=''
     PROXY_TX_LOCK_PATH=''
     PROXY_TX_LOCK_FD=''
+}
+
+# Durable evidence for public-port, subscription and extra-protocol
+# transactions.  The common config lock must already be held when this is
+# armed.  Callers only mark a stage rollback-safe after the firewall helper
+# has returned, so a signal can never re-enter the firewall lock.
+durable_transaction_hook() {
+    :
+}
+
+assert_no_pending_durable_transaction() {
+    local registry_dir="${1:-}"
+    local registry_file pending_path extra_line
+
+    [ -d "$registry_dir" ] && [ ! -L "$registry_dir" ] || return 2
+    registry_file="${registry_dir}/.durable-transaction.pending"
+    DURABLE_TX_PENDING_PATH=''
+    [ -e "$registry_file" ] || [ -L "$registry_file" ] || return 0
+    DURABLE_TX_PENDING_PATH="$registry_file"
+    [ -f "$registry_file" ] && [ ! -L "$registry_file" ] && [ -r "$registry_file" ] || {
+        red "发现不可信的未决事务登记文件，已拒绝新的配置事务：${registry_file}"
+        return 2
+    }
+    IFS= read -r pending_path < "$registry_file" || pending_path=''
+    IFS= read -r extra_line < <(sed -n '2p' "$registry_file") || extra_line=''
+    if [ -z "$pending_path" ] || [ -n "$extra_line" ] || \
+       [ ! -d "$pending_path" ] || [ -L "$pending_path" ] || \
+       [ ! -f "$pending_path/manifest" ] || [ -L "$pending_path/manifest" ] || \
+       [ ! -r "$pending_path/manifest" ]; then
+        red "未决事务登记已损坏，已拒绝新的配置事务：${registry_file}"
+        return 2
+    fi
+    DURABLE_TX_PENDING_PATH="$pending_path"
+    red "发现上次未完成的配置事务，恢复前不会继续修改：${pending_path}"
+    return 2
+}
+
+write_durable_transaction_registry() {
+    local registry_dir="${1:-}"
+    local recovery_dir="${2:-}"
+    local registry_file tmp_registry
+
+    [ -d "$registry_dir" ] && [ ! -L "$registry_dir" ] || return 1
+    [ -d "$recovery_dir" ] && [ ! -L "$recovery_dir" ] || return 1
+    [[ "$recovery_dir" != *$'\n'* && "$recovery_dir" != *$'\r'* ]] || return 1
+    registry_file="${registry_dir}/.durable-transaction.pending"
+    [ ! -e "$registry_file" ] && [ ! -L "$registry_file" ] || return 1
+    tmp_registry=$(mktemp "${registry_dir}/.durable-pending.XXXXXX") || return 1
+    if ! printf '%s\n' "$recovery_dir" > "$tmp_registry" || \
+       ! chmod 600 "$tmp_registry" || \
+       ! ln -- "$tmp_registry" "$registry_file"; then
+        rm -f -- "$tmp_registry"
+        return 1
+    fi
+    rm -f -- "$tmp_registry" || {
+        rm -f -- "$registry_file"
+        return 1
+    }
+    DURABLE_TX_REGISTRY="$registry_file"
+}
+
+cleanup_durable_transaction_registry() {
+    local registry_file="${DURABLE_TX_REGISTRY:-}"
+    local recovery_dir="${DURABLE_TX_RECOVERY_DIR:-}"
+    local registered_path
+
+    [ -n "$registry_file" ] && [ -f "$registry_file" ] && [ ! -L "$registry_file" ] || return 1
+    IFS= read -r registered_path < "$registry_file" || return 1
+    [ "$registered_path" = "$recovery_dir" ] || return 1
+    rm -f -- "$registry_file"
+}
+
+reset_durable_transaction_state() {
+    DURABLE_TX_ACTIVE=0
+    DURABLE_TX_HANDLING=0
+    DURABLE_TX_KIND=''
+    DURABLE_TX_STAGE=''
+    DURABLE_TX_RECOVERY_DIR=''
+    DURABLE_TX_MANIFEST=''
+    DURABLE_TX_REGISTRY=''
+    DURABLE_TX_BACKUP_PATH=''
+    DURABLE_TX_RECOVERY_VAR=''
+    DURABLE_TX_ROLLBACK_CALLBACK=''
+    DURABLE_TX_SERVICE_WAS_ACTIVE=''
+    DURABLE_TX_OLD_PORT=''
+    DURABLE_TX_NEW_PORT=''
+    DURABLE_TX_PREVIOUS_HUP_TRAP=''
+    DURABLE_TX_PREVIOUS_INT_TRAP=''
+    DURABLE_TX_PREVIOUS_TERM_TRAP=''
+    DURABLE_TX_PREVIOUS_EXIT_TRAP=''
+    DURABLE_TX_ROLLBACK_ARGS=()
+    DURABLE_TX_OWNED_RECORDS=()
+}
+
+write_durable_transaction_manifest() {
+    local tmp_manifest record value
+
+    [ "${DURABLE_TX_ACTIVE:-0}" -eq 1 ] && \
+        [ -d "${DURABLE_TX_RECOVERY_DIR:-}" ] && \
+        [ ! -L "${DURABLE_TX_RECOVERY_DIR:-}" ] || return 1
+    for value in \
+        "${DURABLE_TX_KIND:-}" "${DURABLE_TX_STAGE:-}" \
+        "${DURABLE_TX_BACKUP_PATH:-}" "${DURABLE_TX_SERVICE_WAS_ACTIVE:-}" \
+        "${DURABLE_TX_OLD_PORT:-}" "${DURABLE_TX_NEW_PORT:-}"; do
+        [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+    done
+    tmp_manifest=$(mktemp "${DURABLE_TX_RECOVERY_DIR}/.manifest.XXXXXX") || return 1
+    if ! {
+        printf 'kind=%s\n' "$DURABLE_TX_KIND"
+        printf 'stage=%s\n' "$DURABLE_TX_STAGE"
+        printf 'backup_path=%s\n' "$DURABLE_TX_BACKUP_PATH"
+        printf 'service_was_active=%s\n' "$DURABLE_TX_SERVICE_WAS_ACTIVE"
+        printf 'old_port=%s\n' "$DURABLE_TX_OLD_PORT"
+        printf 'new_port=%s\n' "$DURABLE_TX_NEW_PORT"
+        for record in "${DURABLE_TX_OWNED_RECORDS[@]}"; do
+            [[ "$record" != *$'\n'* && "$record" != *$'\r'* ]] || return 1
+            printf 'owned_record=%s\n' "$record"
+        done
+    } > "$tmp_manifest"; then
+        rm -f -- "$tmp_manifest"
+        return 1
+    fi
+    chmod 600 "$tmp_manifest" || { rm -f -- "$tmp_manifest"; return 1; }
+    mv -f -- "$tmp_manifest" "$DURABLE_TX_MANIFEST"
+}
+
+restore_durable_transaction_traps() {
+    trap - HUP INT TERM EXIT
+    [ -z "${DURABLE_TX_PREVIOUS_HUP_TRAP:-}" ] || eval "$DURABLE_TX_PREVIOUS_HUP_TRAP"
+    [ -z "${DURABLE_TX_PREVIOUS_INT_TRAP:-}" ] || eval "$DURABLE_TX_PREVIOUS_INT_TRAP"
+    [ -z "${DURABLE_TX_PREVIOUS_TERM_TRAP:-}" ] || eval "$DURABLE_TX_PREVIOUS_TERM_TRAP"
+    [ -z "${DURABLE_TX_PREVIOUS_EXIT_TRAP:-}" ] || eval "$DURABLE_TX_PREVIOUS_EXIT_TRAP"
+}
+
+arm_durable_transaction() {
+    local kind="${1:-}"
+    local evidence_parent="${2:-}"
+    local backup_path="${3:-}"
+    local recovery_var="${4:-}"
+    local rollback_callback="${5:-}"
+    local service_was_active="${6:-}"
+    local old_port="${7:-}"
+    local new_port="${8:-}"
+    shift 8 || return 1
+
+    [ "${DURABLE_TX_ACTIVE:-0}" -eq 0 ] || return 1
+    [ -n "$kind" ] && [[ "$kind" != *$'\n'* && "$kind" != *$'\r'* ]] || return 1
+    [ -d "$evidence_parent" ] && [ ! -L "$evidence_parent" ] || return 1
+    [ -n "$backup_path" ] && [[ "$backup_path" != *$'\n'* && "$backup_path" != *$'\r'* ]] || return 1
+    [[ "$recovery_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    declare -F "$rollback_callback" >/dev/null 2>&1 || return 1
+    case "$service_was_active" in 0|1) ;; *) return 1 ;; esac
+
+    DURABLE_TX_RECOVERY_DIR=$(mktemp -d "${evidence_parent}/.durable-transaction.XXXXXX") || return 1
+    chmod 700 "$DURABLE_TX_RECOVERY_DIR" || {
+        rm -rf -- "$DURABLE_TX_RECOVERY_DIR"
+        DURABLE_TX_RECOVERY_DIR=''
+        return 1
+    }
+    DURABLE_TX_MANIFEST="${DURABLE_TX_RECOVERY_DIR}/manifest"
+    DURABLE_TX_REGISTRY=''
+    DURABLE_TX_ACTIVE=1
+    DURABLE_TX_HANDLING=0
+    DURABLE_TX_KIND="$kind"
+    DURABLE_TX_STAGE='precommit'
+    DURABLE_TX_BACKUP_PATH="$backup_path"
+    DURABLE_TX_RECOVERY_VAR="$recovery_var"
+    DURABLE_TX_ROLLBACK_CALLBACK="$rollback_callback"
+    DURABLE_TX_SERVICE_WAS_ACTIVE="$service_was_active"
+    DURABLE_TX_OLD_PORT="$old_port"
+    DURABLE_TX_NEW_PORT="$new_port"
+    DURABLE_TX_ROLLBACK_ARGS=("$@")
+    DURABLE_TX_OWNED_RECORDS=()
+    if ! write_durable_transaction_registry \
+        "${DURABLE_TX_REGISTRY_DIR:-${conf_dir:-$evidence_parent}}" \
+        "$DURABLE_TX_RECOVERY_DIR" || \
+       ! write_durable_transaction_manifest; then
+        [ -z "${DURABLE_TX_REGISTRY:-}" ] || rm -f -- "$DURABLE_TX_REGISTRY"
+        rm -rf -- "$DURABLE_TX_RECOVERY_DIR"
+        reset_durable_transaction_state
+        return 1
+    fi
+
+    DURABLE_TX_PREVIOUS_HUP_TRAP=$(trap -p HUP || true)
+    DURABLE_TX_PREVIOUS_INT_TRAP=$(trap -p INT || true)
+    DURABLE_TX_PREVIOUS_TERM_TRAP=$(trap -p TERM || true)
+    DURABLE_TX_PREVIOUS_EXIT_TRAP=$(trap -p EXIT || true)
+    trap 'durable_transaction_trap_handler HUP 129' HUP
+    trap 'durable_transaction_trap_handler INT 130' INT
+    trap 'durable_transaction_trap_handler TERM 143' TERM
+    trap 'durable_transaction_trap_handler EXIT $?' EXIT
+}
+
+durable_transaction_checkpoint() {
+    local stage="${1:-}"
+
+    [ "${DURABLE_TX_ACTIVE:-0}" -eq 1 ] || return 1
+    case "$stage" in
+        precommit|firewall-mutating|config-mutated|publishing|committed|unknown) ;;
+        *) return 1 ;;
+    esac
+    DURABLE_TX_STAGE="$stage"
+    write_durable_transaction_manifest || return 1
+    durable_transaction_hook "$stage"
+}
+
+durable_transaction_set_owned_records() {
+    [ "${DURABLE_TX_ACTIVE:-0}" -eq 1 ] || return 1
+    DURABLE_TX_OWNED_RECORDS=("$@")
+    write_durable_transaction_manifest
+}
+
+disarm_durable_transaction() {
+    local disposition="${1:-cleanup}"
+    local recovery_dir="${DURABLE_TX_RECOVERY_DIR:-}"
+    local recovery_var="${DURABLE_TX_RECOVERY_VAR:-}"
+    local cleanup_status=0
+
+    [ "${DURABLE_TX_ACTIVE:-0}" -eq 1 ] || return 0
+    trap - HUP INT TERM EXIT
+    restore_durable_transaction_traps
+    case "$disposition" in
+        cleanup)
+            if ! cleanup_durable_transaction_registry; then
+                printf -v "$recovery_var" '%s' "$recovery_dir"
+                cleanup_status=1
+            elif [ -n "$recovery_dir" ] && ! rm -rf -- "$recovery_dir"; then
+                printf -v "$recovery_var" '%s' "$recovery_dir"
+                cleanup_status=1
+            fi
+            ;;
+        keep)
+            printf -v "$recovery_var" '%s' "$recovery_dir"
+            ;;
+        *) cleanup_status=1 ;;
+    esac
+    reset_durable_transaction_state
+    return "$cleanup_status"
+}
+
+durable_transaction_trap_handler() {
+    local event="${1:-EXIT}"
+    local original_status="${2:-1}"
+    local final_status="$original_status"
+    local preserve=0 rollback_status=0 recovery_dir recovery_var
+    local rollback_callback
+    local -a rollback_args=()
+
+    trap - HUP INT TERM EXIT
+    [ "${DURABLE_TX_ACTIVE:-0}" -eq 1 ] || exit "$original_status"
+    [ "${DURABLE_TX_HANDLING:-0}" -eq 0 ] || exit 2
+    DURABLE_TX_HANDLING=1
+    recovery_dir="$DURABLE_TX_RECOVERY_DIR"
+    recovery_var="$DURABLE_TX_RECOVERY_VAR"
+    rollback_callback="$DURABLE_TX_ROLLBACK_CALLBACK"
+    rollback_args=("${DURABLE_TX_ROLLBACK_ARGS[@]}")
+
+    case "${DURABLE_TX_STAGE:-unknown}" in
+        precommit|config-mutated)
+            "$rollback_callback" "${rollback_args[@]}" || rollback_status=1
+            if [ "$rollback_status" -eq 0 ]; then
+                if ! cleanup_durable_transaction_registry || ! rm -rf -- "$recovery_dir"; then
+                    preserve=1
+                    final_status=2
+                fi
+            else
+                preserve=1
+                final_status=2
+            fi
+            ;;
+        committed)
+            preserve=1
+            final_status=3
+            ;;
+        firewall-mutating|publishing|unknown|*)
+            preserve=1
+            final_status=2
+            ;;
+    esac
+    if [ "$preserve" -eq 1 ]; then
+        printf -v "$recovery_var" '%s' "$recovery_dir"
+        write_durable_transaction_manifest >/dev/null 2>&1 || true
+        red "事务被 ${event} 中断，已保留恢复证据：${recovery_dir}"
+    fi
+    if declare -F stop_warp_candidate_proxy >/dev/null 2>&1; then
+        stop_warp_candidate_proxy >/dev/null 2>&1 || true
+    fi
+    release_proxy_transaction_lock
+    restore_durable_transaction_traps
+    reset_durable_transaction_state
+    exit "$final_status"
 }
 
 proxy_transaction_hook() {
@@ -5912,10 +9688,9 @@ apply_proxy_config_transaction() {
 
     transaction_conf_dir=$(dirname "$current_route_file") || return 1
     [ "$(dirname "$current_outbound_file")" = "$transaction_conf_dir" ] || return 1
-    acquire_proxy_transaction_lock "$transaction_conf_dir" || {
-        red "另一个代理配置事务仍在运行，本次操作已中止。"
-        return 1
-    }
+    acquire_proxy_transaction_lock_checked "$transaction_conf_dir" "代理配置事务"
+    transaction_status=$?
+    [ "$transaction_status" -eq 0 ] || return "$transaction_status"
     reset_proxy_transaction_state
     PROXY_TX_CURRENT_ROUTE_FILE="$current_route_file"
     PROXY_TX_CURRENT_OUTBOUND_FILE="$current_outbound_file"
@@ -6615,11 +10390,91 @@ proto_exists() {
     jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "${conf_dir}/inbounds.json" > /dev/null 2>&1
 }
 
+# Transaction-safe tag lookup.  Return 0 when the base tag (or its generated
+# IPv6 twin) exists, 1 when neither exists, and 2 when the configuration cannot
+# be trusted.  Callers which mutate inbounds must run this after acquiring the
+# shared configuration lock.
+extra_protocol_tag_exists() {
+    local inbounds_file="${1:-}"
+    local tag="${2:-}"
+    local status
+
+    [ -n "$tag" ] || return 2
+    [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] && [ -r "$inbounds_file" ] || return 2
+    jq -e '
+        (type == "object") and
+        (.inbounds | type == "array") and
+        all(.inbounds[]; type == "object" and ((.tag // "") | type == "string"))
+    ' "$inbounds_file" >/dev/null 2>&1 || return 2
+    jq -e --arg tag "$tag" '
+        any(.inbounds[]; .tag == $tag or .tag == ($tag + "-ipv6"))
+    ' "$inbounds_file" >/dev/null 2>&1
+    status=$?
+    case "$status" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Read the authoritative listen port for a base tag and its optional IPv6
+# twin.  The pair must use one valid port; otherwise fail closed with rc 2.
+# A missing pair is a normal rc 1.
+get_extra_protocol_uniform_port() {
+    local inbounds_file="${1:-}"
+    local tag="${2:-}"
+    local result
+
+    [ -n "$tag" ] || return 2
+    [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] && [ -r "$inbounds_file" ] || return 2
+    result=$(jq -er --arg tag "$tag" '
+        if (type != "object") or (.inbounds | type != "array") then
+            "__INVALID__"
+        else
+            [.inbounds[] | select(.tag == $tag or .tag == ($tag + "-ipv6"))] as $matches |
+            if ($matches | length) == 0 then
+                "__ABSENT__"
+            elif (($matches | map(.tag) | unique | length) != ($matches | length)) then
+                "__INVALID__"
+            else
+                [$matches[].listen_port] as $ports |
+                if (all($ports[];
+                        (type == "number") and (. == floor) and (. >= 1) and (. <= 65535))) and
+                   (($ports | unique | length) == 1) then
+                    ($ports[0] | tostring)
+                else
+                    "__INVALID__"
+                end
+            end
+        end
+    ' "$inbounds_file" 2>/dev/null) || return 2
+    case "$result" in
+        __ABSENT__) return 1 ;;
+        __INVALID__) return 2 ;;
+    esac
+    validate_port_value "$result" extra_protocol_port >/dev/null 2>&1 || return 2
+    printf '%s\n' "$result"
+}
+
 # 更新订阅文件
 remove_url_by_tag() {
-    local tag="$1"
-    sed -i '/'^${tag}':\/\//d' "$client_dir"
-    sed -i '/^$/{N; /\n$/D}' "$client_dir"
+    local scheme="${1:-}"
+    local parent name tmp_file
+
+    [[ "$scheme" =~ ^[A-Za-z][A-Za-z0-9+.-]*$ ]] || return 1
+    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
+    parent=$(dirname "$client_dir") || return 1
+    name=$(basename "$client_dir") || return 1
+    [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    tmp_file=$(mktemp "${parent}/.remove-url.${name}.XXXXXX") || return 1
+    if ! awk -v prefix="${scheme}://" '
+            NF && index($0, prefix) != 1 { print }
+        ' "$client_dir" > "$tmp_file" ||
+       ! chmod --reference="$client_dir" "$tmp_file" 2>/dev/null ||
+       ! mv -f -- "$tmp_file" "$client_dir"; then
+        rm -f -- "$tmp_file"
+        return 1
+    fi
 }
 
 write_base64_subscription() {
@@ -6725,10 +10580,640 @@ update_sub() {
     sync_combined_subscription || return 1
 }
 
+resolve_extra_protocol_listeners() {
+    local bindv6only=0
+
+    EXTRA_PROTOCOL_HAS_IPV4=0
+    EXTRA_PROTOCOL_HAS_IPV6=0
+    EXTRA_PROTOCOL_LISTENERS=()
+    ipv4_stack_available && EXTRA_PROTOCOL_HAS_IPV4=1
+    ipv6_stack_available && EXTRA_PROTOCOL_HAS_IPV6=1
+    [ "$EXTRA_PROTOCOL_HAS_IPV4" -eq 1 ] || [ "$EXTRA_PROTOCOL_HAS_IPV6" -eq 1 ] || return 1
+    bindv6only=$(get_bindv6only) || return 1
+    [[ "$bindv6only" =~ ^[01]$ ]] || return 1
+    mapfile -t EXTRA_PROTOCOL_LISTENERS < <(
+        get_listener_address "$EXTRA_PROTOCOL_HAS_IPV4" "$EXTRA_PROTOCOL_HAS_IPV6" "$bindv6only"
+    )
+    [ "${#EXTRA_PROTOCOL_LISTENERS[@]}" -gt 0 ] || return 1
+    case "${EXTRA_PROTOCOL_LISTENERS[*]}" in
+        '0.0.0.0'|'::'|'0.0.0.0 ::') ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_extra_protocol_server_host() {
+    local raw_host octet
+    local -a octets=()
+
+    EXTRA_PROTOCOL_SERVER_HOST=''
+    raw_host=$(get_realip) || return 1
+    [ -n "$raw_host" ] && [[ "$raw_host" != *[[:space:]]* ]] || return 1
+    if [[ "$raw_host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        IFS='.' read -r -a octets <<< "$raw_host"
+        [ "${#octets[@]}" -eq 4 ] || return 1
+        for octet in "${octets[@]}"; do
+            [ "$octet" -le 255 ] 2>/dev/null || return 1
+        done
+    elif [[ "$raw_host" =~ ^\[[0-9A-Fa-f:]+\]$ ]] || \
+         [[ "$raw_host" =~ ^[0-9A-Fa-f:]+$ && "$raw_host" == *:* ]]; then
+        :
+    else
+        return 1
+    fi
+    EXTRA_PROTOCOL_SERVER_HOST=$(format_url_host "$raw_host") || return 1
+    [ -n "$EXTRA_PROTOCOL_SERVER_HOST" ]
+}
+
+# Read the local listener and externally mapped port independently.  The
+# default remains one-port operation for ordinary VPSes; NAT users can publish
+# the provider-assigned public port while sing-box/firewall keep using the
+# allocated local listener port.
+read_extra_protocol_ports() {
+    local protocol_name="${1:-额外协议}"
+    local listen_input public_input
+
+    EXTRA_PROTOCOL_LISTEN_PORT=''
+    EXTRA_PROTOCOL_PUBLIC_PORT=''
+    while :; do
+        reading "请输入 ${protocol_name} 监听端口 (回车随机生成): " listen_input
+        if [ -z "$listen_input" ]; then
+            listen_input=$(shuf -i 10000-65000 -n 1) || return 1
+            yellow "随机监听端口适用于普通 VPS；NAT 机器请使用服务商分配的监听端口。"
+        fi
+        if validate_port_value "$listen_input" extra_protocol_listen_port; then
+            break
+        fi
+        yellow "错误：监听端口必须是1-65535之间的数字！"
+    done
+
+    while :; do
+        reading "请输入公网映射端口 (回车=${listen_input}): " public_input
+        [ -n "$public_input" ] || public_input="$listen_input"
+        if validate_port_value "$public_input" extra_protocol_public_port; then
+            break
+        fi
+        yellow "错误：公网映射端口必须是1-65535之间的数字！"
+    done
+
+    EXTRA_PROTOCOL_LISTEN_PORT="$listen_input"
+    EXTRA_PROTOCOL_PUBLIC_PORT="$public_input"
+    green "${protocol_name}监听端口：${purple}${EXTRA_PROTOCOL_LISTEN_PORT}${re}"
+    if [ "$EXTRA_PROTOCOL_PUBLIC_PORT" != "$EXTRA_PROTOCOL_LISTEN_PORT" ]; then
+        green "${protocol_name}公网映射端口：${purple}${EXTRA_PROTOCOL_PUBLIC_PORT}${re}"
+    fi
+}
+
+backup_extra_protocol_transaction() {
+    local inbounds_file="${1:-}"
+    local combined_path="${combined_client_dir:-${work_dir}/all-url.txt}"
+    local backup_parent backup_dir path index
+    local -a files=(
+        "$inbounds_file"
+        "$client_dir"
+        "${work_dir}/base-sub.txt"
+        "$combined_path"
+        "${work_dir}/all-sub.txt"
+        "${work_dir}/sub.txt"
+        "${work_dir}/cfy-sub.txt"
+    )
+
+    EXTRA_PROTOCOL_BACKUP_DIR=''
+    [ -n "$inbounds_file" ] && [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] || return 1
+    [ -n "${client_dir:-}" ] && [ ! -L "$client_dir" ] || return 1
+    backup_parent=$(dirname "$inbounds_file") || return 1
+    [ -d "$backup_parent" ] && [ ! -L "$backup_parent" ] || return 1
+    backup_dir=$(mktemp -d "${backup_parent}/.extra-protocol.XXXXXX") || return 1
+    chmod 700 "$backup_dir" || { rm -rf -- "$backup_dir"; return 1; }
+
+    for ((index = 0; index < ${#files[@]}; index++)); do
+        path="${files[$index]}"
+        [ -n "$path" ] || { rm -rf -- "$backup_dir"; return 1; }
+        [ ! -L "$path" ] || { rm -rf -- "$backup_dir"; return 1; }
+        if [ -e "$path" ]; then
+            [ -f "$path" ] || { rm -rf -- "$backup_dir"; return 1; }
+            cp -p -- "$path" "${backup_dir}/file.${index}" || {
+                rm -rf -- "$backup_dir"
+                return 1
+            }
+            : > "${backup_dir}/present.${index}" || {
+                rm -rf -- "$backup_dir"
+                return 1
+            }
+        fi
+    done
+    EXTRA_PROTOCOL_BACKUP_DIR="$backup_dir"
+}
+
+restore_extra_protocol_files() {
+    local backup_dir="${1:-}"
+    local inbounds_file="${2:-}"
+    local combined_path="${combined_client_dir:-${work_dir}/all-url.txt}"
+    local path parent name tmp_file index
+    local -a files=(
+        "$inbounds_file"
+        "$client_dir"
+        "${work_dir}/base-sub.txt"
+        "$combined_path"
+        "${work_dir}/all-sub.txt"
+        "${work_dir}/sub.txt"
+        "${work_dir}/cfy-sub.txt"
+    )
+
+    [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ] || return 1
+    [ -n "$inbounds_file" ] && [ ! -L "$inbounds_file" ] || return 1
+    for ((index = 0; index < ${#files[@]}; index++)); do
+        path="${files[$index]}"
+        [ -n "$path" ] && [ ! -L "$path" ] || return 1
+        if [ -e "${backup_dir}/present.${index}" ]; then
+            [ -f "${backup_dir}/file.${index}" ] && [ ! -L "${backup_dir}/file.${index}" ] || return 1
+            parent=$(dirname "$path") || return 1
+            name=$(basename "$path") || return 1
+            [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+            tmp_file=$(mktemp "${parent}/.restore.${name}.XXXXXX") || return 1
+            if ! cp -p -- "${backup_dir}/file.${index}" "$tmp_file" ||
+               ! mv -f -- "$tmp_file" "$path" ||
+               ! cmp -s -- "${backup_dir}/file.${index}" "$path"; then
+                rm -f -- "$tmp_file"
+                return 1
+            fi
+        elif ! rm -f -- "$path"; then
+            return 1
+        fi
+    done
+}
+
+restore_extra_protocol_service_state() {
+    local was_active="${1:-0}"
+
+    case "$was_active" in
+        1)
+            restart_singbox >/dev/null 2>&1 || return 1
+            singbox_service_is_active
+            ;;
+        0)
+            if singbox_service_is_active; then
+                stop_singbox_checked >/dev/null 2>&1 || return 1
+            fi
+            ! singbox_service_is_active
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+commit_extra_protocol_service_state() {
+    local was_active="${1:-}"
+
+    EXTRA_PROTOCOL_SERVICE_TOUCHED=0
+    case "$was_active" in
+        1)
+            validate_installed_singbox_config_strict || return 1
+            EXTRA_PROTOCOL_SERVICE_TOUCHED=1
+            restart_singbox >/dev/null 2>&1 || return 1
+            singbox_service_is_active
+            ;;
+        0)
+            validate_installed_singbox_config_strict || return 1
+            ! singbox_service_is_active
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+cleanup_extra_protocol_backup() {
+    local backup_dir="${1:-}"
+
+    [ -n "$backup_dir" ] && [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ] || return 1
+    rm -rf -- "$backup_dir"
+}
+
+rollback_extra_protocol_signal_transaction() {
+    local backup_dir="${1:-}"
+    local inbounds_file="${2:-}"
+    local was_active="${3:-0}"
+    local status=0
+
+    restore_extra_protocol_files "$backup_dir" "$inbounds_file" || status=1
+    if [ "${EXTRA_PROTOCOL_SERVICE_TOUCHED:-0}" = 1 ]; then
+        restore_extra_protocol_service_state "$was_active" || status=1
+    elif [ "${EXTRA_PROTOCOL_SERVICE_TOUCHED:-0}" != 0 ]; then
+        status=1
+    fi
+    if [ "${#DURABLE_TX_OWNED_RECORDS[@]}" -gt 0 ]; then
+        remove_owned_firewall_records_exact "${DURABLE_TX_OWNED_RECORDS[@]}" || status=1
+    fi
+    cleanup_extra_protocol_backup "$backup_dir" || status=1
+    return "$status"
+}
+
+handle_extra_protocol_transaction_failure() {
+    local backup_dir="${1:-}"
+    local inbounds_file="${2:-}"
+    local was_active="${3:-0}"
+    local failure_status="${4:-1}"
+    local fatal_hint="${5:-0}"
+    local service_touched="${6:-0}"
+    shift 6 || return 2
+    local status=0
+    local -a new_firewall_records=("$@")
+
+    restore_extra_protocol_files "$backup_dir" "$inbounds_file" || status=1
+    if [ "$service_touched" = 1 ]; then
+        restore_extra_protocol_service_state "$was_active" || status=1
+    elif [ "$service_touched" != 0 ]; then
+        status=1
+    fi
+    if [ "${#new_firewall_records[@]}" -gt 0 ]; then
+        remove_owned_firewall_records_exact "${new_firewall_records[@]}" || status=1
+    fi
+    [ "$failure_status" -ge 1 ] 2>/dev/null || failure_status=1
+    if [ "$status" -eq 0 ] && [ "$fatal_hint" -eq 0 ]; then
+        if cleanup_extra_protocol_backup "$backup_dir"; then
+            EXTRA_PROTOCOL_RECOVERY_PATH=''
+            [ "$failure_status" -ne 2 ] || failure_status=1
+            return "$failure_status"
+        fi
+        status=1
+    fi
+
+    EXTRA_PROTOCOL_RECOVERY_PATH="$backup_dir"
+    red "额外协议事务回滚不完整。人工恢复路径: ${backup_dir}"
+    return 2
+}
+
+_add_extra_protocol_transaction_locked() {
+    local inbounds_file="${1:-}"
+    local client_line="${2:-}"
+    local mutation_callback="${3:-}"
+    shift 3 || return 1
+    local delimiter_seen=0 backup_dir was_active=0 transaction_status=0 has_v4 has_v6
+    local firewall_rule rule_port rule_proto conflict_status nginx_conflict_status tag_status
+    local expected_tag
+    local -a firewall_rules=() callback_args=() new_firewall_records=()
+
+    [ "${1:-}" = --families ] && [ "$#" -ge 4 ] || return 1
+    has_v4="$2"
+    has_v6="$3"
+    shift 3
+    [[ "$has_v4" =~ ^[01]$ && "$has_v6" =~ ^[01]$ ]] || return 1
+    [ "$has_v4" -eq 1 ] || [ "$has_v6" -eq 1 ] || return 1
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = -- ]; then
+            delimiter_seen=1
+            shift
+            callback_args=("$@")
+            break
+        fi
+        firewall_rules+=("$1")
+        shift
+    done
+    [ "$delimiter_seen" -eq 1 ] && [ "${#firewall_rules[@]}" -gt 0 ] || return 1
+    [ -n "$inbounds_file" ] && [ -n "$client_line" ] || return 1
+    declare -F "$mutation_callback" >/dev/null 2>&1 || return 1
+    expected_tag="${callback_args[0]:-}"
+    [ -n "$expected_tag" ] || return 1
+
+    if extra_protocol_tag_exists "$inbounds_file" "$expected_tag"; then
+        red "协议标签 ${expected_tag} 已存在，未重复添加。"
+        return 1
+    else
+        tag_status=$?
+    fi
+    [ "$tag_status" -eq 1 ] || return 2
+
+    for firewall_rule in "${firewall_rules[@]}"; do
+        [[ "$firewall_rule" == */* ]] || return 1
+        rule_port="${firewall_rule%/*}"
+        rule_proto="${firewall_rule#*/}"
+        validate_port_value "$rule_port" extra_protocol_port || return 1
+        case "$rule_proto" in tcp|udp) ;; *) return 1 ;; esac
+        if configured_inbound_port_conflict_exists "$inbounds_file" "$rule_port" "$rule_proto"; then
+            red "端口 ${rule_port}/${rule_proto} 已被 sing-box 配置占用。"
+            return 1
+        else
+            conflict_status=$?
+        fi
+        [ "$conflict_status" -eq 1 ] || return 2
+        if [ "$rule_proto" = tcp ]; then
+            if nginx_configured_port_conflict_exists \
+                "${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}" \
+                "$rule_port" "$rule_proto"; then
+                red "端口 ${rule_port}/${rule_proto} 已被 Nginx 配置占用。"
+                return 1
+            else
+                nginx_conflict_status=$?
+            fi
+            [ "$nginx_conflict_status" -eq 1 ] || return 2
+        fi
+        if port_is_listening "$rule_port" "$rule_proto"; then
+            red "端口 ${rule_port}/${rule_proto} 已被其他进程监听。"
+            return 1
+        fi
+    done
+
+    EXTRA_PROTOCOL_RECOVERY_PATH=''
+    EXTRA_PROTOCOL_SERVICE_TOUCHED=0
+    backup_extra_protocol_transaction "$inbounds_file" || return 1
+    backup_dir="$EXTRA_PROTOCOL_BACKUP_DIR"
+    singbox_service_is_active && was_active=1
+    if ! arm_durable_transaction extra-protocol-add "$(dirname "$backup_dir")" "$backup_dir" \
+        EXTRA_PROTOCOL_RECOVERY_PATH rollback_extra_protocol_signal_transaction \
+        "$was_active" '' '' "$backup_dir" "$inbounds_file" "$was_active"; then
+        cleanup_extra_protocol_backup "$backup_dir" || {
+            EXTRA_PROTOCOL_RECOVERY_PATH="$backup_dir"
+            return 2
+        }
+        return 1
+    fi
+
+    if ! durable_transaction_checkpoint firewall-mutating; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        EXTRA_PROTOCOL_RECOVERY_PATH="${DURABLE_TX_RECOVERY_DIR:-$backup_dir}"
+        return 2
+    fi
+    allow_port --families "$has_v4" "$has_v6" "${firewall_rules[@]}" || transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        if [ "$transaction_status" -eq 2 ]; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            red "防火墙事务状态未决，已保留额外协议恢复备份：${backup_dir}"
+            return 2
+        fi
+        if cleanup_extra_protocol_backup "$backup_dir"; then
+            if ! disarm_durable_transaction cleanup; then
+                return 2
+            fi
+            return "$transaction_status"
+        fi
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        red "额外协议添加失败且事务备份未能清理：${backup_dir}"
+        return 2
+    fi
+    new_firewall_records=("${FIREWALL_LAST_ADDED_RECORDS[@]}")
+    if ! durable_transaction_set_owned_records "${new_firewall_records[@]}" || \
+       ! durable_transaction_checkpoint precommit; then
+        rollback_extra_protocol_signal_transaction "$backup_dir" "$inbounds_file" "$was_active" || {
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            return 2
+        }
+        disarm_durable_transaction cleanup >/dev/null 2>&1 || return 2
+        return 1
+    fi
+
+    transaction_status=0
+    "$mutation_callback" "$inbounds_file" "${callback_args[@]}" || transaction_status=$?
+    [ "$transaction_status" -ne 0 ] || \
+        printf '\n%s\n' "$client_line" >> "$client_dir" || transaction_status=$?
+    if [ "$transaction_status" -eq 0 ]; then
+        durable_transaction_checkpoint config-mutated || transaction_status=2
+    fi
+    [ "$transaction_status" -ne 0 ] || \
+        commit_extra_protocol_service_state "$was_active" || transaction_status=$?
+    if [ "$transaction_status" -eq 0 ]; then
+        durable_transaction_checkpoint publishing || transaction_status=2
+    fi
+    [ "$transaction_status" -ne 0 ] || update_sub || transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
+            "$transaction_status" 0 \
+            "$EXTRA_PROTOCOL_SERVICE_TOUCHED" \
+            "${new_firewall_records[@]}"
+        transaction_status=$?
+        if [ -n "${EXTRA_PROTOCOL_RECOVERY_PATH:-}" ]; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+        elif ! disarm_durable_transaction cleanup; then
+            return 2
+        fi
+        return "$transaction_status"
+    fi
+
+    if ! durable_transaction_checkpoint committed; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! cleanup_extra_protocol_backup "$backup_dir"; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        red "额外协议已生效，但事务备份未能清理: ${backup_dir}"
+        return 3
+    fi
+    if ! disarm_durable_transaction cleanup; then
+        return 3
+    fi
+}
+
+add_extra_protocol_transaction() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "额外协议添加"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _add_extra_protocol_transaction_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+_remove_extra_protocol_transaction_locked() {
+    local inbounds_file="${1:-}"
+    local url_scheme="${2:-}"
+    local mutation_callback="${3:-}"
+    shift 3 || return 1
+    local delimiter_seen=0 backup_dir was_active=0 cleanup_status=0 transaction_status=0
+    local firewall_rule rule_proto current_port port_status expected_tag
+    local -a firewall_rules=() callback_args=() firewall_protocols=()
+
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = -- ]; then
+            delimiter_seen=1
+            shift
+            callback_args=("$@")
+            break
+        fi
+        firewall_rules+=("$1")
+        shift
+    done
+    [ "$delimiter_seen" -eq 1 ] && [ "${#firewall_rules[@]}" -gt 0 ] || return 1
+    [ -n "$inbounds_file" ] && [[ "$url_scheme" =~ ^[A-Za-z0-9+.-]+$ ]] || return 1
+    declare -F "$mutation_callback" >/dev/null 2>&1 || return 1
+    expected_tag="${callback_args[0]:-}"
+    [ -n "$expected_tag" ] || return 1
+
+    # The wrapper may have waited on the shared lock after reading a port.
+    # Re-read the tag and its port now, then rebuild cleanup rules from the
+    # authoritative locked configuration rather than stale caller data.
+    for firewall_rule in "${firewall_rules[@]}"; do
+        [[ "$firewall_rule" == */* ]] || return 1
+        rule_proto="${firewall_rule#*/}"
+        case "$rule_proto" in tcp|udp) ;; *) return 1 ;; esac
+        firewall_protocols+=("$rule_proto")
+    done
+    if current_port=$(get_extra_protocol_uniform_port "$inbounds_file" "$expected_tag"); then
+        :
+    else
+        port_status=$?
+        [ "$port_status" -eq 1 ] && return 1
+        return 2
+    fi
+    firewall_rules=()
+    for rule_proto in "${firewall_protocols[@]}"; do
+        firewall_rules+=("${current_port}/${rule_proto}")
+    done
+
+    EXTRA_PROTOCOL_RECOVERY_PATH=''
+    EXTRA_PROTOCOL_SERVICE_TOUCHED=0
+    backup_extra_protocol_transaction "$inbounds_file" || return 1
+    backup_dir="$EXTRA_PROTOCOL_BACKUP_DIR"
+    singbox_service_is_active && was_active=1
+    if ! arm_durable_transaction extra-protocol-remove "$(dirname "$backup_dir")" "$backup_dir" \
+        EXTRA_PROTOCOL_RECOVERY_PATH rollback_extra_protocol_signal_transaction \
+        "$was_active" "$current_port" '' "$backup_dir" "$inbounds_file" "$was_active"; then
+        cleanup_extra_protocol_backup "$backup_dir" || {
+            EXTRA_PROTOCOL_RECOVERY_PATH="$backup_dir"
+            return 2
+        }
+        return 1
+    fi
+
+    "$mutation_callback" "$inbounds_file" "${callback_args[@]}" || transaction_status=$?
+    [ "$transaction_status" -ne 0 ] || remove_url_by_tag "$url_scheme" || transaction_status=$?
+    if [ "$transaction_status" -eq 0 ]; then
+        durable_transaction_checkpoint config-mutated || transaction_status=2
+    fi
+    [ "$transaction_status" -ne 0 ] || \
+        commit_extra_protocol_service_state "$was_active" || transaction_status=$?
+    if [ "$transaction_status" -eq 0 ]; then
+        durable_transaction_checkpoint publishing || transaction_status=2
+    fi
+    [ "$transaction_status" -ne 0 ] || update_sub || transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
+            "$transaction_status" 0 \
+            "$EXTRA_PROTOCOL_SERVICE_TOUCHED"
+        transaction_status=$?
+        if [ -n "${EXTRA_PROTOCOL_RECOVERY_PATH:-}" ]; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+        elif ! disarm_durable_transaction cleanup; then
+            return 2
+        fi
+        return "$transaction_status"
+    fi
+
+    if ! durable_transaction_checkpoint firewall-mutating; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    remove_owned_firewall_ports_if_unused "$inbounds_file" "${firewall_rules[@]}" || cleanup_status=$?
+    if [ "$cleanup_status" -ne 0 ]; then
+        if [ "$cleanup_status" -eq 2 ]; then
+            handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
+                "$cleanup_status" 1 "$EXTRA_PROTOCOL_SERVICE_TOUCHED"
+        else
+            handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
+                "$cleanup_status" 0 "$EXTRA_PROTOCOL_SERVICE_TOUCHED"
+        fi
+        transaction_status=$?
+        if [ -n "${EXTRA_PROTOCOL_RECOVERY_PATH:-}" ]; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+        elif ! disarm_durable_transaction cleanup; then
+            return 2
+        fi
+        return "$transaction_status"
+    fi
+
+    if ! durable_transaction_checkpoint committed; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        return 2
+    fi
+    if ! cleanup_extra_protocol_backup "$backup_dir"; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
+        red "额外协议已删除，但事务备份未能清理: ${backup_dir}"
+        return 3
+    fi
+    if ! disarm_durable_transaction cleanup; then
+        return 3
+    fi
+}
+
+remove_extra_protocol_transaction() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "额外协议删除"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _remove_extra_protocol_transaction_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+mutate_socks5_inbound_add() {
+    local inbounds_file="$1" tag="$2" port="$3" user="$4" pass="$5"
+    local listener_v4_or_dual="${6:-}" listener_v6="${7:-}"
+    apply_jq_config "$inbounds_file" \
+       --arg tag "$tag" --argjson port "$port" --arg user "$user" --arg pass "$pass" \
+       --arg listener1 "$listener_v4_or_dual" --arg listener2 "$listener_v6" \
+       'def inbound($inbound_tag; $listener): {
+           "type": "socks",
+           "tag": $inbound_tag,
+           "listen": $listener,
+           "listen_port": $port,
+           "users": [{"username": $user, "password": $pass}]
+       };
+       .inbounds += ([inbound($tag; $listener1)] +
+           (if $listener2 == "" then [] else [inbound($tag + "-ipv6"; $listener2)] end))'
+}
+
+mutate_anytls_inbound_add() {
+    local inbounds_file="$1" tag="$2" port="$3" pass="$4" cert="$5" key="$6"
+    local listener_v4_or_dual="${7:-}" listener_v6="${8:-}"
+    apply_jq_config "$inbounds_file" \
+       --arg tag "$tag" --argjson port "$port" --arg pass "$pass" \
+       --arg cert "$cert" --arg key "$key" \
+       --arg listener1 "$listener_v4_or_dual" --arg listener2 "$listener_v6" \
+       'def inbound($inbound_tag; $listener): {
+           "type": "anytls",
+           "tag": $inbound_tag,
+           "listen": $listener,
+           "listen_port": $port,
+           "users": [{"password": $pass}],
+           "tls": {
+               "enabled": true,
+               "certificate_path": $cert,
+               "key_path": $key
+           }
+       };
+       .inbounds += ([inbound($tag; $listener1)] +
+           (if $listener2 == "" then [] else [inbound($tag + "-ipv6"; $listener2)] end))'
+}
+
+mutate_ss2022_inbound_add() {
+    local inbounds_file="$1" tag="$2" port="$3" method="$4" key="$5"
+    local listener_v4_or_dual="${6:-}" listener_v6="${7:-}"
+    apply_jq_config "$inbounds_file" \
+       --arg tag "$tag" --argjson port "$port" --arg method "$method" --arg key "$key" \
+       --arg listener1 "$listener_v4_or_dual" --arg listener2 "$listener_v6" \
+       'def inbound($inbound_tag; $listener): {
+           "type": "shadowsocks",
+           "tag": $inbound_tag,
+           "listen": $listener,
+           "listen_port": $port,
+           "method": $method,
+           "password": $key,
+           "multiplex": {"enabled": true}
+       };
+       .inbounds += ([inbound($tag; $listener1)] +
+           (if $listener2 == "" then [] else [inbound($tag + "-ipv6"; $listener2)] end))'
+}
+
+mutate_extra_protocol_inbound_remove() {
+    local inbounds_file="$1" tag="$2"
+    apply_jq_config "$inbounds_file" --arg tag "$tag" \
+        'del(.inbounds[] | select(.tag == $tag or .tag == ($tag + "-ipv6")))'
+}
+
 # ---- Socks5 入站 ----
 add_socks5_inbound() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="socks5-in"
+    local listener1 listener2=''
 
     if proto_exists "$tag"; then
         yellow "Socks5 协议已存在，无需重复添加。"; sleep 1; return
@@ -6738,24 +11223,10 @@ add_socks5_inbound() {
     local current_uuid
     current_uuid=$(get_current_uuid | tr -d '\n\r')
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 Socks5 监听端口 (回车随机生成): " sk_port
-        if [ -z "$sk_port" ]; then
-            sk_port=$(shuf -i 10000-65000 -n 1)
-            green "socks5监听端口：${purple}${sk_port}${re}"
-            break
-        fi
-
-        # 统一验证端口格式和范围
-        if [[ ! "$sk_port" =~ ^[0-9]+$ ]] || [ "$sk_port" -gt 65535 ] || [ "$sk_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-
-        green "socks5监听端口：${purple}${sk_port}${re}"
-        break
-    done
+    local sk_port sk_public_port
+    read_extra_protocol_ports Socks5 || return 1
+    sk_port="$EXTRA_PROTOCOL_LISTEN_PORT"
+    sk_public_port="$EXTRA_PROTOCOL_PUBLIC_PORT"
 
     reading "请输入 Socks5 用户名 (回车自动使用UUID前8位): " sk_user
     if [ -n "$sk_user" ]; then
@@ -6785,38 +11256,32 @@ add_socks5_inbound() {
         fi
     fi
 
-    apply_jq_config "$inbounds_file" \
-       --arg tag "$tag" \
-       --argjson port "$sk_port" \
-       --arg user "$sk_user" \
-       --arg pass "$sk_pass" \
-       '.inbounds += [{
-           "type": "socks",
-           "tag": $tag,
-           "listen": "::",
-           "listen_port": $port,
-           "users": [{"username": $user, "password": $pass}]
-       }]' || return
-
-    allow_port ${sk_port}/tcp ${sk_port}/udp > /dev/null 2>&1
-
-    local server_ip
-    server_ip=$(get_realip)
+    resolve_extra_protocol_listeners || { red "未检测到可用的公网地址族，未修改配置。"; return 1; }
+    listener1="${EXTRA_PROTOCOL_LISTENERS[0]}"
+    [ "${#EXTRA_PROTOCOL_LISTENERS[@]}" -lt 2 ] || listener2="${EXTRA_PROTOCOL_LISTENERS[1]}"
+    resolve_extra_protocol_server_host || { red "无法获取有效公网地址，未发布 Socks5 节点。"; return 1; }
+    local server_ip="$EXTRA_PROTOCOL_SERVER_HOST"
     local isp
     isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
         | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
         | sed 's/ /_/g' || echo "Socks5")
 
-    local url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_port}#${isp}"
+    local url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_public_port}#${isp}"
+    local transaction_status=0
 
-    echo "" >> "${client_dir}"
-    echo "${url_line}" >> "${client_dir}"
-    update_sub
-
-    restart_singbox
+    add_extra_protocol_transaction "$inbounds_file" "$url_line" mutate_socks5_inbound_add \
+        --families "$EXTRA_PROTOCOL_HAS_IPV4" "$EXTRA_PROTOCOL_HAS_IPV6" \
+        "${sk_port}/tcp" "${sk_port}/udp" -- \
+        "$tag" "$sk_port" "$sk_user" "$sk_pass" "$listener1" "$listener2" || \
+        transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        [ "$transaction_status" -eq 2 ] && \
+            red "Socks5 添加事务 fatal 中止；请按上方恢复路径人工处理。"
+        return "$transaction_status"
+    fi
 
     green "\nSocks5 协议已添加！"
-    green "端口: ${purple}${sk_port}${re}"
+    green "监听端口: ${purple}${sk_port}${re}  公网端口: ${purple}${sk_public_port}${re}"
     green "用户名: ${purple}${sk_user}${re}  ${green}密码:${re} ${purple}${sk_pass}${re}"
     green "节点链接: ${purple}${url_line}${re}\n"
     render_terminal_qr "$url_line"
@@ -6825,16 +11290,24 @@ add_socks5_inbound() {
 remove_socks5_inbound() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="socks5-in"
+    local sk_port transaction_status=0
 
     if ! proto_exists "$tag"; then
         yellow "Socks5 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    apply_jq_config "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' || return
-
-    remove_url_by_tag "socks"
-    update_sub
-    restart_singbox
+    sk_port=$(jq -er --arg tag "$tag" '
+        [.inbounds[] | select(.tag == $tag or .tag == ($tag + "-ipv6")) | .listen_port] |
+        unique | if length == 1 then .[0] else error("inconsistent socks ports") end
+    ' "$inbounds_file") || return 1
+    validate_port_value "$sk_port" socks5_port || return 1
+    remove_extra_protocol_transaction "$inbounds_file" socks mutate_extra_protocol_inbound_remove \
+        "${sk_port}/tcp" "${sk_port}/udp" -- "$tag" || transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        [ "$transaction_status" -eq 2 ] && \
+            red "Socks5 删除事务 fatal 中止；请按上方恢复路径人工处理。"
+        return "$transaction_status"
+    fi
     green "\nSocks5 协议已删除\n"
 }
 
@@ -6842,6 +11315,7 @@ remove_socks5_inbound() {
 add_anytls() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="anytls"
+    local listener1 listener2=''
 
     if proto_exists "$tag"; then
         yellow "AnyTLS 协议已存在，无需重复添加。"; sleep 1; return
@@ -6854,64 +11328,39 @@ add_anytls() {
         red "无法获取当前UUID，请确认 sing-box 已正确安装并配置。"; sleep 2; return
     fi
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 AnyTLS 监听端口 (回车随机生成): " at_port
+    local at_port at_public_port
+    read_extra_protocol_ports AnyTLS || return 1
+    at_port="$EXTRA_PROTOCOL_LISTEN_PORT"
+    at_public_port="$EXTRA_PROTOCOL_PUBLIC_PORT"
 
-        if [ -z "$at_port" ]; then
-            at_port=$(shuf -i 10000-65000 -n 1)
-            green "Anytls监听端口：${purple}${at_port}${re}"
-            break
-        fi
-
-        if [[ ! "$at_port" =~ ^[0-9]+$ ]] || [ "$at_port" -gt 65535 ] || [ "$at_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-
-        green "Anytls监听端口：${purple}${at_port}${re}"
-        break
-    done
-
-    apply_jq_config "$inbounds_file" \
-       --arg tag "$tag" \
-       --argjson port "$at_port" \
-       --arg pass "$current_uuid" \
-       --arg cert "${work_dir}/cert.pem" \
-       --arg key "${work_dir}/private.key" \
-       '.inbounds += [{
-           "type": "anytls",
-           "tag": $tag,
-           "listen": "::",
-           "listen_port": $port,
-           "users": [{"password": $pass}],
-           "tls": {
-               "enabled": true,
-               "certificate_path": $cert,
-               "key_path": $key
-           }
-       }]' || return
-
-    allow_port ${at_port}/tcp > /dev/null 2>&1
-
-    local server_ip
-    server_ip=$(get_realip)
+    resolve_extra_protocol_listeners || { red "未检测到可用的公网地址族，未修改配置。"; return 1; }
+    listener1="${EXTRA_PROTOCOL_LISTENERS[0]}"
+    [ "${#EXTRA_PROTOCOL_LISTENERS[@]}" -lt 2 ] || listener2="${EXTRA_PROTOCOL_LISTENERS[1]}"
+    resolve_extra_protocol_server_host || { red "无法获取有效公网地址，未发布 AnyTLS 节点。"; return 1; }
+    local server_ip="$EXTRA_PROTOCOL_SERVER_HOST"
     local isp
     isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
         | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
         | sed 's/ /_/g' || echo "AnyTLS")
 
-    local url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=1&sni=bing.com#${isp}"
+    local url_line="anytls://${current_uuid}@${server_ip}:${at_public_port}?insecure=1&sni=bing.com#${isp}"
+    local transaction_status=0
 
-    echo "" >> "${client_dir}"
-    echo "${url_line}" >> "${client_dir}"
-    update_sub
-
-    restart_singbox
+    add_extra_protocol_transaction "$inbounds_file" "$url_line" mutate_anytls_inbound_add \
+        --families "$EXTRA_PROTOCOL_HAS_IPV4" "$EXTRA_PROTOCOL_HAS_IPV6" \
+        "${at_port}/tcp" -- \
+        "$tag" "$at_port" "$current_uuid" "${work_dir}/cert.pem" "${work_dir}/private.key" \
+        "$listener1" "$listener2" || \
+        transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        [ "$transaction_status" -eq 2 ] && \
+            red "AnyTLS 添加事务 fatal 中止；请按上方恢复路径人工处理。"
+        return "$transaction_status"
+    fi
 
     green "\nAnyTLS 协议已添加！"
     green "密码(UUID): ${purple}${current_uuid}${re}"
-    green "端口: ${purple}${at_port}${re}"
+    green "监听端口: ${purple}${at_port}${re}  公网端口: ${purple}${at_public_port}${re}"
     green "节点链接:\n${purple}${url_line}${re}\n"
     render_terminal_qr "$url_line"
 }
@@ -6919,16 +11368,24 @@ add_anytls() {
 remove_anytls() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="anytls"
+    local at_port transaction_status=0
 
     if ! proto_exists "$tag"; then
         yellow "AnyTLS 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    apply_jq_config "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' || return
-
-    remove_url_by_tag "anytls"
-    update_sub
-    restart_singbox
+    at_port=$(jq -er --arg tag "$tag" '
+        [.inbounds[] | select(.tag == $tag or .tag == ($tag + "-ipv6")) | .listen_port] |
+        unique | if length == 1 then .[0] else error("inconsistent anytls ports") end
+    ' "$inbounds_file") || return 1
+    validate_port_value "$at_port" anytls_port || return 1
+    remove_extra_protocol_transaction "$inbounds_file" anytls mutate_extra_protocol_inbound_remove \
+        "${at_port}/tcp" -- "$tag" || transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        [ "$transaction_status" -eq 2 ] && \
+            red "AnyTLS 删除事务 fatal 中止；请按上方恢复路径人工处理。"
+        return "$transaction_status"
+    fi
     green "\nAnyTLS 协议已删除\n"
 }
 
@@ -6936,29 +11393,16 @@ remove_anytls() {
 add_ss2022() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="shadowsocks-2022"
+    local listener1 listener2=''
 
     if proto_exists "$tag"; then
         yellow "Shadowsocks-2022 协议已存在，无需重复添加。"; sleep 1; return
     fi
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 Shadowsocks-2022 监听端口 (回车随机生成): " ss_port
-
-        if [ -z "$ss_port" ]; then
-            ss_port=$(shuf -i 10000-65000 -n 1)
-            green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
-            break
-        fi
-
-        if [[ ! "$ss_port" =~ ^[0-9]+$ ]] || [ "$ss_port" -gt 65535 ] || [ "$ss_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-
-        green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
-        break
-    done
+    local ss_port ss_public_port
+    read_extra_protocol_ports Shadowsocks-2022 || return 1
+    ss_port="$EXTRA_PROTOCOL_LISTEN_PORT"
+    ss_public_port="$EXTRA_PROTOCOL_PUBLIC_PORT"
 
     echo ""
     green "请选择加密方式:"
@@ -6976,25 +11420,11 @@ add_ss2022() {
     local ss_key
     ss_key=$(dd if=/dev/urandom bs=1 count=${key_len} 2>/dev/null | base64 -w0)
 
-    apply_jq_config "$inbounds_file" \
-       --arg tag "$tag" \
-       --argjson port "$ss_port" \
-       --arg method "$ss_method" \
-       --arg key "$ss_key" \
-       '.inbounds += [{
-           "type": "shadowsocks",
-           "tag": $tag,
-           "listen": "::",
-           "listen_port": $port,
-           "method": $method,
-           "password": $key,
-           "multiplex": {"enabled": true}
-       }]' || return
-
-    allow_port ${ss_port}/tcp ${ss_port}/udp > /dev/null 2>&1
-
-    local server_ip
-    server_ip=$(get_realip)
+    resolve_extra_protocol_listeners || { red "未检测到可用的公网地址族，未修改配置。"; return 1; }
+    listener1="${EXTRA_PROTOCOL_LISTENERS[0]}"
+    [ "${#EXTRA_PROTOCOL_LISTENERS[@]}" -lt 2 ] || listener2="${EXTRA_PROTOCOL_LISTENERS[1]}"
+    resolve_extra_protocol_server_host || { red "无法获取有效公网地址，未发布 Shadowsocks-2022 节点。"; return 1; }
+    local server_ip="$EXTRA_PROTOCOL_SERVER_HOST"
     local isp
     isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
         | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
@@ -7002,18 +11432,24 @@ add_ss2022() {
 
     local ss_userinfo
     ss_userinfo=$(printf '%s:%s' "${ss_method}" "${ss_key}" | base64 -w0)
-    local url_line="ss://${ss_userinfo}@${server_ip}:${ss_port}#${isp}"
+    local url_line="ss://${ss_userinfo}@${server_ip}:${ss_public_port}#${isp}"
+    local transaction_status=0
 
-    echo "" >> "${client_dir}"
-    echo "${url_line}" >> "${client_dir}"
-    update_sub
-
-    restart_singbox
+    add_extra_protocol_transaction "$inbounds_file" "$url_line" mutate_ss2022_inbound_add \
+        --families "$EXTRA_PROTOCOL_HAS_IPV4" "$EXTRA_PROTOCOL_HAS_IPV6" \
+        "${ss_port}/tcp" "${ss_port}/udp" -- \
+        "$tag" "$ss_port" "$ss_method" "$ss_key" "$listener1" "$listener2" || \
+        transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        [ "$transaction_status" -eq 2 ] && \
+            red "Shadowsocks-2022 添加事务 fatal 中止；请按上方恢复路径人工处理。"
+        return "$transaction_status"
+    fi
 
     green "\nShadowsocks-2022 协议已添加！"
     green "加密方式: ${purple}${ss_method}${re}"
     green "密钥(base64): ${purple}${ss_key}${re}"
-    green "端口: ${purple}${ss_port}${re}"
+    green "监听端口: ${purple}${ss_port}${re}  公网端口: ${purple}${ss_public_port}${re}"
     green "节点链接:\n${purple}${url_line}${re}\n"
     render_terminal_qr "$url_line"
 }
@@ -7021,16 +11457,24 @@ add_ss2022() {
 remove_ss2022() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="shadowsocks-2022"
+    local ss_port transaction_status=0
 
     if ! proto_exists "$tag"; then
         yellow "Shadowsocks-2022 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    apply_jq_config "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' || return
-
-    remove_url_by_tag "ss"
-    update_sub
-    restart_singbox
+    ss_port=$(jq -er --arg tag "$tag" '
+        [.inbounds[] | select(.tag == $tag or .tag == ($tag + "-ipv6")) | .listen_port] |
+        unique | if length == 1 then .[0] else error("inconsistent shadowsocks ports") end
+    ' "$inbounds_file") || return 1
+    validate_port_value "$ss_port" ss2022_port || return 1
+    remove_extra_protocol_transaction "$inbounds_file" ss mutate_extra_protocol_inbound_remove \
+        "${ss_port}/tcp" "${ss_port}/udp" -- "$tag" || transaction_status=$?
+    if [ "$transaction_status" -ne 0 ]; then
+        [ "$transaction_status" -eq 2 ] && \
+            red "Shadowsocks-2022 删除事务 fatal 中止；请按上方恢复路径人工处理。"
+        return "$transaction_status"
+    fi
     green "\nShadowsocks-2022 协议已删除\n"
 }
 

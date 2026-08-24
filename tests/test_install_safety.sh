@@ -86,7 +86,33 @@ for function_name in \
     sync_combined_subscription \
     update_sub \
     manage_packages \
+    acquire_firewall_lock \
+    release_firewall_lock \
+    select_firewall_backend \
+    read_firewall_state \
+    write_firewall_state_records \
+    firewall_state_has_record \
+    ufw_is_active \
+    firewalld_is_active \
+    ufw_port_is_open \
+    firewall_record_is_live \
+    raw_port_is_open \
+    raw_input_policy_is_accept \
+    raw_input_chain_is_unfiltered \
+    nft_input_filter_status \
+    firewall_state_matches_backend \
+    raw_firewall_persistence_available \
+    add_firewall_record \
+    delete_firewall_record \
+    persist_raw_firewall_rules \
+    rollback_added_firewall_records \
+    rollback_deleted_firewall_records \
+    write_firewall_recovery_records \
+    rollback_firewall_add_transaction \
+    rollback_firewall_delete_transaction \
+    _allow_port_locked \
     allow_port \
+    open_install_firewall_ports \
     is_install_complete \
     mark_install_complete \
     clear_install_complete_marker \
@@ -159,6 +185,35 @@ NGINX_PORT=23001
 TUIC_PORT=23003
 HY2_PORT=23005
 ARGO_PORT=18001
+assert_fail resolve_service_ports
+
+# Port-limited NAT VPSes may reuse the same numeric port across TCP and UDP,
+# while same-protocol listeners must remain unique.
+PORT=12000
+REALITY_PORT=23001
+NGINX_PORT=23002
+TUIC_PORT=23001
+HY2_PORT=23002
+ARGO_PORT=18001
+assert_ok resolve_service_ports
+assert_equal '23001,23002,23001,23002,18001' \
+    "$vless_port,$nginx_port,$tuic_port,$hy2_port,$argo_port" \
+    'cross-protocol NAT port reuse was not preserved'
+
+PORT=12000
+REALITY_PORT=23001
+NGINX_PORT=23002
+TUIC_PORT=23003
+HY2_PORT=23003
+ARGO_PORT=18001
+assert_fail resolve_service_ports
+
+PORT=12000
+REALITY_PORT=23001
+NGINX_PORT=23002
+TUIC_PORT=23003
+HY2_PORT=23004
+ARGO_PORT=23001
 assert_fail resolve_service_ports
 
 command_exists() { [[ "$1" == ss ]]; }
@@ -274,6 +329,7 @@ if command -v jq >/dev/null 2>&1; then
 
     load_function apply_jq_config
     validate_singbox_config() { :; }
+    validate_installed_singbox_config_strict() { :; }
     dual_menu_fixture="${tmp_dir}/dual-menu"
     command mkdir -p "${dual_menu_fixture}/conf"
     conf_dir="${dual_menu_fixture}/conf"
@@ -317,9 +373,9 @@ EOF
 
     change_config_source="$(sed -n '/^change_config() {/,/^configure_cf_https_subscription() {/p' "$script" | sed '$d')"
     for expected_call in \
-        'update_public_inbound_port "$inbounds_file" reality "$new_port"' \
-        'update_public_inbound_port "$inbounds_file" hysteria2 "$new_port"' \
-        'update_public_inbound_port "$inbounds_file" tuic "$new_port"'; do
+        'change_public_inbound_port_transaction "$inbounds_file" reality "$new_port" tcp' \
+        'change_public_inbound_port_transaction "$inbounds_file" hysteria2 "$new_port" udp' \
+        'change_public_inbound_port_transaction "$inbounds_file" tuic "$new_port" udp'; do
         grep -Fq "$expected_call" <<< "$change_config_source" || \
             fail "menu does not use synchronized port update: ${expected_call}"
     done
@@ -393,8 +449,17 @@ for package_manager in apt dnf yum apk; do
     esac
 done
 
-ufw() { printf 'ufw %s\n' "$*" >> "$CALL_LOG"; }
-firewall-cmd() { printf 'firewall-cmd %s\n' "$*" >> "$CALL_LOG"; }
+ufw() {
+    printf 'ufw %s\n' "$*" >> "$CALL_LOG"
+    [ "${1:-}" = status ] && printf 'Status: active\n'
+    return 0
+}
+firewall-cmd() {
+    printf 'firewall-cmd %s\n' "$*" >> "$CALL_LOG"
+    [ "$#" -eq 1 ] && [ "$1" = --state ] && { printf 'running\n'; return; }
+    [ "$#" -eq 1 ] && [ "$1" = --get-default-zone ] && { printf 'public\n'; return; }
+    [[ "$*" != *--query-port=* ]]
+}
 iptables() {
     printf 'iptables %s\n' "$*" >> "$CALL_LOG"
     [[ "${1:-}" != -C ]]
@@ -403,47 +468,66 @@ ip6tables() {
     printf 'ip6tables %s\n' "$*" >> "$CALL_LOG"
     [[ "${1:-}" != -C ]]
 }
-systemctl() {
-    [[ "${1:-}" == is-active && "${2:-}" == firewalld ]]
-}
-
+netfilter-persistent() { printf 'netfilter-persistent %s\n' "$*" >> "$CALL_LOG"; }
 for FIREWALL_BACKEND in ufw firewall-cmd iptables ip6tables; do
+    work_dir="${tmp_dir}/firewall-${FIREWALL_BACKEND}"
+    FIREWALL_STATE_FILE="${work_dir}/firewall.state"
+    command rm -rf "$work_dir"
+    command mkdir -p "$work_dir"
     : > "$CALL_LOG"
     command_exists() {
-        [[ "$1" == "$FIREWALL_BACKEND" ]]
+        [[ "$1" == "$FIREWALL_BACKEND" || "$1" == flock || "$1" == netfilter-persistent ]]
     }
-    assert_ok allow_port --families 1 1 23001 tcp
-    assert_ok allow_port --families 1 1 23003/udp
+    case "$FIREWALL_BACKEND" in
+        ufw|firewall-cmd) family_args=(--families 1 1) ;;
+        iptables) family_args=(--families 1 0) ;;
+        ip6tables) family_args=(--families 0 1) ;;
+    esac
+    assert_ok allow_port "${family_args[@]}" 23001 tcp
+    assert_ok allow_port "${family_args[@]}" 23003/udp
     if grep -Eq -- '--set-target|--set-policy|(^|[[:space:]])-P([[:space:]]|$)|default allow' "$CALL_LOG"; then
         fail "${FIREWALL_BACKEND} changed a global firewall policy"
     fi
     case "$FIREWALL_BACKEND" in
         ufw)
-            grep -Fq 'ufw allow in 23001/tcp' "$CALL_LOG" || fail 'ufw exact TCP rule is missing'
-            grep -Fq 'ufw allow in 23003/udp' "$CALL_LOG" || fail 'ufw exact UDP rule is missing'
+            grep -Fq 'ufw allow in proto tcp to 0.0.0.0/0 port 23001' "$CALL_LOG" || \
+                fail 'ufw exact IPv4 TCP rule is missing'
+            grep -Fq 'ufw allow in proto tcp to ::/0 port 23001' "$CALL_LOG" || \
+                fail 'ufw exact IPv6 TCP rule is missing'
+            grep -Fq 'ufw allow in proto udp to 0.0.0.0/0 port 23003' "$CALL_LOG" || \
+                fail 'ufw exact IPv4 UDP rule is missing'
+            grep -Fq 'ufw allow in proto udp to ::/0 port 23003' "$CALL_LOG" || \
+                fail 'ufw exact IPv6 UDP rule is missing'
             ;;
         firewall-cmd)
             grep -Fq -- '--add-port=23001/tcp' "$CALL_LOG" || fail 'firewalld exact TCP rule is missing'
             grep -Fq -- '--add-port=23003/udp' "$CALL_LOG" || fail 'firewalld exact UDP rule is missing'
+            grep -Fq -- '--permanent --zone=public --add-port=23001/tcp' "$CALL_LOG" || \
+                fail 'firewalld permanent TCP rule is missing'
+            grep -Fq -- '--reload' "$CALL_LOG" && fail 'firewalld was globally reloaded'
             ;;
         iptables)
-            grep -Fq 'iptables -I INPUT -p tcp --dport 23001 -j ACCEPT' "$CALL_LOG" || \
+            grep -Fq 'iptables -I INPUT -p tcp --dport 23001 -m comment --comment sing-box-pre -j ACCEPT' "$CALL_LOG" || \
                 fail 'iptables exact TCP rule is missing'
-            grep -Fq 'iptables -I INPUT -p udp --dport 23003 -j ACCEPT' "$CALL_LOG" || \
+            grep -Fq 'iptables -I INPUT -p udp --dport 23003 -m comment --comment sing-box-pre -j ACCEPT' "$CALL_LOG" || \
                 fail 'iptables exact UDP rule is missing'
             ;;
         ip6tables)
-            grep -Fq 'ip6tables -I INPUT -p tcp --dport 23001 -j ACCEPT' "$CALL_LOG" || \
+            grep -Fq 'ip6tables -I INPUT -p tcp --dport 23001 -m comment --comment sing-box-pre -j ACCEPT' "$CALL_LOG" || \
                 fail 'ip6tables exact TCP rule is missing'
-            grep -Fq 'ip6tables -I INPUT -p udp --dport 23003 -j ACCEPT' "$CALL_LOG" || \
+            grep -Fq 'ip6tables -I INPUT -p udp --dport 23003 -m comment --comment sing-box-pre -j ACCEPT' "$CALL_LOG" || \
                 fail 'ip6tables exact UDP rule is missing'
             ;;
     esac
 done
 
 command_exists() {
-    [[ "$1" == iptables || "$1" == ip6tables ]]
+    [[ "$1" == iptables || "$1" == ip6tables || "$1" == flock || "$1" == netfilter-persistent ]]
 }
+work_dir="${tmp_dir}/firewall-family"
+FIREWALL_STATE_FILE="${work_dir}/firewall.state"
+command rm -rf "$work_dir"
+command mkdir -p "$work_dir"
 iptables() {
     printf 'iptables %s\n' "$*" >> "$CALL_LOG"
     [[ "$FAMILY_CASE" != v6-only && "$FAMILY_CASE" != v4-fail ]] || return 1
@@ -458,7 +542,7 @@ ip6tables() {
 : > "$CALL_LOG"
 FAMILY_CASE=v4-only
 assert_ok allow_port --families 1 0 24001/tcp
-grep -Fq 'iptables -I INPUT -p tcp --dport 24001 -j ACCEPT' "$CALL_LOG" || \
+grep -Fq 'iptables -I INPUT -p tcp --dport 24001 -m comment --comment sing-box-pre -j ACCEPT' "$CALL_LOG" || \
     fail 'IPv4-only firewall update omitted the active iptables rule'
 if grep -Fq 'ip6tables ' "$CALL_LOG"; then
     fail 'IPv4-only firewall update invoked ip6tables'
@@ -467,7 +551,7 @@ fi
 : > "$CALL_LOG"
 FAMILY_CASE=v6-only
 assert_ok allow_port --families 0 1 24002/udp
-grep -Fq 'ip6tables -I INPUT -p udp --dport 24002 -j ACCEPT' "$CALL_LOG" || \
+grep -Fq 'ip6tables -I INPUT -p udp --dport 24002 -m comment --comment sing-box-pre -j ACCEPT' "$CALL_LOG" || \
     fail 'IPv6-only firewall update omitted the active ip6tables rule'
 if grep -Fq 'iptables ' "$CALL_LOG"; then
     fail 'IPv6-only firewall update invoked iptables'
@@ -495,8 +579,30 @@ grep -Fq 'render_inbounds_config "$has_v4" "$has_v6" "$bindv6only"' <<< "$instal
     fail 'sing-box inbounds do not use the stack-aware renderer'
 grep -Fq 'generate_random_alphanumeric 24' <<< "$install_source" || \
     fail 'install_singbox bypasses the pipefail-safe password generator'
-grep -Fq 'allow_port --families "$has_v4" "$has_v6"' <<< "$install_source" || \
+grep -Fq 'open_install_firewall_ports "$has_v4" "$has_v6"' <<< "$install_source" || \
     fail 'install_singbox does not pass detected address families to allow_port'
+(
+    vless_port=25001
+    nginx_port=25002
+    tuic_port=25001
+    hy2_port=25002
+    allow_port() {
+        assert_equal '--families 1 0 25001/tcp 25002/tcp 25001/udp 25002/udp' \
+            "$*" 'install firewall helper changed its exact protocol rules'
+        return "${MOCK_INSTALL_ALLOW_STATUS:-0}"
+    }
+    MOCK_INSTALL_ALLOW_STATUS=0
+    assert_ok open_install_firewall_ports 1 0
+    MOCK_INSTALL_ALLOW_STATUS=1
+    assert_equal 1 "$(set +e; open_install_firewall_ports 1 0; printf '%s' "$?")" \
+        'install firewall helper masked ordinary failure'
+    MOCK_INSTALL_ALLOW_STATUS=2
+    assert_equal 2 "$(set +e; open_install_firewall_ports 1 0; printf '%s' "$?")" \
+        'install firewall helper downgraded unknown firewall status'
+)
+run_install_source="$(extract_function run_install_flow)"
+grep -Fq 'manage_packages install nginx jq tar openssl lsof coreutils util-linux' <<< "$run_install_source" || \
+    fail 'install flow does not install flock via util-linux before firewall transactions'
 if grep -Fq 'ping -c' <<< "$install_source"; then
     fail 'install_singbox still uses ping to select the network stack'
 fi
@@ -935,7 +1041,10 @@ rc-service() {
     return 0
 }
 manage_packages() { record_install_stage packages; }
-install_singbox() { record_install_stage install; }
+install_singbox() {
+    FIREWALL_LAST_ADDED_RECORDS=('iptables|4|sing-box-pre|24443|tcp')
+    record_install_stage install
+}
 validate_singbox_config() { record_install_stage config; }
 add_nginx_conf() { record_install_stage nginx; }
 get_info() { record_install_stage info; }
@@ -943,7 +1052,13 @@ create_shortcut() { record_install_stage shortcut; }
 green() { printf '%s\n' "$*"; }
 yellow() { printf '%s\n' "$*"; }
 red() { printf '%s\n' "$*"; }
+remove_owned_firewall_records_exact() {
+    builtin printf '%s\n' "$*" >> "$INSTALL_FIREWALL_ROLLBACK_LOG"
+    return "${INSTALL_FIREWALL_ROLLBACK_STATUS:-0}"
+}
 
+load_function rollback_failed_install_firewall_records
+load_function handle_failed_install_stage
 load_function run_install_flow
 load_function interactive_install
 
@@ -957,6 +1072,9 @@ setup_complete_legacy_install_fixture() {
     NGINX_SUBSCRIPTION_CONF="${work_dir}/nginx/sing-box.conf"
     INSTALL_FAIL_STAGE=none
     INSTALL_CALL_LOG="${work_dir}/calls.log"
+    INSTALL_FIREWALL_ROLLBACK_LOG="${work_dir}/firewall-rollbacks.log"
+    INSTALL_FIREWALL_ROLLBACK_STATUS=0
+    FIREWALL_LAST_ADDED_RECORDS=()
     LEGACY_INIT_SYSTEM=systemd
 
     command rm -rf "$work_dir"
@@ -979,6 +1097,7 @@ setup_complete_legacy_install_fixture() {
     command printf '%s\n' '#!/sbin/openrc-run' 'legacy argo OpenRC service' > \
         "${LEGACY_OPENRC_INIT_DIR}/argo"
     : > "$INSTALL_CALL_LOG"
+    : > "$INSTALL_FIREWALL_ROLLBACK_LOG"
 }
 
 for INSTALL_MODE in auto interactive; do
@@ -1113,7 +1232,11 @@ run_install_failure_case() {
     command mkdir -p "$work_dir"
     INSTALL_FAIL_STAGE="$stage"
     INSTALL_CALL_LOG="${work_dir}/calls.log"
+    INSTALL_FIREWALL_ROLLBACK_LOG="${work_dir}/firewall-rollbacks.log"
+    INSTALL_FIREWALL_ROLLBACK_STATUS=0
+    FIREWALL_LAST_ADDED_RECORDS=()
     : > "$INSTALL_CALL_LOG"
+    : > "$INSTALL_FIREWALL_ROLLBACK_LOG"
     set +e
     output="$(${mode}_install 2>&1)"
     status=$?
@@ -1132,6 +1255,14 @@ run_install_failure_case() {
         shortcut) expected_calls=$'packages\ninstall\nconfig\nservices\nnginx\ninfo\nshortcut' ;;
     esac
     assert_file_content "$expected_calls" "$INSTALL_CALL_LOG" "${mode}_install did not stop at ${stage} failure"
+    if [[ "$stage" == install || "$stage" == config ]]; then
+        assert_file_content 'iptables|4|sing-box-pre|24443|tcp' \
+            "$INSTALL_FIREWALL_ROLLBACK_LOG" \
+            "${mode}_install did not roll back newly owned firewall records after ${stage} failure"
+    else
+        [[ ! -s "$INSTALL_FIREWALL_ROLLBACK_LOG" ]] || \
+            fail "${mode}_install rolled back firewall records after ${stage} failure despite possible live services"
+    fi
     [[ ! -e "${work_dir}/.install-complete" ]] || \
         fail "${mode}_install wrote a completion marker after ${stage} failure"
 
@@ -1161,6 +1292,46 @@ for INSTALL_MODE in auto interactive; do
         run_install_failure_case "$INSTALL_MODE" "$INSTALL_FAILURE"
     done
 done
+
+# The install orchestrator must remain transactional when callers enable
+# errexit; an unguarded install_singbox call would exit before firewall rollback.
+work_dir="${tmp_dir}/install-errexit-rollback"
+command rm -rf "$work_dir"
+command mkdir -p "$work_dir"
+INSTALL_FAIL_STAGE=install
+INSTALL_CALL_LOG="${work_dir}/calls.log"
+INSTALL_FIREWALL_ROLLBACK_LOG="${work_dir}/firewall-rollbacks.log"
+INSTALL_FIREWALL_ROLLBACK_STATUS=0
+: > "$INSTALL_CALL_LOG"
+: > "$INSTALL_FIREWALL_ROLLBACK_LOG"
+set +e
+( set -e; run_install_flow >/dev/null 2>&1 )
+install_errexit_status=$?
+set -e
+assert_equal 1 "$install_errexit_status" 'errexit install failure status'
+assert_file_content 'iptables|4|sing-box-pre|24443|tcp' \
+    "$INSTALL_FIREWALL_ROLLBACK_LOG" \
+    'errexit skipped rollback of newly owned install firewall records'
+
+work_dir="${tmp_dir}/install-firewall-rollback-unknown"
+command rm -rf "$work_dir"
+command mkdir -p "$work_dir"
+INSTALL_FAIL_STAGE=config
+INSTALL_CALL_LOG="${work_dir}/calls.log"
+INSTALL_FIREWALL_ROLLBACK_LOG="${work_dir}/firewall-rollbacks.log"
+INSTALL_FIREWALL_ROLLBACK_STATUS=1
+FIREWALL_LAST_ADDED_RECORDS=()
+: > "$INSTALL_CALL_LOG"
+: > "$INSTALL_FIREWALL_ROLLBACK_LOG"
+set +e
+run_install_flow >/dev/null 2>&1
+install_firewall_unknown_status=$?
+set -e
+assert_equal 2 "$install_firewall_unknown_status" \
+    'install did not return unknown status when firewall rollback failed'
+[[ ! -e "${work_dir}/.install-complete" ]] || \
+    fail 'install wrote completion marker after firewall rollback became unknown'
+INSTALL_FIREWALL_ROLLBACK_STATUS=0
 
 load_function dispatch_cli_action
 auto_install() { return 37; }
