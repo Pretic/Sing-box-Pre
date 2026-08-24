@@ -101,7 +101,7 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 - 没有添加 Socks5/HTTP 出站时，脚本自动使用 sing-box 内置的 `wireguard-out`。
 - 已添加其他代理时，菜单仍会把“内置 WARP”列为第一个选项，也可以选择已有代理。
 - 未匹配服务继续使用服务器原 IP，脚本不会安装系统级 WARP、创建系统 WireGuard 网卡或修改宿主机默认路由。
-- 双栈 VPS 检测到可用原生 IPv6 时，所选服务的 IPv4 使用 WARP、IPv6 保持直连，避免部分 WARP 配置的 IPv6 路径超时；没有原生 IPv6 的单栈/NAT VPS 不添加该直连回退。
+- 所选服务的 IPv4/IPv6 均使用选定出站；选择 `wireguard-out` 时，其 A/AAAA 流量都走内置 WARP，未选服务继续使用服务器原 IP。
 - 首次启用内置 WARP 时，脚本在本机生成密钥并直接向 Cloudflare 注册免费设备（即接受 Cloudflare WARP 服务条款）；私钥与账户信息只以 `600` 权限保存在 `/etc/sing-box/conf/warp/`，不会使用所有 VPS 共用的公开身份。旧共享身份会在下次设置分流时自动迁移。
 - 内置 WARP peer 每 25 秒发送持久保活，避免空闲后 UDP/NAT 映射失效；NAT 机不需要增加入站映射，但服务商必须允许 VPS 向 Cloudflare WARP endpoint 发起出站 UDP 连接。
 

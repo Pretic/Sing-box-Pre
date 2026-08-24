@@ -13156,14 +13156,8 @@ add_rule_menu() {
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
-    local ipv6_direct_fallback=false
-    if [ "$selected_out" = "wireguard-out" ] && native_ipv6_available; then
-        ipv6_direct_fallback=true
-        yellow "检测到原生 IPv6：该服务 IPv6 直连，IPv4 使用 WARP，避免 WARP IPv6 不可用。"
-    fi
-
-    if add_service_route "$rule_tag" "$selected_out" "$ipv6_direct_fallback"; then
-        green "'${rule_tag}' 已分流至出站 '${selected_out}'"
+    if add_service_route "$rule_tag" "$selected_out"; then
+        green "'${rule_tag}' 的 IPv4/IPv6 已分流至出站 '${selected_out}'"
     else
         red "'${rule_tag}' 分流设置失败，原配置已保留。"
     fi

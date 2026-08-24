@@ -35,7 +35,17 @@ done
 
 warp_block=$(sed -n '/^extract_warp_endpoint() {/,/^warp_manage() {/p' "$script" | sed '$d')
 [[ -n "$warp_block" ]] || fail 'WARP helper block could not be extracted'
+# shellcheck disable=SC1091
 source /dev/stdin <<< "$warp_block"
+
+add_rule_menu_block=$(sed -n '/^add_rule_menu() {/,/^set_global_outbound() {/p' "$script" | sed '$d')
+[[ -n "$add_rule_menu_block" ]] || fail 'WARP rule menu could not be extracted'
+if grep -Fq 'native_ipv6_available' <<< "$add_rule_menu_block"; then
+    fail 'WARP rule menu must not automatically bypass WARP for selected-service IPv6 traffic'
+fi
+if grep -Fq 'ipv6_direct_fallback' <<< "$add_rule_menu_block"; then
+    fail 'WARP rule menu must use the full-route default instead of an automatic IPv6 fallback'
+fi
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 red() { :; }
@@ -64,7 +74,10 @@ reset_fixture() {
     conf_dir="$tmp_root/conf"
     route_file="$conf_dir/route.json"
     outbound_file="$conf_dir/outbounds.json"
+    # Used by functions sourced dynamically from sing-box.sh.
+    # shellcheck disable=SC2034
     work_dir="$tmp_root/work"
+    # shellcheck disable=SC2034
     server_name='sing-box'
     MOCK_VALIDATE_STATUS=0
     MOCK_RESTART_STATUS=0
@@ -152,11 +165,21 @@ jq -e '.endpoints | any(
 )' "$conf_dir/endpoints.json" >/dev/null || \
     fail 'legacy shared WARP identity was not migrated to persisted unique state'
 
+add_service_route google wireguard-out
+[[ "$(jq '[.route.rules[] | select(.rule_set? | index("google"))] | length' "$route_file")" -eq 1 ]] || \
+    fail 'default WARP service route should have one rule covering both address families'
+jq -e '.route.rules | any(
+    (.rule_set? | index("google")) and
+    .outbound == "wireguard-out" and
+    (.ip_version? == null)
+)' "$route_file" >/dev/null || \
+    fail 'default WARP service route did not send IPv4 and IPv6 to wireguard-out'
+
 add_service_route google wireguard-out true
 [[ "$(jq -r '.route.rules[0].action' "$route_file")" == sniff ]] || \
     fail 'sniff rule is not first'
 [[ "$(jq '[.route.rules[] | select(.rule_set? | index("google"))] | length' "$route_file")" -eq 2 ]] || \
-    fail 'dual-stack WARP service should have IPv6 direct and WARP rules'
+    fail 'explicit IPv6 fallback should retain IPv6 direct and WARP rules'
 direct_index=$(jq '[.route.rules | to_entries[] | select(.value.rule_set? | index("google")) | select(.value.ip_version == 6 and .value.outbound == "direct") | .key][0]' "$route_file")
 warp_index=$(jq '[.route.rules | to_entries[] | select(.value.rule_set? | index("google")) | select((.value.ip_version? // 0) != 6 and .value.outbound == "wireguard-out") | .key][0]' "$route_file")
 [[ "$direct_index" != null && "$warp_index" != null && "$direct_index" -lt "$warp_index" ]] || \
@@ -174,9 +197,9 @@ jq -e '.route.rules | any(.domain_suffix == ["example.com"])' "$route_file" >/de
 
 add_service_route youtube wireguard-out false
 [[ "$(jq '[.route.rules[] | select(.rule_set? | index("youtube"))] | length' "$route_file")" -eq 1 ]] || \
-    fail 'single-stack WARP service should have one WARP rule'
+    fail 'explicit full-route service should have one WARP rule'
 jq -e '.route.rules | any((.rule_set? | index("youtube")) and .outbound == "wireguard-out")' "$route_file" >/dev/null || \
-    fail 'single-stack WARP service did not select wireguard-out'
+    fail 'explicit full-route service did not select wireguard-out'
 
 set_global_route custom-proxy
 [[ "$(jq -r '.route.final' "$route_file")" == custom-proxy ]] || \
@@ -191,6 +214,14 @@ restore_direct_route
 [[ "$(jq -r '.route.final' "$route_file")" == direct ]] || \
     fail 'direct route was not restored explicitly'
 [[ -s "$conf_dir/endpoints.json" ]] || fail 'direct restore deleted endpoints.json'
+
+add_service_route gemini wireguard-out
+[[ "$(jq -r '.route.final' "$route_file")" == direct ]] || \
+    fail 'selective WARP routing changed the fallback for unselected services'
+jq -e '.route.rules | any((.rule_set? | index("gemini")) and .outbound == "wireguard-out")' "$route_file" >/dev/null || \
+    fail 'selected service was not routed through WARP after direct restore'
+jq -e '.route.rules | all((.rule_set? | index("netflix")) | not)' "$route_file" >/dev/null || \
+    fail 'an unselected service unexpectedly gained a WARP route'
 
 reset_fixture
 write_custom_fixture
@@ -235,7 +266,7 @@ grep -Fq '内置 WARP 出站:' "$script" || \
 if grep -Fq 'YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=' "$script"; then
     fail 'legacy shared WARP private key is still embedded in the public script'
 fi
-if grep -Fq 'rm -rf ${route_file} ${conf_dir}/endpoints.json' "$script"; then
+if grep -Fq "rm -rf \${route_file} \${conf_dir}/endpoints.json" "$script"; then
     fail 'global proxy still deletes route and endpoint files'
 fi
 
