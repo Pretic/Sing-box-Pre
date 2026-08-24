@@ -89,6 +89,7 @@ package_is_installed() { [[ "$1" == nginx ]]; }
 managed_service_process_is_running() { return 1; }
 detect_usable_init_system() { return 1; }
 remove_hy2_port_hopping() { printf '%s\n' base-hy2 >> "$uninstall_log"; }
+remove_owned_firewall_rules() { printf '%s\n' base-firewall >> "$uninstall_log"; }
 remove_managed_nginx_include() { printf '%s\n' base-nginx-config >> "$uninstall_log"; }
 remove_managed_singbox_link() { printf '%s\n' base-links >> "$uninstall_log"; }
 purge_nginx_package() { printf '%s\n' package-purge >> "$uninstall_log"; return 1; }
@@ -104,7 +105,7 @@ set -e
 [[ ! -e "${ROOT}/etc/nginx/conf.d/sing-box.conf" ]] || \
     fail 'managed Nginx configuration survived base uninstall commit'
 [[ "$(tr '\n' ' ' < "$uninstall_log")" == \
-   'base-hy2 base-nginx-config base-links package-purge ' ]] || \
+   'base-hy2 base-firewall base-nginx-config base-links package-purge ' ]] || \
     fail "package purge did not run after base commit: $(tr '\n' ' ' < "$uninstall_log")"
 shopt -s nullglob
 recoveries=("${ROOT}/var/lib/sing-box-uninstall"/.uninstall-recovery.*)

@@ -7087,6 +7087,9 @@ perform_singbox_uninstall() {
         target_work_dir="$work_dir"
     fi
     [ -n "$target_work_dir" ] && [ "$target_work_dir" != / ] || return 1
+    local HY2_NAT_STATE_FILE="${target_work_dir}/hy2-nat.state"
+    local FIREWALL_STATE_FILE="${target_work_dir}/firewall.state"
+    local FIREWALL_LOCK_FILE="${target_work_dir}/.firewall.lock"
     if [ "$purge_nginx" -eq 1 ]; then
         if declare -F package_is_installed >/dev/null 2>&1; then
             if package_is_installed nginx; then
@@ -7411,11 +7414,54 @@ perform_singbox_uninstall() {
         chmod 600 "${recovery_dir}/recovery.conf" 2>/dev/null || true
     }
 
+    _restore_uninstall_firewall_state() {
+        local snapshot_state="${transaction_dir}/workdir/firewall.state"
+        local record backend family live_status restore_status=0
+        local FIREWALL_STATE_FILE="$snapshot_state"
+        local -a restore_records=() raw_families=()
+
+        [ -s "$snapshot_state" ] || return 0
+        declare -F read_firewall_state >/dev/null 2>&1 && \
+            declare -F firewall_record_is_live >/dev/null 2>&1 && \
+            declare -F add_firewall_record >/dev/null 2>&1 && \
+            declare -F persist_raw_firewall_rules >/dev/null 2>&1 && \
+            declare -F acquire_firewall_lock >/dev/null 2>&1 && \
+            declare -F release_firewall_lock >/dev/null 2>&1 || return 1
+        read_firewall_state || return 1
+        restore_records=("${FIREWALL_STATE_RECORDS[@]}")
+        acquire_firewall_lock || return 1
+        for record in "${restore_records[@]}"; do
+            backend="${record%%|*}"
+            if [ "$backend" = iptables ]; then
+                IFS='|' read -r _ family _ _ _ <<< "$record"
+                case " ${raw_families[*]} " in
+                    *" ${family} "*) ;;
+                    *) raw_families+=("$family") ;;
+                esac
+            fi
+            if firewall_record_is_live "$record"; then
+                live_status=0
+            else
+                live_status=$?
+            fi
+            case "$live_status" in
+                0) continue ;;
+                1) add_firewall_record "$record" || { restore_status=1; break; } ;;
+                *) restore_status=1; break ;;
+            esac
+        done
+        if [ "$restore_status" -eq 0 ] && [ "${#raw_families[@]}" -gt 0 ]; then
+            persist_raw_firewall_rules "${raw_families[@]}" || restore_status=1
+        fi
+        release_firewall_lock
+        return "$restore_status"
+    }
+
     _rollback_uninstall_transaction() {
         local rollback_uncertain="${1:-0}"
         local rollback_reason="$2"
-        local rollback_index
-        local -a rollback_nat_records=()
+        local rollback_index record family
+        local -a rollback_nat_records=() rollback_nat_families=()
 
         rollback_ok=1
         for ((rollback_index=0; rollback_index<${#snapshot_paths[@]}; rollback_index++)); do
@@ -7428,14 +7474,22 @@ perform_singbox_uninstall() {
         if [ -s "$old_nat_state" ]; then
             if declare -F restore_hy2_nat_records >/dev/null 2>&1 && \
                declare -F persist_hy2_nat_rules >/dev/null 2>&1 && \
-               mapfile -t rollback_nat_records < "$old_nat_state" && \
-               restore_hy2_nat_records "${rollback_nat_records[@]}" && \
-               persist_hy2_nat_rules; then
-                :
+               mapfile -t rollback_nat_records < "$old_nat_state"; then
+                for record in "${rollback_nat_records[@]}"; do
+                    family="${record%%|*}"
+                    case " ${rollback_nat_families[*]} " in
+                        *" ${family} "*) ;;
+                        *) rollback_nat_families+=("$family") ;;
+                    esac
+                done
+                restore_hy2_nat_records "${rollback_nat_records[@]}" || rollback_ok=0
+                persist_hy2_nat_rules "${rollback_nat_families[@]}" || rollback_ok=0
             else
                 rollback_ok=0
             fi
         fi
+
+        _restore_uninstall_firewall_state || rollback_ok=0
 
         if [ "$definitions_present" -eq 1 ] && [ "$init_system" = systemd ]; then
             systemctl daemon-reload >/dev/null 2>&1 || rollback_ok=0
@@ -7446,8 +7500,9 @@ perform_singbox_uninstall() {
                 rollback_ok=0
             fi
         fi
-        _restore_uninstall_services || rollback_ok=0
-
+        if [ "$rollback_ok" -eq 1 ] && [ "$rollback_uncertain" -eq 0 ]; then
+            _restore_uninstall_services || rollback_ok=0
+        fi
         if [ "$rollback_ok" -eq 1 ] && [ "$rollback_uncertain" -eq 0 ]; then
             _cleanup_uninstall_transaction >/dev/null 2>&1 || true
             red "${rollback_reason}；原安装与服务状态已恢复。"
@@ -7559,6 +7614,13 @@ perform_singbox_uninstall() {
         _rollback_uninstall_transaction "$transaction_uncertain" "HY2 端口跳跃规则清理失败"
         return $?
     fi
+    transaction_failed=0
+    remove_owned_firewall_rules || transaction_failed=$?
+    if [ "$transaction_failed" -ne 0 ]; then
+        [ "$transaction_failed" -eq 2 ] && transaction_uncertain=1
+        _rollback_uninstall_transaction "$transaction_uncertain" "防火墙所有权规则清理失败"
+        return $?
+    fi
 
     [ -e "$nginx_conf" ] && nginx_conf_existed=1
     if ! remove_managed_nginx_include "$nginx_main" "$nginx_conf_dir"; then
@@ -7633,45 +7695,26 @@ perform_singbox_uninstall() {
 # 卸载 sing-box（交互式）
 uninstall_singbox() {
     local uninstall_root="${1:-}"
-    local purge_choice=0
+    local purge_choice=0 uninstall_status
 
     reading "确定要卸载 sing-box 吗? (y/n): " choice
     case "${choice}" in
         y|Y)
             yellow "正在卸载 sing-box"
-            if ! remove_hy2_port_hopping; then
-                red "Hysteria2 端口跳跃状态无法安全清理，卸载已中止。"
-                return 1
-            fi
-            if ! remove_owned_firewall_rules; then
-                red "防火墙所有权状态无法安全清理，卸载已中止。"
-                return 1
-            fi
-            if command_exists rc-service; then
-                rc-service sing-box stop; rc-service argo stop
-                rm -f "${uninstall_root}/etc/init.d/sing-box" \
-                      "${uninstall_root}/etc/init.d/argo"
-                rc-update del sing-box default; rc-update del argo default
-            else
-                systemctl stop "${server_name}"; systemctl stop argo
-                systemctl disable "${server_name}"; systemctl disable argo
-                systemctl daemon-reload || true
-            fi
-            rm -rf "${work_dir}" || true
-            remove_managed_singbox_link "$uninstall_root"
-            rm -f "${uninstall_root}/etc/systemd/system/sing-box.service" \
-                  "${uninstall_root}/etc/systemd/system/argo.service"
-            rm -f "${uninstall_root}/etc/nginx/conf.d/sing-box.conf"
-
             reading "\n是否卸载 Nginx？${green}(卸载请输入 ${yellow}y${re} ${green}回车将跳过卸载Nginx) (y/n): ${re}" choice
             case "${choice}" in
                 y|Y) purge_choice=1 ;;
                 *)   yellow "取消卸载Nginx\n\n" ;;
             esac
-            perform_singbox_uninstall "$uninstall_root" "$purge_choice" || return 1
-            green "\nsing-box 卸载成功\n\n" && exit 0
+            if perform_singbox_uninstall "$uninstall_root" "$purge_choice"; then
+                uninstall_status=0
+            else
+                uninstall_status=$?
+            fi
+            [ "$uninstall_status" -eq 0 ] && green "\nsing-box 卸载成功\n\n"
+            return "$uninstall_status"
             ;;
-        *) purple "已取消卸载操作\n\n" ;;
+        *) purple "已取消卸载操作\n\n"; return 0 ;;
     esac
 }
 
@@ -8124,62 +8167,24 @@ interactive_install() {
 }
 
 # Non-interactive uninstall (-u); keeps nginx unless PURGE_NGINX=1 or --purge-nginx is used.
+# shellcheck disable=SC2120  # Isolated-root tests pass $1; production CLI does not.
 auto_uninstall() {
-    local uninstall_root="${1:-}"
+    local uninstall_root="${1:-}" uninstall_status
 
     green "Starting non-interactive sing-box uninstall..."
-    perform_singbox_uninstall "$uninstall_root" "${PURGE_NGINX:-0}" || return 1
-
-    if ! remove_hy2_port_hopping; then
-        red "Unable to safely clean Hysteria2 port-hopping rules; uninstall aborted."
-        return 1
-    fi
-    if ! remove_owned_firewall_rules; then
-        red "Unable to safely clean owned firewall rules; uninstall aborted."
-        return 1
-    fi
-
-    if command_exists rc-service; then
-        rc-service sing-box stop  > /dev/null 2>&1
-        rc-service argo stop      > /dev/null 2>&1
-        rc-update del sing-box default > /dev/null 2>&1
-        rc-update del argo default     > /dev/null 2>&1
-        rm -f "${uninstall_root}/etc/init.d/sing-box" "${uninstall_root}/etc/init.d/argo"
-    elif command_exists systemctl; then
-        systemctl stop    sing-box > /dev/null 2>&1
-        systemctl stop    argo     > /dev/null 2>&1
-        systemctl disable sing-box > /dev/null 2>&1
-        systemctl disable argo     > /dev/null 2>&1
-        systemctl daemon-reload    > /dev/null 2>&1
-        rm -f "${uninstall_root}/etc/systemd/system/sing-box.service" \
-              "${uninstall_root}/etc/systemd/system/argo.service"
-    fi
-
-    rm -rf "${work_dir}"
-    remove_managed_singbox_link "$uninstall_root"
-
-    rm -f "${uninstall_root}/etc/nginx/conf.d/sing-box.conf"
-    [ -f "${uninstall_root}/etc/nginx/nginx.conf.bak.sb" ] && \
-        mv "${uninstall_root}/etc/nginx/nginx.conf.bak.sb" \
-           "${uninstall_root}/etc/nginx/nginx.conf" > /dev/null 2>&1
-
-    if [ "${PURGE_NGINX}" = "1" ]; then
-        if command_exists nginx; then
-            if command_exists rc-service; then
-                rc-service nginx stop   > /dev/null 2>&1
-                rc-update del nginx default > /dev/null 2>&1
-            elif command_exists systemctl; then
-                systemctl stop    nginx > /dev/null 2>&1
-                systemctl disable nginx > /dev/null 2>&1
-            fi
-            purge_nginx_package
-        else
-            yellow "nginx is not installed; skipping nginx purge."
-        fi
-        green "\nsing-box and nginx have been purged.\n"
+    if perform_singbox_uninstall "$uninstall_root" "${PURGE_NGINX:-0}"; then
+        uninstall_status=0
     else
-        green "\nsing-box uninstalled; nginx retained. Use --purge-nginx to remove nginx too.\n"
+        uninstall_status=$?
     fi
+    if [ "$uninstall_status" -eq 0 ]; then
+        if [ "${PURGE_NGINX:-0}" = 1 ]; then
+            green "\nsing-box and nginx have been purged.\n"
+        else
+            green "\nsing-box uninstalled; nginx retained. Use --purge-nginx to remove nginx too.\n"
+        fi
+    fi
+    return "$uninstall_status"
 }
 report_node_change_transaction_result() {
     local transaction_status="${1:-2}"

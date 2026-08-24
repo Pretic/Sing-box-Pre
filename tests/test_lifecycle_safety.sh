@@ -82,6 +82,7 @@ systemctl() {
 }
 command_exists() { [[ "$1" == systemctl ]]; }
 remove_hy2_port_hopping() { printf '%s\n' hy2-clean >> "$uninstall_log"; }
+remove_owned_firewall_rules() { printf '%s\n' firewall-clean >> "$uninstall_log"; }
 remove_managed_nginx_include() { printf '%s\n' nginx-main-clean >> "$uninstall_log"; }
 remove_managed_singbox_link() { printf '%s\n' links-clean >> "$uninstall_log"; }
 restart_nginx() { printf '%s\n' nginx-reload >> "$uninstall_log"; }

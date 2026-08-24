@@ -19,6 +19,7 @@ source <(printf '%s\n' "$function_source")
 work_dir=/etc/sing-box
 uninstall_log="${tmp_dir}/uninstall.log"
 remove_hy2_port_hopping() { printf '%s\n' hy2-clean >> "$uninstall_log"; }
+remove_owned_firewall_rules() { printf '%s\n' firewall-clean >> "$uninstall_log"; }
 remove_managed_nginx_include() { printf '%s\n' nginx-clean >> "$uninstall_log"; }
 remove_managed_singbox_link() { printf '%s\n' links-clean >> "$uninstall_log"; }
 purge_nginx_package() { printf '%s\n' nginx-purge >> "$uninstall_log"; }

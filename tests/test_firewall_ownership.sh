@@ -1054,16 +1054,22 @@ MOCK_UFW_ACTIVE=0
 assert_fail remove_owned_firewall_rules
 [ "$(cat "$FIREWALL_STATE_FILE")" = "$state_before" ] || fail 'state was deleted while its backend was unavailable'
 
-# Both uninstall paths must attempt owned-rule cleanup before deleting work_dir.
+# The shared transaction must clean HY2 then owned firewall state before the
+# workdir, while public entry points delegate instead of mutating directly.
+uninstall_source="$(extract_function perform_singbox_uninstall)"
+hy2_cleanup_line="$(grep -n 'remove_hy2_port_hopping' <<< "$uninstall_source" | head -1 | cut -d: -f1 || true)"
+cleanup_line="$(grep -n 'remove_owned_firewall_rules' <<< "$uninstall_source" | head -1 | cut -d: -f1 || true)"
+delete_line="$(grep -n 'rm -rf.*target_work_dir' <<< "$uninstall_source" | head -1 | cut -d: -f1 || true)"
+[ -n "$hy2_cleanup_line" ] && [ -n "$cleanup_line" ] && [ -n "$delete_line" ] || \
+    fail 'shared uninstall transaction is not wired to HY2/firewall cleanup'
+[ "$hy2_cleanup_line" -lt "$cleanup_line" ] || fail 'shared uninstall cleans firewall before HY2 NAT'
+[ "$cleanup_line" -lt "$delete_line" ] || fail 'shared uninstall deletes ownership state before cleanup'
 for uninstall_name in uninstall_singbox auto_uninstall; do
     uninstall_source="$(extract_function "$uninstall_name")"
-    hy2_cleanup_line="$(grep -n 'remove_hy2_port_hopping' <<< "$uninstall_source" | head -1 | cut -d: -f1 || true)"
-    cleanup_line="$(grep -n 'remove_owned_firewall_rules' <<< "$uninstall_source" | head -1 | cut -d: -f1 || true)"
-    delete_line="$(grep -n 'rm -rf.*work_dir' <<< "$uninstall_source" | head -1 | cut -d: -f1 || true)"
-    [ -n "$hy2_cleanup_line" ] && [ -n "$cleanup_line" ] && [ -n "$delete_line" ] || \
-        fail "${uninstall_name} is not wired to HY2/firewall cleanup"
-    [ "$hy2_cleanup_line" -lt "$cleanup_line" ] || fail "${uninstall_name} cleans firewall before HY2 NAT"
-    [ "$cleanup_line" -lt "$delete_line" ] || fail "${uninstall_name} deletes ownership state before cleanup"
+    grep -q 'perform_singbox_uninstall' <<< "$uninstall_source" || \
+        fail "${uninstall_name} does not delegate to the shared transaction"
+    ! grep -q 'remove_owned_firewall_rules\|remove_hy2_port_hopping' <<< "$uninstall_source" || \
+        fail "${uninstall_name} bypasses the shared network transaction"
 done
 
 # Reality port helpers select VLESS inbounds by the vless-reality tag family,

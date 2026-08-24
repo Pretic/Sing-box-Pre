@@ -32,6 +32,9 @@ purge_nginx_package() { return 0; }
 FAIL_STAGE=''
 FAIL_ONCE=0
 DAEMON_RELOADS=0
+FIREWALL_REMOVALS=0
+FIREWALL_RESTORES=0
+FIREWALL_PERSISTS=0
 
 systemctl() {
     case "$1 ${2:-} ${3:-}" in
@@ -64,7 +67,37 @@ remove_hy2_port_hopping() {
         *) return 0 ;;
     esac
 }
-remove_managed_nginx_include() { [[ "$FAIL_STAGE" != nginx-config ]]; }
+remove_owned_firewall_rules() {
+    FIREWALL_REMOVALS=$((FIREWALL_REMOVALS + 1))
+    rm -f "${ROOT}/firewall-live/owned"
+    case "$FAIL_STAGE" in
+        firewall-full) return 1 ;;
+        firewall-uncertain) return 2 ;;
+        *) return 0 ;;
+    esac
+}
+acquire_firewall_lock() { return 0; }
+release_firewall_lock() { return 0; }
+read_firewall_state() {
+    mapfile -t FIREWALL_STATE_RECORDS < <(tail -n +2 "$FIREWALL_STATE_FILE")
+}
+firewall_record_is_live() {
+    [[ -e "${ROOT}/firewall-live/owned" ]]
+}
+add_firewall_record() {
+    FIREWALL_RESTORES=$((FIREWALL_RESTORES + 1))
+    [[ "$FAIL_STAGE" != firewall-restore ]] || return 1
+    : > "${ROOT}/firewall-live/owned"
+}
+persist_raw_firewall_rules() {
+    FIREWALL_PERSISTS=$((FIREWALL_PERSISTS + 1))
+    return 0
+}
+restore_hy2_nat_records() { return 0; }
+persist_hy2_nat_rules() { return 0; }
+remove_managed_nginx_include() {
+    [[ "$FAIL_STAGE" != nginx-config && "$FAIL_STAGE" != firewall-restore ]]
+}
 remove_managed_singbox_link() { [[ "$FAIL_STAGE" != links ]]; }
 nginx() {
     if [[ "$FAIL_STAGE" == nginx-reload && "$FAIL_ONCE" -eq 0 ]]; then
@@ -108,6 +141,11 @@ setup_case() {
     printf '%s\n' sing-unit > "${ROOT}/etc/systemd/system/sing-box.service"
     printf '%s\n' argo-unit > "${ROOT}/etc/systemd/system/argo.service"
     printf '%s\n' runtime > "${ROOT}/etc/sing-box/runtime.state"
+    printf '%s\n' version=1 'iptables|4|sing-box-managed|443|tcp' \
+        > "${ROOT}/etc/sing-box/firewall.state"
+    mkdir -p "${ROOT}/firewall-live"
+    : > "${ROOT}/firewall-live/owned"
+    : > "${ROOT}/firewall-live/external"
     printf '%s\n' 'server {}' > "${ROOT}/etc/nginx/conf.d/sing-box.conf"
     SING_ACTIVE=1
     ARGO_ACTIVE=1
@@ -115,6 +153,9 @@ setup_case() {
     ARGO_ENABLED=1
     FAIL_ONCE=0
     DAEMON_RELOADS=0
+    FIREWALL_REMOVALS=0
+    FIREWALL_RESTORES=0
+    FIREWALL_PERSISTS=0
 }
 
 assert_full_rollback() {
@@ -135,21 +176,49 @@ assert_full_rollback() {
     [[ -f "${ROOT}/etc/systemd/system/sing-box.service" && \
        -f "${ROOT}/etc/systemd/system/argo.service" ]] || fail "${stage} did not restore units"
     [[ -f "${ROOT}/etc/nginx/conf.d/sing-box.conf" ]] || fail "${stage} did not restore Nginx config"
+    [[ -e "${ROOT}/firewall-live/owned" ]] || fail "${stage} did not restore its owned firewall rule"
+    [[ -e "${ROOT}/firewall-live/external" ]] || fail "${stage} touched an external firewall rule"
 }
 
-for stage in snapshot hy2-full nginx-config nginx-reload daemon-reload links workdir; do
+for stage in snapshot hy2-full firewall-full nginx-config nginx-reload daemon-reload links workdir; do
     assert_full_rollback "$stage"
 done
+
+# Network ownership is cleaned inside the transaction, after service quiesce,
+# and a later failure restores both live/persistent firewall ownership without
+# touching external rules.
+setup_case network-cross-domain
+FAIL_STAGE=nginx-config
+set +e
+perform_singbox_uninstall "$ROOT" 0 >/dev/null 2>&1
+status=$?
+set -e
+[[ "$status" -eq 1 ]] || fail "cross-domain rollback returned ${status} instead of rc1"
+[[ "$FIREWALL_REMOVALS" -eq 1 ]] || fail 'owned firewall cleanup was not delegated exactly once'
+[[ "$FIREWALL_RESTORES" -eq 1 && "$FIREWALL_PERSISTS" -eq 1 ]] || \
+    fail 'owned firewall live/persistent state was not restored'
+[[ -e "${ROOT}/firewall-live/external" ]] || fail 'cross-domain rollback touched an external rule'
+
+setup_case successful-network-cleanup
+FAIL_STAGE=''
+perform_singbox_uninstall "$ROOT" 0 >/dev/null 2>&1 || fail 'successful network uninstall failed'
+[[ ! -e "${ROOT}/firewall-live/owned" ]] || fail 'successful uninstall retained an owned firewall rule'
+[[ -e "${ROOT}/firewall-live/external" ]] || fail 'successful uninstall removed an external firewall rule'
+[[ "$FIREWALL_REMOVALS" -eq 1 ]] || fail 'successful uninstall cleaned firewall ownership more than once'
 
 # A lower layer that already reports incomplete firewall recovery forces rc2
 # even when filesystem and service restoration succeeds.
 setup_case hy2-uncertain
 FAIL_STAGE=hy2-uncertain
 set +e
-recovery_output="$(perform_singbox_uninstall "$ROOT" 0 2>&1)"
+perform_singbox_uninstall "$ROOT" 0 >"${ROOT}/recovery-output" 2>&1
 status=$?
 set -e
+recovery_output="$(cat "${ROOT}/recovery-output")"
 [[ "$status" -eq 2 ]] || fail "uncertain HY2 cleanup returned ${status} instead of rc2"
+[[ "$SING_ACTIVE" -eq 0 && "$ARGO_ACTIVE" -eq 0 && \
+   "$SING_ENABLED" -eq 0 && "$ARGO_ENABLED" -eq 0 ]] || \
+    fail 'rc2 recovery restarted services despite uncertain network state'
 shopt -s nullglob
 recoveries=("${ROOT}/var/lib/sing-box-uninstall"/.uninstall-recovery.*)
 [[ "${#recoveries[@]}" -eq 1 ]] || fail 'uncertain HY2 cleanup did not retain one recovery snapshot'
@@ -159,5 +228,22 @@ recoveries=("${ROOT}/var/lib/sing-box-uninstall"/.uninstall-recovery.*)
     fail 'retained uninstall recovery metadata is missing or not 0600'
 [[ "$recovery_output" == *'自动回滚不完整'*"${recoveries[0]}"* ]] || \
     fail 'uncertain HY2 cleanup did not report recovery path'
+
+# A firewall restore failure is also rc2, retains secure recovery evidence,
+# and leaves both services quiesced.
+setup_case firewall-restore
+FAIL_STAGE=firewall-restore
+set +e
+perform_singbox_uninstall "$ROOT" 0 >/dev/null 2>&1
+status=$?
+set -e
+[[ "$status" -eq 2 ]] || fail "firewall restore failure returned ${status} instead of rc2"
+recoveries=("${ROOT}/var/lib/sing-box-uninstall"/.uninstall-recovery.*)
+[[ "${#recoveries[@]}" -eq 1 ]] || fail 'firewall restore failure did not retain recovery evidence'
+[[ "$(stat -c '%a' "${recoveries[0]}")" == 700 ]] || fail 'firewall recovery directory is not 0700'
+[[ "$(stat -c '%a' "${recoveries[0]}/recovery.conf")" == 600 ]] || fail 'firewall recovery metadata is not 0600'
+[[ "$SING_ACTIVE" -eq 0 && "$ARGO_ACTIVE" -eq 0 && \
+   "$SING_ENABLED" -eq 0 && "$ARGO_ENABLED" -eq 0 ]] || \
+    fail 'firewall rc2 recovery restarted services'
 
 printf 'Post-quiesce uninstall transaction tests passed.\n'

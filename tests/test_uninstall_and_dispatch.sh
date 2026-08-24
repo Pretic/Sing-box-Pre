@@ -315,6 +315,49 @@ manage_argo "$quick_service"
 assert_equal $'restart\nparse\nchange' "$(cat "$refresh_log")" \
     'manage_argo quick Tunnel call sequence'
 
+# Every public uninstaller must delegate exactly once to the shared transaction
+# and preserve its four documented outcomes without pre/post mutation.
+perform_calls="${tmp_dir}/perform-calls"
+perform_singbox_uninstall() {
+    printf '%s|%s\n' "${1:-}" "${2:-0}" >> "$perform_calls"
+    return "${PERFORM_STATUS:-0}"
+}
+reading() {
+    if [[ "$1" == *'确定要卸载'* ]]; then
+        printf -v "$2" y
+    else
+        printf -v "$2" n
+    fi
+}
+
+for PERFORM_STATUS in 0 1 2 3; do
+    : > "$perform_calls"
+    set +e
+    auto_uninstall /fixture >/dev/null 2>&1
+    actual=$?
+    set -e
+    assert_equal "$PERFORM_STATUS" "$actual" "auto uninstall rc${PERFORM_STATUS} propagation"
+    assert_equal 1 "$(wc -l < "$perform_calls" | tr -d ' ')" \
+        "auto uninstall rc${PERFORM_STATUS} delegation count"
+
+    : > "$perform_calls"
+    set +e
+    (uninstall_singbox /fixture >/dev/null 2>&1)
+    actual=$?
+    set -e
+    assert_equal "$PERFORM_STATUS" "$actual" "interactive uninstall rc${PERFORM_STATUS} propagation"
+    assert_equal 1 "$(wc -l < "$perform_calls" | tr -d ' ')" \
+        "interactive uninstall rc${PERFORM_STATUS} delegation count"
+done
+
+for entrypoint in auto_uninstall uninstall_singbox; do
+    entry_source="$(extract_function "$entrypoint")"
+    [[ "$entry_source" != *'remove_hy2_port_hopping'* ]] || \
+        fail "${entrypoint} bypasses the shared HY2 transaction"
+    [[ "$entry_source" != *'remove_owned_firewall_rules'* ]] || \
+        fail "${entrypoint} bypasses the shared firewall transaction"
+done
+
 # Every CLI alias must return the status from the action it dispatches. Unique
 # mock statuses prove both handler selection and exact propagation.
 auto_install() { return 41; }
