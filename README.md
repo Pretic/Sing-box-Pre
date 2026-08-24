@@ -110,7 +110,7 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 `WARP分流管理` 还提供三个内置身份操作：
 
 - `查看内置 WARP 状态及解锁情况`：脱敏显示设备 ID、出口 IP、地区、Cloudflare 机房及 Netflix、Disney+、ChatGPT、Gemini 检测结果，不显示令牌、私钥、client ID 或 reserved bytes。
-- `更换内置 WARP 身份/IP`：注册并验证一个新身份后事务替换；Cloudflare 可能仍分配相同出口 IP，菜单会明确提示。
+- `更换内置 WARP 身份/IP`：最多尝试 5 个候选，只有验证在线且出口 IP 确实变化后才事务替换；候选重复或失败时保留原身份。
 - `自动优选 WARP IP（多平台解锁）`：用户可多选上述四个平台，默认全选；候选必须满足 WARP 在线、出口 IP 已改变且所选项目全部通过。最多尝试 5 个候选，失败时保留原身份，不会无限注册或留下后台进程。
 
 首页的 `WARP 状态` 指 sing-box 内置端点而非系统网卡：`running` 表示最近探测正常，`not configured` 表示尚未初始化，`degraded` 表示端点存在但最近探测失败。状态结果短暂缓存，避免每次重绘菜单都重复测速。上述操作只启动临时的 localhost 探测代理，不安装系统 WARP、Cloudflare Client、WireProxy、定时任务或守护进程；公网 IP 和地区由 Cloudflare Anycast 调度，脚本无法保证得到指定国家或指定 IP。
@@ -122,6 +122,7 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 - `/etc/sing-box/url.txt` 保留基础节点明文，`/etc/sing-box/base-sub.txt` 保留基础节点 Base64 订阅。
 - 基础节点默认包含 `vless-reality-ipv4`；如果 VPS 检测到 IPv6，会额外输出 `vless-reality-ipv6`。固定隧道同时输出以 `ARGO_DOMAIN` 连接的稳定 Argo 节点，以及以 `CFIP` 连接、后缀为 `argo-preferred` 的优选 Argo 节点；两者地址相同时自动去重。临时隧道仍只输出一个 Argo 节点。
 - `/etc/sing-box/cfy-url.txt` 保存 cfy 最近一次优选结果；`/etc/sing-box/all-url.txt` 合并基础节点和 cfy 优选节点。
+- cfy 会用 `/etc/sing-box/cfy-source.generation` 将优选结果绑定到生成时的基础订阅；基础节点、UUID、Argo 域名或入口发生变化后，旧优选结果会自动退出公开订阅，重新运行 cfy 后再安全并入。Sing-box 只读取、不会改写这两个 cfy-owned 文件。
 - Nginx 对外仍服务 `/etc/sing-box/sub.txt`，该文件由 `/etc/sing-box/all-sub.txt` 同步而来；未运行 cfy 时等同基础订阅，运行 cfy 后会包含优选节点。
 
 查看当前节点与订阅信息：
@@ -174,7 +175,7 @@ HTTPS 只有在脚本从公网取得的内容与本机 `/etc/sing-box/sub.txt` �
 - `关闭节点订阅` 会停止 Nginx，因此 HTTP 和经 Tunnel 回源的 HTTPS 都会停止。
 - `关闭 Cloudflare HTTPS 订阅` 只移除 HTTPS 路由和首选状态，保留 HTTP 订阅与节点。
 - `重新生成订阅密钥` 会同步更新 Nginx 与 Tunnel 路由，旧 HTTP/HTTPS 地址随即失效，需要在客户端更新订阅。
-- 首页继续只显示简洁的 Argo、Nginx、sing-box 状态；完整 URL、Tunnel 类型和验证时间在“查看订阅链接与详细状态”二级菜单中显示。
+- 首页继续只显示简洁的 Argo、WARP、Nginx、sing-box 状态；完整 URL、Tunnel 类型和验证时间在“查看订阅链接与详细状态”二级菜单中显示。
 
 ## 快捷命令
 
