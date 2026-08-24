@@ -91,14 +91,19 @@ get_latest_argo_domain() {
 }
 sleep() { :; }
 update_sub() {
+    local staged_base_file="${1:-}"
+    local publish_result="$PUBLISH_STATUS"
+
     PUBLISH_CALLS=$((PUBLISH_CALLS + 1))
     printf '%s\n' published > "${work_dir}/base-sub.txt"
     if [ "${PUBLISH_INDEX}" -lt "${#PUBLISH_SEQUENCE[@]}" ]; then
         publish_result="${PUBLISH_SEQUENCE[$PUBLISH_INDEX]}"
         PUBLISH_INDEX=$((PUBLISH_INDEX + 1))
-        return "$publish_result"
     fi
-    return "$PUBLISH_STATUS"
+    if [ "$publish_result" -eq 0 ] && [ -n "$staged_base_file" ]; then
+        cp -p -- "$staged_base_file" "$client_dir" || return 1
+    fi
+    return "$publish_result"
 }
 
 locked_set_quick_port() {

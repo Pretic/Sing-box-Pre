@@ -496,17 +496,19 @@ remove_hy2_port_hopping || fail 'adopted dual-stack expansion fixture cleanup fa
 for helper_name in \
     stage_hy2_client_file \
     restore_hy2_client_snapshot \
-    restore_hy2_subscription_snapshot \
     handle_hy2_menu_transaction_failure \
     enable_hy2_port_hopping_transaction \
     disable_hy2_port_hopping_transaction; do
     declare -F "$helper_name" >/dev/null || fail "$helper_name is not implemented"
 done
+if declare -F restore_hy2_subscription_snapshot >/dev/null || \
+   grep -Fq 'restore_hy2_subscription_snapshot' "$script"; then
+    fail 'HY2 retains the obsolete derived-file snapshot restore path'
+fi
 
 SERVICE_ACTIVE=1
 RESTART_FAILURES=0
 UPDATE_SUB_FAILURES=0
-ATOMIC_CLIENT_FAILURES=0
 RESTART_CALLS=0
 HY2_ERROR_LOG="$tmp_root/hy2-errors.log"
 
@@ -524,23 +526,22 @@ get_uniform_inbound_port() { printf '%s\n' 12443; }
 get_realip() { printf '%s\n' '203.0.113.10'; }
 get_hy2_certificate_fingerprint() { printf '%s\n' 'AA%3ABB%3ACC'; }
 get_hy2_node_label() { printf '%s\n' 'CN-Test_ISP'; }
-atomic_replace_hy2_client() {
-    if [[ "$ATOMIC_CLIENT_FAILURES" -gt 0 ]]; then
-        ATOMIC_CLIENT_FAILURES=$((ATOMIC_CLIENT_FAILURES - 1))
-        return 1
-    fi
-    mv -f -- "$1" "$2"
+with_subscription_lock() {
+    local SUBSCRIPTION_LOCK_HELD=1
+    "$@"
 }
 update_sub() {
+    local staged_file="${1:-$client_dir}"
     printf '%s\n' broken-publication > "$work_dir/base-sub.txt"
     if [[ "$UPDATE_SUB_FAILURES" -gt 0 ]]; then
         UPDATE_SUB_FAILURES=$((UPDATE_SUB_FAILURES - 1))
         return 1
     fi
-    cp -- "$client_dir" "$work_dir/base-sub.txt"
-    cp -- "$client_dir" "$combined_client_dir"
-    cp -- "$client_dir" "$work_dir/all-sub.txt"
-    cp -- "$client_dir" "$work_dir/sub.txt"
+    cp -- "$staged_file" "$client_dir"
+    cp -- "$staged_file" "$work_dir/base-sub.txt"
+    cp -- "$staged_file" "$combined_client_dir"
+    cp -- "$staged_file" "$work_dir/all-sub.txt"
+    cp -- "$staged_file" "$work_dir/sub.txt"
 }
 red() { printf '%s\n' "$*" >> "$HY2_ERROR_LOG"; }
 
@@ -553,14 +554,13 @@ prepare_menu_fixture() {
         'tuic://unchanged' > "$client_dir"
     local path
     for path in "$work_dir/base-sub.txt" "$combined_client_dir" "$work_dir/all-sub.txt" "$work_dir/sub.txt"; do
-        printf 'old:%s\n' "$(basename "$path")" > "$path"
+        cp -- "$client_dir" "$path"
     done
     MENU_NAT_BEFORE=$(firewall_snapshot)
     MENU_OWNER_BEFORE=$(<"$HY2_NAT_STATE_FILE")
     SERVICE_ACTIVE=1
     RESTART_FAILURES=0
     UPDATE_SUB_FAILURES=0
-    ATOMIC_CLIENT_FAILURES=0
     RESTART_CALLS=0
     : > "$HY2_ERROR_LOG"
 }
@@ -571,8 +571,7 @@ assert_menu_fixture_restored() {
     [[ "$(<"$HY2_NAT_STATE_FILE")" == "$MENU_OWNER_BEFORE" ]] || fail "$description did not restore NAT state"
     grep -Fq 'mport=12443,56000-56100' "$client_dir" || fail "$description did not restore client"
     for path in "$work_dir/base-sub.txt" "$combined_client_dir" "$work_dir/all-sub.txt" "$work_dir/sub.txt"; do
-        [[ "$(<"$path")" == "old:$(basename "$path")" ]] || \
-            fail "$description did not restore $(basename "$path")"
+        cmp -s "$client_dir" "$path" || fail "$description did not regenerate $(basename "$path")"
     done
     [[ "$SERVICE_ACTIVE" == 1 ]] || fail "$description did not restore service state"
 }
@@ -592,13 +591,12 @@ prepare_adopted_menu_fixture() {
         'hysteria2://11111111-2222-3333-4444-555555555555@198.51.100.1:12443?peer=www.bing.com&insecure=1#legacy' \
         'tuic://unchanged' > "$client_dir"
     for path in "$work_dir/base-sub.txt" "$combined_client_dir" "$work_dir/all-sub.txt" "$work_dir/sub.txt"; do
-        printf 'legacy:%s\n' "$(basename "$path")" > "$path"
+        cp -- "$client_dir" "$path"
     done
     MENU_NAT_BEFORE=$(firewall_snapshot)
     SERVICE_ACTIVE=1
     RESTART_FAILURES=0
     UPDATE_SUB_FAILURES=0
-    ATOMIC_CLIENT_FAILURES=0
     RESTART_CALLS=0
     : > "$HY2_ERROR_LOG"
 }
@@ -641,10 +639,9 @@ eval "$original_stage_helper"
 assert_menu_fixture_restored 'client generation failure'
 [[ "$RESTART_CALLS" -eq 0 ]] || fail 'client generation failure restarted the service'
 
-for failure_stage in atomic restart update_sub; do
+for failure_stage in restart update_sub; do
     prepare_menu_fixture
     case "$failure_stage" in
-        atomic) ATOMIC_CLIENT_FAILURES=1 ;;
         restart) RESTART_FAILURES=1 ;;
         update_sub) UPDATE_SUB_FAILURES=1 ;;
     esac
@@ -666,13 +663,12 @@ fi
 grep -Fq '#legacy' "$client_dir" || \
     fail 'menu rollback did not restore the legacy client'
 for path in "$work_dir/base-sub.txt" "$combined_client_dir" "$work_dir/all-sub.txt" "$work_dir/sub.txt"; do
-    [[ "$(<"$path")" == "legacy:$(basename "$path")" ]] || \
-        fail "menu rollback did not restore legacy $(basename "$path")"
+    cmp -s "$client_dir" "$path" || fail "menu rollback did not regenerate legacy $(basename "$path")"
 done
 [[ "$SERVICE_ACTIVE" == 1 ]] || \
     fail 'menu rollback did not restore service state for legacy adoption'
 
-for restore_stage in nat client subscription service; do
+for restore_stage in nat client service; do
     prepare_menu_fixture
     UPDATE_SUB_FAILURES=1
     case "$restore_stage" in
@@ -683,10 +679,6 @@ for restore_stage in nat client subscription service; do
         client)
             original_restore_helper=$(declare -f restore_hy2_client_snapshot)
             restore_hy2_client_snapshot() { return 1; }
-            ;;
-        subscription)
-            original_restore_helper=$(declare -f restore_hy2_subscription_snapshot)
-            restore_hy2_subscription_snapshot() { return 1; }
             ;;
         service)
             original_restore_helper=$(declare -f restore_hy2_service_state)
@@ -719,6 +711,52 @@ fi
 assert_fatal_backup_retained 'disable rollback failure'
 eval "$original_restore_helper"
 rm -rf -- "$FATAL_BACKUP_PATH"
+
+run_committed_cleanup_failure() {
+    local operation="$1"
+    local cleanup_status cleanup_path=''
+
+    prepare_menu_fixture
+    rm() {
+        local last_arg=''
+        for last_arg in "$@"; do :; done
+        if [[ "$*" == *'-rf'* && "$last_arg" == "$(dirname "$client_dir")/.hy2-menu."* ]]; then
+            cleanup_path="$last_arg"
+            return 1
+        fi
+        command rm "$@"
+    }
+    set +e
+    if [ "$operation" = enable ]; then
+        enable_hy2_port_hopping_transaction 56200 56300
+    else
+        disable_hy2_port_hopping_transaction
+    fi
+    cleanup_status=$?
+    set -e
+    unset -f rm
+
+    [[ "$cleanup_status" -eq 3 ]] || \
+        fail "$operation committed cleanup failure returned $cleanup_status instead of warning status 3"
+    [[ -n "$cleanup_path" && -d "$cleanup_path" ]] || \
+        fail "$operation committed cleanup failure did not retain its recovery directory"
+    grep -Fq '提交已完成' "$HY2_ERROR_LOG" || \
+        fail "$operation committed cleanup failure did not distinguish cleanup from rollback failure"
+    grep -Fq "$cleanup_path" "$HY2_ERROR_LOG" || \
+        fail "$operation committed cleanup failure did not report the retained path"
+    if [ "$operation" = enable ]; then
+        grep -Fq 'mport=12443,56200-56300' "$client_dir" || \
+            fail 'enable cleanup warning rolled back the committed client'
+    else
+        if grep -Fq 'mport=' "$client_dir"; then
+            fail 'disable cleanup warning rolled back the committed client'
+        fi
+    fi
+    command rm -rf -- "$cleanup_path"
+}
+
+run_committed_cleanup_failure enable
+run_committed_cleanup_failure disable
 
 prepare_menu_fixture
 enable_hy2_port_hopping_transaction 56200 56300 || fail 'HY2 menu enable transaction failed'
@@ -761,6 +799,8 @@ grep -Fq 'enable_hy2_port_hopping_transaction "$min_port" "$max_port"' <<< "$cha
     fail 'HY2 enable menu does not use the transaction helper'
 grep -Fq 'disable_hy2_port_hopping_transaction' <<< "$change_config_source" || \
     fail 'HY2 disable menu does not use the transaction helper'
+[[ "$(grep -Fc '[ "$hy2_transaction_status" -eq 3 ]' <<< "$change_config_source")" -ge 2 ]] || \
+    fail 'HY2 menu does not treat committed cleanup warnings as committed operations'
 
 # The production persistence helper must propagate backend failures.
 production_persist_source=$(sed -n '/^persist_hy2_nat_rules() {/,/^}/p' "$script")

@@ -42,6 +42,12 @@ for function_name in \
     disarm_durable_transaction \
     extra_protocol_tag_exists \
     get_extra_protocol_uniform_port \
+    with_subscription_lock \
+    encode_subscription_source \
+    publish_subscriptions_locked \
+    mutate_base_subscription_locked \
+    mutate_base_subscription \
+    remove_url_by_tag_file \
     remove_url_by_tag \
     acquire_proxy_transaction_lock_checked \
     _add_extra_protocol_transaction_locked \
@@ -78,6 +84,7 @@ done
 work_dir="${tmp_root}/work"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
+combined_client_dir="${work_dir}/all-url.txt"
 inbounds_file="${conf_dir}/inbounds.json"
 call_log="${tmp_root}/calls.log"
 mkdir -p "$conf_dir"

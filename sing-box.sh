@@ -289,7 +289,13 @@ harden_runtime_secret_permissions() {
         "${singbox_dir}/conf/outbounds.json" \
         "${singbox_dir}/tunnel.json" \
         "${singbox_dir}/tunnel.yml" \
-        "${singbox_dir}/argo.env"; do
+        "${singbox_dir}/argo.env" \
+        "${singbox_dir}/url.txt" \
+        "${singbox_dir}/base-sub.txt" \
+        "${singbox_dir}/cfy-url.txt" \
+        "${singbox_dir}/cfy-sub.txt" \
+        "${singbox_dir}/all-url.txt" \
+        "${singbox_dir}/all-sub.txt"; do
         [ -e "$secret_file" ] || [ -L "$secret_file" ] || continue
         [ -f "$secret_file" ] && [ ! -L "$secret_file" ] || return 1
         chmod 600 "$secret_file" || return 1
@@ -3668,7 +3674,8 @@ stage_hy2_client_file() {
     local node_label="${7:-}"
     local line_count uuid url_host replacement staged_file
 
-    [ -f "$client_dir" ] || return 1
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
     line_count=$(grep -c '^hysteria2://' "$client_dir" 2>/dev/null || true)
     [ "$line_count" -eq 1 ] || return 1
     staged_file=$(mktemp "$(dirname "$client_dir")/.hy2-client.XXXXXX") || return 1
@@ -3716,14 +3723,6 @@ stage_hy2_client_file() {
     HY2_STAGED_CLIENT_FILE="$staged_file"
 }
 
-atomic_replace_hy2_client() {
-    local staged_file="${1:-}"
-    local target_file="${2:-}"
-
-    [ -f "$staged_file" ] && [ -n "$target_file" ] || return 1
-    mv -f -- "$staged_file" "$target_file"
-}
-
 backup_hy2_menu_transaction() {
     local backup_dir="${1:-}"
     local baseline_min="${2:-}"
@@ -3740,6 +3739,7 @@ backup_hy2_menu_transaction() {
     )
     local index path family
 
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
     [ -d "$backup_dir" ] || return 1
     if [ -f "$state_file" ]; then
         cp -p -- "$state_file" "${backup_dir}/nat.state" || return 1
@@ -3763,39 +3763,20 @@ backup_hy2_menu_transaction() {
 
 restore_hy2_client_snapshot() {
     local backup_dir="${1:-}"
-    local tmp_file
+    local tmp_file publish_status
 
+    tmp_file=$(mktemp "$(dirname "$client_dir")/.tmp.$(basename "$client_dir").hy2-restore.XXXXXX") || return 1
     if [ -e "${backup_dir}/present.0" ]; then
-        tmp_file=$(mktemp "$(dirname "$client_dir")/.hy2-restore.XXXXXX") || return 1
         cp -p -- "${backup_dir}/file.0" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
-        mv -f -- "$tmp_file" "$client_dir" || { rm -f -- "$tmp_file"; return 1; }
     else
-        rm -f -- "$client_dir" || return 1
+        : > "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
     fi
-}
-
-restore_hy2_subscription_snapshot() {
-    local backup_dir="${1:-}"
-    local -a files=(
-        "${work_dir}/base-sub.txt"
-        "$combined_client_dir"
-        "${work_dir}/all-sub.txt"
-        "${work_dir}/sub.txt"
-        "${work_dir}/cfy-sub.txt"
-    )
-    local index slot path tmp_file
-
-    for ((index = 0; index < ${#files[@]}; index++)); do
-        path="${files[$index]}"
-        slot=$((index + 1))
-        if [ -e "${backup_dir}/present.${slot}" ]; then
-            tmp_file=$(mktemp "$(dirname "$path")/.hy2-restore.XXXXXX") || return 1
-            cp -p -- "${backup_dir}/file.${slot}" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
-            mv -f -- "$tmp_file" "$path" || { rm -f -- "$tmp_file"; return 1; }
-        else
-            rm -f -- "$path" || return 1
-        fi
-    done
+    chmod 600 "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    update_sub "$tmp_file" || {
+        publish_status=$?
+        rm -f -- "$tmp_file"
+        return "$publish_status"
+    }
 }
 
 restore_hy2_nat_snapshot() {
@@ -3867,7 +3848,6 @@ rollback_hy2_menu_transaction() {
 
     restore_hy2_nat_snapshot "$backup_dir" || status=1
     restore_hy2_client_snapshot "$backup_dir" || status=1
-    restore_hy2_subscription_snapshot "$backup_dir" || status=1
     restore_hy2_service_state "$was_active" || status=1
     return "$status"
 }
@@ -3888,10 +3868,21 @@ handle_hy2_menu_transaction_failure() {
     return 2
 }
 
+cleanup_hy2_committed_transaction() {
+    local backup_dir="${1:-}"
+
+    [ -d "$backup_dir" ] || return 0
+    if rm -rf -- "$backup_dir"; then
+        return 0
+    fi
+    red "Hysteria2 提交已完成，但事务备份清理失败。保留路径: ${backup_dir}"
+    return 3
+}
+
 _enable_hy2_port_hopping_transaction_locked() {
     local min_port="${1:-}"
     local max_port="${2:-}"
-    local listen_port server_ip fingerprint node_label backup_dir staged_file was_active=0
+    local listen_port server_ip fingerprint node_label
 
     validate_port_value "$min_port" hy2_hop_min_port || return 1
     validate_port_value "$max_port" hy2_hop_max_port || return 1
@@ -3902,10 +3893,23 @@ _enable_hy2_port_hopping_transaction_locked() {
     [ -n "$server_ip" ] || return 1
     fingerprint=$(get_hy2_certificate_fingerprint) || return 1
     node_label=$(get_hy2_node_label) || return 1
+    with_subscription_lock enable_hy2_port_hopping_transaction_locked \
+        "$min_port" "$max_port" "$listen_port" "$server_ip" "$fingerprint" "$node_label"
+}
+
+enable_hy2_port_hopping_transaction_locked() {
+    local min_port="$1"
+    local max_port="$2"
+    local listen_port="$3"
+    local server_ip="$4"
+    local fingerprint="$5"
+    local node_label="$6"
+    local backup_dir staged_file was_active=0
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
     stage_hy2_client_file enable "$min_port" "$max_port" "$listen_port" \
         "$server_ip" "$fingerprint" "$node_label" || return 1
     staged_file="$HY2_STAGED_CLIENT_FILE"
-
     backup_dir=$(mktemp -d "$(dirname "$client_dir")/.hy2-menu.XXXXXX") || {
         rm -f -- "$staged_file"
         return 1
@@ -3919,14 +3923,13 @@ _enable_hy2_port_hopping_transaction_locked() {
     singbox_service_is_active && was_active=1
 
     if ! add_hy2_port_hopping "$min_port" "$max_port" "$listen_port" ||
-       ! atomic_replace_hy2_client "$staged_file" "$client_dir" ||
-       { [ "$was_active" -eq 1 ] && ! restart_singbox; } ||
-       ! update_sub; then
+       ! update_sub "$staged_file" ||
+       { [ "$was_active" -eq 1 ] && ! restart_singbox; }; then
         handle_hy2_menu_transaction_failure "$backup_dir" "$was_active" "$staged_file"
         return $?
     fi
 
-    rm -rf -- "$backup_dir"
+    cleanup_hy2_committed_transaction "$backup_dir"
 }
 
 enable_hy2_port_hopping_transaction() {
@@ -3942,8 +3945,13 @@ enable_hy2_port_hopping_transaction() {
 }
 
 _disable_hy2_port_hopping_transaction_locked() {
+    with_subscription_lock disable_hy2_port_hopping_transaction_locked
+}
+
+disable_hy2_port_hopping_transaction_locked() {
     local backup_dir staged_file was_active=0
 
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
     stage_hy2_client_file disable || return 1
     staged_file="$HY2_STAGED_CLIENT_FILE"
     backup_dir=$(mktemp -d "$(dirname "$client_dir")/.hy2-menu.XXXXXX") || {
@@ -3959,14 +3967,13 @@ _disable_hy2_port_hopping_transaction_locked() {
     singbox_service_is_active && was_active=1
 
     if ! remove_hy2_port_hopping ||
-       ! atomic_replace_hy2_client "$staged_file" "$client_dir" ||
-       { [ "$was_active" -eq 1 ] && ! restart_singbox; } ||
-       ! update_sub; then
+       ! update_sub "$staged_file" ||
+       { [ "$was_active" -eq 1 ] && ! restart_singbox; }; then
         handle_hy2_menu_transaction_failure "$backup_dir" "$was_active" "$staged_file"
         return $?
     fi
 
-    rm -rf -- "$backup_dir"
+    cleanup_hy2_committed_transaction "$backup_dir"
 }
 
 disable_hy2_port_hopping_transaction() {
@@ -4459,7 +4466,13 @@ EOF
 
 # 生成节点和订阅链接
 get_info() {
-    local url_file tmp_url_file
+    local url_file tmp_url_file base_source_generation
+
+    url_file="${client_dir:-${work_dir}/url.txt}"
+    base_source_generation=$(get_base_subscription_generation "$url_file") || {
+        red "无法记录当前订阅源代际，拒绝生成节点。"
+        return 1
+    }
 
     yellow "\nip检测中,请稍等...\n"
     server_ipv4=$(get_public_ipv4 2>/dev/null || true)
@@ -4511,16 +4524,10 @@ get_info() {
         yellow "\n未获取到 ArgoDomain，跳过 VLESS-WS-TLS-Argo 节点，仅输出 Reality 节点\n"
     fi
 
-    extra_lines=""
-    if [ -f "${client_dir}" ]; then
-        extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://)' "${client_dir}" || true)
-    fi
-
     reality_v4_name="${isp}-vless-reality-ipv4"
     reality_v6_name="${isp}-vless-reality-ipv6"
     argo_name="${isp}-vless-ws-tls-argo"
 
-    url_file="${client_dir:-${work_dir}/url.txt}"
     tmp_url_file=$(mktemp "${work_dir}/.tmp.url.txt.XXXXXX") || return 1
     if ! : > "$tmp_url_file"; then
         rm -f "$tmp_url_file"
@@ -4584,20 +4591,16 @@ EOF
         fi
     fi
 
-    if [ -n "$extra_lines" ]; then
-        if ! printf '\n%s\n' "$extra_lines" >> "$tmp_url_file"; then
-            rm -f "$tmp_url_file"
-            return 1
-        fi
-    fi
-
-    chmod 644 "$tmp_url_file" 2>/dev/null || { rm -f "$tmp_url_file"; return 1; }
-    mv -f "$tmp_url_file" "$url_file" || { rm -f "$tmp_url_file"; return 1; }
+    chmod 600 "$tmp_url_file" 2>/dev/null || { rm -f "$tmp_url_file"; return 1; }
+    publish_generated_base "$tmp_url_file" "$base_source_generation" || {
+        local publish_status=$?
+        rm -f "$tmp_url_file"
+        return "$publish_status"
+    }
+    rm -f "$tmp_url_file"
 
     echo ""
     while IFS= read -r line; do echo -e "${purple}$line"; done < "$url_file"
-    update_sub || return 1
-    chmod 644 "${work_dir}/sub.txt" || return 1
     yellow "\n温馨提醒:"
     yellow "如果节点里的ip是ipv6的，可在 修改节点配置 菜单切换ipv4后重新订阅节点\n"
     red "如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
@@ -5600,7 +5603,7 @@ release_node_subscription_lock() {
 publish_node_change_subscription() {
     local staged_client="${1:-}"
     local subscription_dir='' publish_status=0 rollback_ok=1 recovery_dir=''
-    local client_mode index subscription_committed=0 subscription_traps_installed=0
+    local index subscription_committed=0 subscription_traps_installed=0
     local subscription_previous_hup='' subscription_previous_int=''
     local subscription_previous_term='' subscription_previous_exit=''
     local -a owned_paths owned_keys
@@ -5689,29 +5692,7 @@ publish_node_change_subscription() {
     trap '_node_subscription_interrupt_handler EXIT $?' EXIT
     subscription_traps_installed=1
 
-    client_mode=$(stat -c '%a' "$client_dir" 2>/dev/null || printf '%s' 600)
-    if ! cp -p -- "$staged_client" "${subscription_dir}/client.candidate" ||
-       ! chmod "$client_mode" "${subscription_dir}/client.candidate" ||
-       ! mv -f -- "${subscription_dir}/client.candidate" "$client_dir"; then
-        rollback_ok=1
-        for ((index=${#owned_paths[@]} - 1; index >= 0; index--)); do
-            node_change_restore_path "${owned_paths[$index]}" "$subscription_dir" \
-                "${owned_keys[$index]}" || rollback_ok=0
-        done
-        if [ "$rollback_ok" -eq 1 ] && rm -rf -- "$subscription_dir"; then
-            _restore_node_subscription_traps
-            release_node_subscription_lock
-            return 1
-        fi
-        recovery_dir="${work_dir}/.node-subscription-recovery.${subscription_dir##*.node-subscription.}"
-        mv -- "$subscription_dir" "$recovery_dir" 2>/dev/null || recovery_dir="$subscription_dir"
-        _restore_node_subscription_traps
-        release_node_subscription_lock
-        red "订阅基础源提交失败且回滚不完整；恢复材料已保留：${recovery_dir}"
-        return 2
-    fi
-
-    if update_sub; then
+    if update_sub "$staged_client"; then
         publish_status=0
     else
         publish_status=$?
@@ -8386,7 +8367,9 @@ change_config() {
             else
                 hy2_transaction_status=$?
             fi
-            if [ "$hy2_transaction_status" -ne 0 ]; then
+            if [ "$hy2_transaction_status" -eq 3 ]; then
+                yellow "Hysteria2 端口跳跃已启用，但旧事务备份未能清理；请按上方保留路径处理。"
+            elif [ "$hy2_transaction_status" -ne 0 ]; then
                 [ "$hy2_transaction_status" -eq 2 ] && return 2
                 red "Hysteria2 端口跳跃启用失败，原配置已保留或恢复。"
                 return 1
@@ -8400,7 +8383,9 @@ change_config() {
             else
                 hy2_transaction_status=$?
             fi
-            if [ "$hy2_transaction_status" -ne 0 ]; then
+            if [ "$hy2_transaction_status" -eq 3 ]; then
+                yellow "Hysteria2 端口跳跃已删除，但旧事务备份未能清理；请按上方保留路径处理。"
+            elif [ "$hy2_transaction_status" -ne 0 ]; then
                 [ "$hy2_transaction_status" -eq 2 ] && return 2
                 red "Hysteria2 端口跳跃删除失败，原配置已保留或恢复。"
                 return 1
@@ -9932,7 +9917,7 @@ update_vless_argo_domain_file() {
     [ -n "$new_domain" ] || return 1
     [ -s "$target_file" ] || return 0
 
-    tmp_file=$(mktemp)
+    tmp_file=$(mktemp "$(dirname "$target_file")/.tmp.$(basename "$target_file").argo.XXXXXX") || return 1
     while IFS= read -r line || [ -n "$line" ]; do
         if [[ "$line" == vless://* && "$line" == *"path=%2Fvless-argo"* ]]; then
             line=$(printf '%s\n' "$line" | sed -E "s#([?&]sni=)[^&#]*#\1${new_domain}#g; s#([?&]host=)[^&#]*#\1${new_domain}#g")
@@ -9948,7 +9933,7 @@ update_uuid_file() {
     [ -n "$new_uuid" ] || return 1
     [ -s "$target_file" ] || return 0
 
-    tmp_file=$(mktemp)
+    tmp_file=$(mktemp "$(dirname "$target_file")/.tmp.$(basename "$target_file").uuid.XXXXXX") || return 1
     while IFS= read -r line || [ -n "$line" ]; do
         if [[ "$line" == vless://* ]]; then
             line=$(printf '%s\n' "$line" | sed -E "s#^vless://[^@]+@#vless://${new_uuid}@#")
@@ -9969,57 +9954,33 @@ update_uuid_file() {
 
 # 更新VLESS Argo域名到订阅
 update_vless_argo_domain() {
-    update_vless_argo_domain_file "$client_dir" "$1"
+    mutate_base_subscription update_vless_argo_domain_file "$1"
+}
+
+update_argo_subscription_file() {
+    local staged_base_file="$1"
+    local new_domain="$2"
+    local vmess_url encoded_vmess decoded_vmess updated_vmess encoded_updated_vmess new_vmess_url
+
+    update_vless_argo_domain_file "$staged_base_file" "$new_domain" || return 1
+    vmess_url=$(grep -o 'vmess://[^ ]*' "$staged_base_file" | head -1)
+    [ -n "$vmess_url" ] || return 0
+    encoded_vmess="${vmess_url#vmess://}"
+    decoded_vmess=$(printf '%s' "$encoded_vmess" | base64 --decode 2>/dev/null || true)
+    [ -n "$decoded_vmess" ] || return 0
+    updated_vmess=$(printf '%s' "$decoded_vmess" | jq --arg new_domain "$new_domain" \
+        '.host = $new_domain | .sni = $new_domain | del(.allowInsecure)' 2>/dev/null || true)
+    [ -n "$updated_vmess" ] || return 0
+    encoded_updated_vmess=$(printf '%s' "$updated_vmess" | base64 | tr -d '\n\r')
+    new_vmess_url="vmess://${encoded_updated_vmess}"
+    sed -i "s|$vmess_url|$new_vmess_url|" "$staged_base_file"
 }
 
 change_argo_domain() {
-    local client_backup cfy_backup='' cfy_file="${work_dir}/cfy-url.txt"
-    local vmess_url encoded_vmess decoded_vmess updated_vmess encoded_updated_vmess new_vmess_url
-
     [ -z "$ArgoDomain" ] && { red "未获取到Argo域名，无法更新节点"; return 1; }
-    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
-    client_backup=$(mktemp "$(dirname "$client_dir")/.argo-domain.rollback.XXXXXX") || return 1
-    cp -p "$client_dir" "$client_backup" || { rm -f "$client_backup"; return 1; }
-    if [ -e "$cfy_file" ]; then
-        [ -f "$cfy_file" ] && [ ! -L "$cfy_file" ] || { rm -f "$client_backup"; return 1; }
-        cfy_backup=$(mktemp "$(dirname "$cfy_file")/.argo-domain-cfy.rollback.XXXXXX") || {
-            rm -f "$client_backup"
-            return 1
-        }
-        cp -p "$cfy_file" "$cfy_backup" || { rm -f "$client_backup" "$cfy_backup"; return 1; }
-    fi
-
-    if ! update_vless_argo_domain "$ArgoDomain" || \
-       { [ -n "$cfy_backup" ] && ! update_vless_argo_domain_file "$cfy_file" "$ArgoDomain"; }; then
-        cp -p "$client_backup" "$client_dir"
-        [ -z "$cfy_backup" ] || cp -p "$cfy_backup" "$cfy_file"
-        rm -f "$client_backup" "$cfy_backup"
-        return 1
-    fi
 
     # 兼容用户手动保留的旧 VMess 模板；默认新安装不再生成 VMess。
-    vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir" | head -1)
-    if [ -n "$vmess_url" ]; then
-        encoded_vmess="${vmess_url#vmess://}"
-        decoded_vmess=$(echo "$encoded_vmess" | base64 --decode 2>/dev/null || true)
-        if [ -n "$decoded_vmess" ]; then
-            updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain | del(.allowInsecure)' 2>/dev/null || true)
-            if [ -n "$updated_vmess" ]; then
-                encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-                new_vmess_url="vmess://${encoded_updated_vmess}"
-                sed -i "s|$vmess_url|$new_vmess_url|" "$client_dir"
-            fi
-        fi
-    fi
-
-    if ! update_sub; then
-        cp -p "$client_backup" "$client_dir" || true
-        [ -z "$cfy_backup" ] || cp -p "$cfy_backup" "$cfy_file" || true
-        update_sub >/dev/null 2>&1 || red "订阅发布失败，源文件已恢复；请稍后重新发布订阅。"
-        rm -f "$client_backup" "$cfy_backup"
-        return 1
-    fi
-    rm -f "$client_backup" "$cfy_backup"
+    mutate_base_subscription update_argo_subscription_file "$ArgoDomain" || return $?
 
     green "vless-ws-tls-argo节点已更新\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
@@ -10576,7 +10537,6 @@ EOF
 }
 
 change_cfip() {
-    local client_backup cfy_backup='' cfy_file="${work_dir}/cfy-url.txt"
     local detected_mode address_mode
     clear
     yellow "修改vless-ws-tls-argo优选域名\n"
@@ -10597,38 +10557,23 @@ change_cfip() {
         *) return 1 ;;
     esac
 
-    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
-    client_backup=$(mktemp "$(dirname "$client_dir")/.argo-preferred.rollback.XXXXXX") || return 1
-    cp -p "$client_dir" "$client_backup" || { rm -f "$client_backup"; return 1; }
-    if [ -e "$cfy_file" ]; then
-        [ -f "$cfy_file" ] && [ ! -L "$cfy_file" ] || { rm -f "$client_backup"; return 1; }
-        cfy_backup=$(mktemp "$(dirname "$cfy_file")/.argo-preferred-cfy.rollback.XXXXXX") || {
-            rm -f "$client_backup"
-            return 1
-        }
-        cp -p "$cfy_file" "$cfy_backup" || { rm -f "$client_backup" "$cfy_backup"; return 1; }
-    fi
-
-    update_argo_preferred_address_file "$client_dir" "$cfip" "$cfport" "$address_mode" || {
-        rm -f "$client_backup" "$cfy_backup"
+    mutate_base_subscription update_cfip_subscription_file \
+        "$cfip" "$cfport" "$address_mode" || {
         red "未找到可安全更新的 Argo 节点，原订阅保持不变。"
         return 1
     }
-    if [ -n "$cfy_backup" ]; then
-        update_argo_preferred_address_file "$cfy_file" "$cfip" "$cfport" "$address_mode" || \
-            yellow "最近一次 cfy 结果未包含可更新的优选入口；基础订阅已更新。"
-    fi
-
-    if ! update_sub; then
-        cp -p "$client_backup" "$client_dir" || true
-        [ -z "$cfy_backup" ] || cp -p "$cfy_backup" "$cfy_file" || true
-        update_sub >/dev/null 2>&1 || red "订阅发布失败，源文件已恢复；请稍后重新发布订阅。"
-        rm -f "$client_backup" "$cfy_backup"
-        return 1
-    fi
-    rm -f "$client_backup" "$cfy_backup"
     green "\nvless-ws-tls-argo节点优选域名已更新为：${purple}${cfip}:${cfport}${re}\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
+}
+
+update_cfip_subscription_file() {
+    local staged_base_file="$1"
+    local cfip="$2"
+    local cfport="$3"
+    local address_mode="$4"
+
+    update_argo_preferred_address_file "$staged_base_file" \
+        "$cfip" "$cfport" "$address_mode"
 }
 
 # 从 endpoint 对象或 endpoints.json 中提取内置 WARP endpoint。
@@ -13556,125 +13501,358 @@ get_extra_protocol_uniform_port() {
 # 更新订阅文件
 remove_url_by_tag() {
     local scheme="${1:-}"
-    local parent name tmp_file
 
     [[ "$scheme" =~ ^[A-Za-z][A-Za-z0-9+.-]*$ ]] || return 1
-    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
-    parent=$(dirname "$client_dir") || return 1
-    name=$(basename "$client_dir") || return 1
-    [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
-    tmp_file=$(mktemp "${parent}/.remove-url.${name}.XXXXXX") || return 1
-    if ! awk -v prefix="${scheme}://" '
-            NF && index($0, prefix) != 1 { print }
-        ' "$client_dir" > "$tmp_file" ||
-       ! chmod --reference="$client_dir" "$tmp_file" 2>/dev/null ||
-       ! mv -f -- "$tmp_file" "$client_dir"; then
-        rm -f -- "$tmp_file"
+    mutate_base_subscription remove_url_by_tag_file "$scheme"
+}
+
+with_subscription_lock() {
+    local lock_file="${SUBSCRIPTION_LOCK_FILE:-${work_dir}/.subscription.lock}"
+    local timeout_seconds="${SUBSCRIPTION_LOCK_TIMEOUT_SECONDS:-30}"
+    local lock_dir lock_status=0
+    local subscription_lock_fd
+
+    if [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ]; then
+        "$@"
+        return $?
+    fi
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+    command -v flock >/dev/null 2>&1 || return 1
+    lock_dir=$(dirname "$lock_file") || return 1
+    mkdir -p "$lock_dir" || return 1
+    if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
+        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    fi
+    (umask 077 && : >> "$lock_file") || return 1
+    chmod 600 "$lock_file" || return 1
+    exec {subscription_lock_fd}>>"$lock_file" || return 1
+    if ! flock -x -w "$timeout_seconds" "$subscription_lock_fd"; then
+        exec {subscription_lock_fd}>&-
         return 1
+    fi
+
+    local SUBSCRIPTION_LOCK_HELD=1
+    "$@" || lock_status=$?
+    flock -u "$subscription_lock_fd" 2>/dev/null || true
+    exec {subscription_lock_fd}>&-
+    return "$lock_status"
+}
+
+encode_subscription_source() {
+    local source_file="$1"
+    local output_file="$2"
+
+    if [ ! -s "$source_file" ]; then
+        : > "$output_file"
+    elif base64 -w0 "$source_file" > "$output_file" 2>/dev/null; then
+        return 0
+    else
+        (set -o pipefail; base64 "$source_file" | tr -d '\n\r' > "$output_file")
     fi
 }
 
 write_base64_subscription() {
     local source_file="$1"
     local sub_file="$2"
+    local output_mode="${3:-600}"
     local sub_dir sub_name tmp_file
 
+    case "$output_mode" in 600|644) ;; *) return 1 ;; esac
     sub_dir=$(dirname "$sub_file")
     sub_name=$(basename "$sub_file")
     mkdir -p "$sub_dir" || return 1
-    tmp_file=$(mktemp "${sub_dir}/.tmp.${sub_name}.XXXXXX") || return 1
-
-    if [ ! -s "$source_file" ]; then
-        if ! : > "$tmp_file"; then
-            rm -f "$tmp_file"
-            return 1
-        fi
-    elif ! base64 -w0 "$source_file" > "$tmp_file" 2>/dev/null; then
-        if ! (set -o pipefail; base64 "$source_file" | tr -d '\n\r' > "$tmp_file"); then
-            rm -f "$tmp_file"
-            return 1
-        fi
+    if [ -e "$sub_file" ] || [ -L "$sub_file" ]; then
+        [ -f "$sub_file" ] && [ ! -L "$sub_file" ] || return 1
     fi
-
-    chmod 644 "$tmp_file" 2>/dev/null || { rm -f "$tmp_file"; return 1; }
+    tmp_file=$(mktemp "${sub_dir}/.tmp.${sub_name}.XXXXXX") || return 1
+    encode_subscription_source "$source_file" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod "$output_mode" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
     mv -f "$tmp_file" "$sub_file" || { rm -f "$tmp_file"; return 1; }
 }
-sync_combined_subscription() {
-    local tmp_file cfy_file cfy_sub_file combined_sub_file
-    local tmp_cfy_sub_file='' tmp_combined_sub_file='' tmp_sub_file=''
-    cfy_file="${work_dir}/cfy-url.txt"
-    cfy_sub_file="${work_dir}/cfy-sub.txt"
-    combined_sub_file="${work_dir}/all-sub.txt"
 
-    mkdir -p "${work_dir}" || return 1
-    tmp_file=$(mktemp "${work_dir}/.tmp.all-url.XXXXXX") || return 1
+publish_subscriptions_locked() {
+    local staged_base_file="${1:-}"
+    local cfy_file="${work_dir}/cfy-url.txt"
+    local base_source_file="$client_dir"
+    local cfy_source_file=/dev/null
+    local base_sub_file="${work_dir}/base-sub.txt"
+    local cfy_sub_file="${work_dir}/cfy-sub.txt"
+    local combined_sub_file="${work_dir}/all-sub.txt"
+    local served_sub_file="${work_dir}/sub.txt"
+    local tmp_base_sub tmp_cfy_sub tmp_all_url tmp_all_sub tmp_sub target_file
+    local backup_file commit_failed=0 rollback_failed=0 index restore_index
+    local -a commit_sources=() commit_targets=() backup_files=() target_existed=()
 
-    if [ -s "$client_dir" ] && ! sed '/^[[:space:]]*$/d' "$client_dir" > "$tmp_file"; then
-        rm -f "$tmp_file"
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    mkdir -p "$work_dir" || return 1
+    for target_file in "$client_dir" "$cfy_file" "$base_sub_file" "$cfy_sub_file" \
+        "$combined_client_dir" "$combined_sub_file" "$served_sub_file"; do
+        if [ -e "$target_file" ] || [ -L "$target_file" ]; then
+            [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
+        fi
+    done
+
+    if [ -n "$staged_base_file" ]; then
+        [ -f "$staged_base_file" ] && [ ! -L "$staged_base_file" ] || return 1
+        chmod 600 "$staged_base_file" || return 1
+        base_source_file="$staged_base_file"
+    else
+        [ -f "$client_dir" ] || return 1
+        chmod 600 "$client_dir" || return 1
+    fi
+    if [ -e "$cfy_file" ]; then
+        chmod 600 "$cfy_file" || return 1
+        cfy_source_file="$cfy_file"
+    fi
+
+    tmp_base_sub=$(mktemp "${work_dir}/.tmp.base-sub.txt.XXXXXX") || return 1
+    tmp_cfy_sub=$(mktemp "${work_dir}/.tmp.cfy-sub.txt.XXXXXX") || { rm -f "$tmp_base_sub"; return 1; }
+    tmp_all_url=$(mktemp "${work_dir}/.tmp.all-url.txt.XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub"; return 1; }
+    tmp_all_sub=$(mktemp "${work_dir}/.tmp.all-sub.txt.XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url"; return 1; }
+    tmp_sub=$(mktemp "${work_dir}/.tmp.sub.txt.XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub"; return 1; }
+
+    if ! awk '{ sub(/\r$/, ""); if ($0 ~ /^[[:space:]]*$/) next; if (!seen[$0]++) print }' \
+        "$base_source_file" "$cfy_source_file" 2>/dev/null > "$tmp_all_url" ||
+       ! encode_subscription_source "$base_source_file" "$tmp_base_sub" ||
+       ! encode_subscription_source "$cfy_source_file" "$tmp_cfy_sub" ||
+       ! encode_subscription_source "$tmp_all_url" "$tmp_all_sub" ||
+       ! encode_subscription_source "$tmp_all_url" "$tmp_sub" ||
+       ! chmod 600 "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" ||
+       ! chmod 644 "$tmp_sub"; then
+        rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub"
         return 1
     fi
-    if [ -s "$cfy_file" ]; then
-        if [ -s "$tmp_file" ] && ! printf '\n' >> "$tmp_file"; then
-            rm -f "$tmp_file"
-            return 1
-        fi
-        if ! sed '/^[[:space:]]*$/d' "$cfy_file" >> "$tmp_file"; then
-            rm -f "$tmp_file"
-            return 1
-        fi
-        tmp_cfy_sub_file=$(mktemp "${work_dir}/.tmp.cfy-sub.txt.XXXXXX") || { rm -f "$tmp_file"; return 1; }
-        write_base64_subscription "$cfy_file" "$tmp_cfy_sub_file" || {
-            rm -f "$tmp_file" "$tmp_cfy_sub_file"
-            return 1
-        }
-    fi
 
-    if [ -s "$tmp_file" ]; then
-        chmod 644 "$tmp_file" 2>/dev/null || {
-            rm -f "$tmp_file" "$tmp_cfy_sub_file"
+    if [ -n "$staged_base_file" ]; then
+        commit_sources+=("$staged_base_file")
+        commit_targets+=("$client_dir")
+    fi
+    commit_sources+=("$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub")
+    commit_targets+=("$base_sub_file" "$cfy_sub_file" "$combined_client_dir" "$combined_sub_file" "$served_sub_file")
+
+    for ((index = 0; index < ${#commit_targets[@]}; index++)); do
+        target_file="${commit_targets[$index]}"
+        backup_file=$(mktemp "${work_dir}/.tmp.$(basename "$target_file").rollback.XXXXXX") || {
+            rm -f "${commit_sources[@]}" "${backup_files[@]}"
             return 1
         }
-        tmp_combined_sub_file=$(mktemp "${work_dir}/.tmp.all-sub.txt.XXXXXX") || {
-            rm -f "$tmp_file" "$tmp_cfy_sub_file"
-            return 1
-        }
-        tmp_sub_file=$(mktemp "${work_dir}/.tmp.sub.txt.XXXXXX") || {
-            rm -f "$tmp_file" "$tmp_cfy_sub_file" "$tmp_combined_sub_file"
-            return 1
-        }
-        write_base64_subscription "$tmp_file" "$tmp_combined_sub_file" || {
-            rm -f "$tmp_file" "$tmp_cfy_sub_file" "$tmp_combined_sub_file" "$tmp_sub_file"
-            return 1
-        }
-        write_base64_subscription "$tmp_file" "$tmp_sub_file" || {
-            rm -f "$tmp_file" "$tmp_cfy_sub_file" "$tmp_combined_sub_file" "$tmp_sub_file"
-            return 1
-        }
-        mv -f "$tmp_file" "$combined_client_dir" || {
-            rm -f "$tmp_file" "$tmp_cfy_sub_file" "$tmp_combined_sub_file" "$tmp_sub_file"
-            return 1
-        }
-        mv -f "$tmp_combined_sub_file" "$combined_sub_file" || {
-            rm -f "$tmp_cfy_sub_file" "$tmp_combined_sub_file" "$tmp_sub_file"
-            return 1
-        }
-        mv -f "$tmp_sub_file" "${work_dir}/sub.txt" || {
-            rm -f "$tmp_cfy_sub_file" "$tmp_sub_file"
-            return 1
-        }
-        if [ -n "$tmp_cfy_sub_file" ]; then
-            mv -f "$tmp_cfy_sub_file" "$cfy_sub_file" || { rm -f "$tmp_cfy_sub_file"; return 1; }
+        if [ -f "$target_file" ]; then
+            cp -p -- "$target_file" "$backup_file" || {
+                rm -f "$backup_file" "${commit_sources[@]}" "${backup_files[@]}"
+                return 1
+            }
+            target_existed+=(1)
+        else
+            rm -f "$backup_file"
+            target_existed+=(0)
         fi
+        backup_files+=("$backup_file")
+    done
+
+    for ((index = 0; index < ${#commit_targets[@]}; index++)); do
+        if ! mv -f -- "${commit_sources[$index]}" "${commit_targets[$index]}"; then
+            commit_failed=1
+            for ((restore_index = index - 1; restore_index >= 0; restore_index--)); do
+                if [ "${target_existed[$restore_index]}" = 1 ]; then
+                    if ! mv -f -- "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}"; then
+                        rollback_failed=1
+                        printf 'FATAL: subscription rollback failed; preserved backup %s for %s\n' \
+                            "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}" >&2
+                    fi
+                else
+                    if ! rm -f -- "${commit_targets[$restore_index]}"; then
+                        rollback_failed=1
+                        printf 'FATAL: subscription rollback failed; remove manually: %s\n' \
+                            "${commit_targets[$restore_index]}" >&2
+                    fi
+                fi
+            done
+            break
+        fi
+    done
+    rm -f "${commit_sources[@]}"
+    if [ "$commit_failed" -eq 0 ]; then
+        rm -f "${backup_files[@]}"
+        return 0
+    fi
+    if [ "$rollback_failed" -ne 0 ]; then
+        printf 'FATAL: subscription rollback was incomplete; recovery files remain in %s\n' "$work_dir" >&2
+        return 2
+    fi
+    rm -f "${backup_files[@]}"
+    return 1
+}
+
+sync_combined_subscription() {
+    with_subscription_lock publish_subscriptions_locked
+}
+
+update_sub() {
+    with_subscription_lock publish_subscriptions_locked "${1:-}"
+}
+
+get_base_subscription_generation_locked() {
+    local source_file="${1:-$client_dir}"
+    local digest byte_count
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    if [ -e "$source_file" ] || [ -L "$source_file" ]; then
+        [ -f "$source_file" ] && [ ! -L "$source_file" ] || return 1
     else
-        rm -f "$tmp_file" "$tmp_cfy_sub_file"
-        printf '' | atomic_write_file "$combined_client_dir" 644 || return 1
-        printf '' | atomic_write_file "$combined_sub_file" 644 || return 1
-        printf '' | atomic_write_file "${work_dir}/sub.txt" 644 || return 1
+        printf 'absent\n'
+        return 0
+    fi
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    digest=$(sha256sum "$source_file" 2>/dev/null) || return 1
+    digest=${digest%%[[:space:]]*}
+    [[ "$digest" =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+    byte_count=$(wc -c < "$source_file") || return 1
+    byte_count=${byte_count//[[:space:]]/}
+    [[ "$byte_count" =~ ^[0-9]+$ ]] || return 1
+    printf 'file:%s:%s\n' "${digest,,}" "$byte_count"
+}
+
+get_base_subscription_generation() {
+    with_subscription_lock get_base_subscription_generation_locked "${1:-$client_dir}"
+}
+
+verify_base_subscription_generation_locked() {
+    local expected_generation="${1:-}"
+    local source_file="${2:-$client_dir}"
+    local current_generation
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    [ -n "$expected_generation" ] || return 1
+    current_generation=$(get_base_subscription_generation_locked "$source_file") || return 1
+    if [ "$current_generation" != "$expected_generation" ]; then
+        printf 'ERROR: base subscription generation changed; refusing stale get_info publication\n' >&2
+        return 1
     fi
 }
-update_sub() {
-    write_base64_subscription "$client_dir" "${work_dir}/base-sub.txt" || return 1
-    sync_combined_subscription || return 1
+
+publish_generated_base_locked() {
+    local generated_base_file="${1:-}"
+    local expected_generation="${2:-}"
+    local staged_base_file extra_file publish_status
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    verify_base_subscription_generation_locked "$expected_generation" "$client_dir" || return 1
+    [ -f "$generated_base_file" ] && [ ! -L "$generated_base_file" ] || return 1
+    if [ -e "$client_dir" ] || [ -L "$client_dir" ]; then
+        [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
+    fi
+    staged_base_file=$(mktemp "$(dirname "$client_dir")/.tmp.$(basename "$client_dir").generated.XXXXXX") || return 1
+    extra_file=$(mktemp "$(dirname "$client_dir")/.tmp.$(basename "$client_dir").extras.XXXXXX") || {
+        rm -f "$staged_base_file"
+        return 1
+    }
+    cp -- "$generated_base_file" "$staged_base_file" || {
+        rm -f "$staged_base_file" "$extra_file"
+        return 1
+    }
+    if [ -f "$client_dir" ]; then
+        awk '$0 !~ /^(vless:\/\/|vmess:\/\/|hysteria2:\/\/|tuic:\/\/)/ { print }' \
+            "$client_dir" > "$extra_file" || {
+            rm -f "$staged_base_file" "$extra_file"
+            return 1
+        }
+    fi
+    if [ -s "$extra_file" ]; then
+        if [ -s "$staged_base_file" ]; then
+            printf '\n' >> "$staged_base_file" || {
+                rm -f "$staged_base_file" "$extra_file"
+                return 1
+            }
+        fi
+        cat "$extra_file" >> "$staged_base_file" || {
+            rm -f "$staged_base_file" "$extra_file"
+            return 1
+        }
+    fi
+    rm -f "$extra_file"
+    chmod 600 "$staged_base_file" || { rm -f "$staged_base_file"; return 1; }
+    publish_subscriptions_locked "$staged_base_file" || {
+        publish_status=$?
+        rm -f "$staged_base_file"
+        return "$publish_status"
+    }
+}
+
+publish_generated_base() {
+    with_subscription_lock publish_generated_base_locked "$@"
+}
+
+mutate_base_subscription_locked() {
+    local mutation_callback="${1:-}"
+    local staged_base_file mutation_status=0
+    shift || return 1
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    [ -n "$mutation_callback" ] || return 1
+    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
+    staged_base_file=$(mktemp "$(dirname "$client_dir")/.tmp.$(basename "$client_dir").mutation.XXXXXX") || return 1
+    cp -p -- "$client_dir" "$staged_base_file" || { rm -f "$staged_base_file"; return 1; }
+    chmod 600 "$staged_base_file" || { rm -f "$staged_base_file"; return 1; }
+
+    "$mutation_callback" "$staged_base_file" "$@" || mutation_status=$?
+    if [ "$mutation_status" -ne 0 ] || [ ! -f "$staged_base_file" ] || [ -L "$staged_base_file" ]; then
+        rm -f "$staged_base_file"
+        [ "$mutation_status" -ne 0 ] && return "$mutation_status"
+        return 1
+    fi
+    chmod 600 "$staged_base_file" || { rm -f "$staged_base_file"; return 1; }
+    publish_subscriptions_locked "$staged_base_file" || {
+        mutation_status=$?
+        rm -f "$staged_base_file"
+        return "$mutation_status"
+    }
+}
+
+mutate_base_subscription() {
+    with_subscription_lock mutate_base_subscription_locked "$@"
+}
+
+sed_base_subscription_file() {
+    local staged_base_file="$1"
+    shift
+    sed "$@" "$staged_base_file"
+}
+
+update_subscription_uuid_file() {
+    local staged_base_file="$1"
+    local new_uuid="$2"
+
+    sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' "$staged_base_file" &&
+        sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" "$staged_base_file"
+}
+
+append_base_subscription_url_file() {
+    local staged_base_file="$1"
+    local url_line="$2"
+
+    printf '\n%s\n' "$url_line" >> "$staged_base_file"
+}
+
+append_base_subscription_url() {
+    mutate_base_subscription append_base_subscription_url_file "$1"
+}
+
+remove_url_by_tag_file() {
+    local staged_base_file="$1"
+    local tag="$2"
+    local tmp_file
+
+    [[ "$tag" =~ ^[A-Za-z][A-Za-z0-9+.-]*$ ]] || return 1
+    [ -f "$staged_base_file" ] && [ ! -L "$staged_base_file" ] || return 1
+    tmp_file=$(mktemp "$(dirname "$staged_base_file")/.tmp.$(basename "$staged_base_file").remove-url.XXXXXX") || return 1
+    if ! awk -v prefix="${tag}://" '
+            NF && index($0, prefix) != 1 { print }
+        ' "$staged_base_file" > "$tmp_file" ||
+       ! chmod 600 "$tmp_file" ||
+       ! mv -f -- "$tmp_file" "$staged_base_file"; then
+        rm -f -- "$tmp_file"
+        return 1
+    fi
 }
 
 resolve_extra_protocol_listeners() {

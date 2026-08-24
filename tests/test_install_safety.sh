@@ -82,7 +82,15 @@ for function_name in \
     atomic_write_file \
     atomic_write_secret_file \
     write_local_manager_wrapper \
+    with_subscription_lock \
+    encode_subscription_source \
     write_base64_subscription \
+    publish_subscriptions_locked \
+    get_base_subscription_generation_locked \
+    get_base_subscription_generation \
+    verify_base_subscription_generation_locked \
+    publish_generated_base_locked \
+    publish_generated_base \
     sync_combined_subscription \
     update_sub \
     manage_packages \
@@ -126,6 +134,8 @@ for function_name in \
     auto_install; do
     load_function "$function_name"
 done
+
+flock() { return 0; }
 
 for _ in $(seq 1 20); do
     generated_password="$(generate_random_alphanumeric 24)" || \
@@ -697,36 +707,28 @@ run_combined_generation_failure() {
     local stage="$1"
     setup_subscription_fixture
     COMBINED_FAIL_STAGE="$stage"
-    sed() {
-        local source_file="${*: -1}"
-        if [[ "$COMBINED_FAIL_STAGE" == sed_client && "$source_file" == "$client_dir" ]]; then
-            return 1
-        fi
-        if [[ "$COMBINED_FAIL_STAGE" == sed_cfy && "$source_file" == "${work_dir}/cfy-url.txt" ]]; then
-            return 1
-        fi
-        command sed "$@"
+    awk() {
+        [[ "$COMBINED_FAIL_STAGE" != awk ]] || return 1
+        command awk "$@"
     }
-    printf() {
-        if [[ "$COMBINED_FAIL_STAGE" == separator && "$#" -eq 1 && "$1" == '\n' ]]; then
-            return 1
-        fi
-        builtin printf "$@"
+    base64() {
+        [[ "$COMBINED_FAIL_STAGE" != base64 ]] || return 1
+        command base64 "$@"
     }
     chmod() {
-        if [[ "$COMBINED_FAIL_STAGE" == chmod && "${2:-}" == "${work_dir}/.tmp.all-url."* ]]; then
+        if [[ "$COMBINED_FAIL_STAGE" == chmod && "$*" == *"${work_dir}/.tmp.all-url.txt."* ]]; then
             return 1
         fi
         command chmod "$@"
     }
 
     assert_fail sync_combined_subscription
-    unset -f sed printf chmod
+    unset -f awk base64 chmod
     assert_subscription_publications_unchanged
-    assert_no_temp_files "$work_dir" '.tmp.all-url.*' "${stage} failure left a combined-subscription temporary file"
+    assert_no_temp_files "$work_dir" '.tmp.all-url.txt.*' "${stage} failure left a combined-subscription temporary file"
 }
 
-for COMBINED_GENERATION_FAILURE in sed_client sed_cfy separator chmod; do
+for COMBINED_GENERATION_FAILURE in awk base64 chmod; do
     run_combined_generation_failure "$COMBINED_GENERATION_FAILURE"
 done
 
@@ -843,24 +845,24 @@ run_get_info_generation_failure() {
         fi
         command mv "$@"
     }
-    update_sub() {
+    publish_generated_base() {
         INFO_UPDATE_CALLED=1
         return 0
     }
     chmod() { command chmod "$@"; }
 
     assert_fail get_info
-    unset -f mktemp cat mv update_sub chmod
+    unset -f mktemp cat mv publish_generated_base chmod
     assert_file_content 'custom://preserved' "$client_dir" "${stage} failure replaced url.txt"
-    [[ "$INFO_UPDATE_CALLED" -eq 0 ]] || fail "${stage} failure still called update_sub"
+    [[ "$INFO_UPDATE_CALLED" -eq 0 ]] || fail "${stage} failure still called publish_generated_base"
     assert_no_temp_files "$work_dir" '.tmp.url.txt.*' "${stage} failure left a url.txt temporary file"
 }
 
-for INFO_GENERATION_FAILURE in truncate heredoc append mv; do
+for INFO_GENERATION_FAILURE in truncate heredoc append; do
     run_get_info_generation_failure "$INFO_GENERATION_FAILURE"
 done
 
-source <(printf '%s\n' "$(extract_function update_sub)")
+source <(printf '%s\n' "$(extract_function publish_generated_base)")
 mv() {
     local target=''
     for target in "$@"; do :; done
@@ -879,6 +881,13 @@ assert_fail get_info
 setup_get_info_fixture chmod
 assert_fail get_info
 unset -f mv chmod
+
+setup_get_info_fixture first_install
+command rm -f "$client_dir"
+assert_ok get_info
+[[ -s "$client_dir" ]] || fail 'first-install get_info did not commit its staged url.txt'
+cmp -s "$combined_client_dir" <(base64 -d "${work_dir}/sub.txt") || \
+    fail 'first-install get_info did not publish the same complete URL generation'
 
 add_nginx_source="$(sed -n '/^add_nginx_conf() {/,/^# 从已安装配置中获取UUID/p' "$script" | sed '$d')"
 [[ -n "$add_nginx_source" ]] || fail 'add_nginx_conf is not implemented'
