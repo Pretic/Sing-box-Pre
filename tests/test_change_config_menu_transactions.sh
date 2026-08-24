@@ -45,8 +45,9 @@ reading() {
     READ_INDEX=$((READ_INDEX + 1))
 }
 
-change_public_port_transaction() {
-    LAST_CALL="public:$1:$2"
+change_public_inbound_port_transaction() {
+    [[ "$1" == "${conf_dir}/inbounds.json" ]] || return 2
+    LAST_CALL="public:$2:$3:$4"
     return "$TX_STATUS"
 }
 change_argo_port_transaction() {
@@ -102,7 +103,7 @@ CHECK_STATUS=0
 TX_STATUS=2
 reset_case 1 1 12001
 if change_config >/dev/null 2>&1; then status=0; else status=$?; fi
-[[ "$status" -eq 2 && "$LAST_CALL" == public:reality:12001 ]] || \
+[[ "$status" -eq 2 && "$LAST_CALL" == public:reality:12001:tcp ]] || \
     fail 'Reality menu swallowed rc2 or bypassed the transaction wrapper'
 ! grep -Fq 'vless-reality端口已修改成' "$GREEN_LOG" || fail 'Reality rc2 printed a false success message'
 
@@ -141,7 +142,7 @@ if change_config >/dev/null 2>&1; then status=0; else status=$?; fi
 TX_STATUS=0
 reset_case 1 2 12002
 change_config >/dev/null 2>&1 || fail 'successful Hysteria2 menu transaction failed'
-[[ "$LAST_CALL" == public:hysteria2:12002 ]] || fail 'Hysteria2 menu bypassed the transaction wrapper'
+[[ "$LAST_CALL" == public:hysteria2:12002:udp ]] || fail 'Hysteria2 menu bypassed the transaction wrapper'
 grep -Fq 'hysteria2端口已修改为' "$GREEN_LOG" || fail 'successful menu transaction omitted its success message'
 
 printf 'Change-config menu transaction tests passed.\n'

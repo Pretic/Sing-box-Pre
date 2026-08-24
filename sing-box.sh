@@ -5113,6 +5113,125 @@ commit_subscription_frontend_state_transaction() {
     chmod 600 "$state_target"
 }
 
+ensure_nginx_conf_d_include() {
+    local main_conf="${1:-}"
+    local nginx_conf_dir="${2:-}"
+    local tmp_file mode
+
+    [ -f "$main_conf" ] && [ ! -L "$main_conf" ] && [ -n "$nginx_conf_dir" ] || return 1
+    if awk -v wanted="${nginx_conf_dir}/*.conf;" '
+        {
+            line=$0
+            sub(/[[:space:]]*#.*/, "", line)
+            if ($1 == "include" && $2 == wanted) found=1
+        }
+        END { exit !found }
+    ' "$main_conf"; then
+        return 0
+    fi
+
+    tmp_file=$(mktemp "$(dirname "$main_conf")/.nginx-main.XXXXXX") || return 1
+    if ! awk -v include_path="$nginx_conf_dir" '
+        BEGIN { in_http=0; depth=0; inserted=0 }
+        {
+            code=$0
+            sub(/[[:space:]]*#.*/, "", code)
+            open_copy=code
+            close_copy=code
+            opens=gsub(/\{/, "", open_copy)
+            closes=gsub(/\}/, "", close_copy)
+            if (!in_http && code ~ /^[[:space:]]*http[[:space:]]*\{/) {
+                in_http=1
+                depth=opens-closes
+                print
+                next
+            }
+            if (in_http) {
+                next_depth=depth+opens-closes
+                if (next_depth == 0 && closes > 0) {
+                    print "    # sing-box-pre:conf.d:start"
+                    print "    include " include_path "/*.conf;"
+                    print "    # sing-box-pre:conf.d:end"
+                    inserted=1
+                    in_http=0
+                }
+                depth=next_depth
+            }
+            print
+        }
+        END { if (!inserted) exit 42 }
+    ' "$main_conf" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    mode=$(stat -c '%a' "$main_conf" 2>/dev/null) || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    chmod "$mode" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    mv -f "$tmp_file" "$main_conf"
+}
+
+remove_managed_nginx_include() {
+    local main_conf="${1:-}"
+    local nginx_conf_dir="${2:-${NGINX_CONF_DIR:-/etc/nginx/conf.d}}"
+    local candidate tmp_file mode keep_owned_block=0
+
+    [ -e "$main_conf" ] || return 0
+    [ -f "$main_conf" ] && [ ! -L "$main_conf" ] || return 1
+    if [ -d "$nginx_conf_dir" ]; then
+        for candidate in "$nginx_conf_dir"/*.conf; do
+            [ -e "$candidate" ] || continue
+            [ "$(basename "$candidate")" = sing-box.conf ] || keep_owned_block=1
+        done
+    fi
+
+    tmp_file=$(mktemp "$(dirname "$main_conf")/.nginx-main-clean.XXXXXX") || return 1
+    if ! awk -v include_path="$nginx_conf_dir" -v keep="$keep_owned_block" '
+        function trim(value) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            return value
+        }
+        { lines[++count]=$0 }
+        END {
+            start_count=0
+            end_count=0
+            block_start=0
+            expected="include " include_path "/*.conf;"
+            for (i=1; i<=count; i++) {
+                if (lines[i] ~ /^[[:space:]]*# sing-box-pre:conf[.]d:start[[:space:]]*$/) {
+                    start_count++
+                    if (i+2 <= count && trim(lines[i+1]) == expected &&
+                        lines[i+2] ~ /^[[:space:]]*# sing-box-pre:conf[.]d:end[[:space:]]*$/) {
+                        block_start=i
+                    }
+                }
+                if (lines[i] ~ /^[[:space:]]*# sing-box-pre:conf[.]d:end[[:space:]]*$/) {
+                    end_count++
+                }
+            }
+            if (start_count == 0 && end_count == 0) {
+                for (i=1; i<=count; i++) print lines[i]
+                exit 0
+            }
+            if (start_count != 1 || end_count != 1 || block_start == 0) exit 42
+            for (i=1; i<=count; i++) {
+                if (!keep && i >= block_start && i <= block_start+2) continue
+                print lines[i]
+            }
+        }
+    ' "$main_conf" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    mode=$(stat -c '%a' "$main_conf" 2>/dev/null) || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    chmod "$mode" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    mv -f "$tmp_file" "$main_conf"
+}
+
 add_nginx_conf() {
     local main_conf="${NGINX_MAIN_CONF:-/etc/nginx/nginx.conf}"
     local nginx_conf_dir="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
@@ -5329,13 +5448,17 @@ update_public_inbound_port() {
 get_uniform_inbound_port() {
     local target_file="$1"
     local protocol="$2"
-    local port selector
+    local port
 
     port=$(jq -er --arg protocol "$protocol" '
         [.inbounds[] |
             select(
                 if $protocol == "reality" then
                     (.type == "vless" and ((.tag? // "") | startswith("vless-reality")))
+                elif $protocol == "argo" then
+                    (.type == "vless" and
+                     ((.tag? // "") == "vless-ws-argo" or
+                      (.tag? // "") == "vless-ws-argo-ipv6"))
                 else
                     .type == $protocol
                 end
@@ -5345,9 +5468,781 @@ get_uniform_inbound_port() {
         then $ports[0]
         else empty
         end
-    " "$target_file") || return 1
+    ' "$target_file") || return 1
     validate_port_value "$port" "${protocol}_port" || return 1
     printf '%s\n' "$port"
+}
+
+validate_uuid_value() {
+    local value="${1:-}"
+
+    [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+}
+
+node_change_snapshot_path() {
+    local source_path="${1:-}"
+    local transaction_dir="${2:-}"
+    local source_key="${3:-}"
+    local snapshot_path marker_path
+
+    [ -n "$source_path" ] && [ -d "$transaction_dir" ] && [ ! -L "$transaction_dir" ] || return 1
+    [[ "$source_key" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    snapshot_path="${transaction_dir}/${source_key}.data"
+    marker_path="${transaction_dir}/${source_key}"
+    [ ! -e "$snapshot_path" ] && [ ! -L "$snapshot_path" ] || return 1
+    [ ! -e "${marker_path}.present" ] && [ ! -e "${marker_path}.absent" ] || return 1
+
+    if [ -e "$source_path" ] || [ -L "$source_path" ]; then
+        cp -a -- "$source_path" "$snapshot_path" || return 1
+        : > "${marker_path}.present" || return 1
+        chmod 600 "${marker_path}.present" || return 1
+    else
+        : > "${marker_path}.absent" || return 1
+        chmod 600 "${marker_path}.absent" || return 1
+    fi
+}
+
+node_change_restore_path() {
+    local destination_path="${1:-}"
+    local transaction_dir="${2:-}"
+    local source_key="${3:-}"
+    local snapshot_path marker_path destination_parent
+
+    [ -n "$destination_path" ] && [ "$destination_path" != / ] || return 1
+    [ -d "$transaction_dir" ] && [ ! -L "$transaction_dir" ] || return 1
+    [[ "$source_key" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    snapshot_path="${transaction_dir}/${source_key}.data"
+    marker_path="${transaction_dir}/${source_key}"
+
+    if [ -f "${marker_path}.present" ] && [ ! -e "${marker_path}.absent" ]; then
+        [ -e "$snapshot_path" ] || [ -L "$snapshot_path" ] || return 1
+        destination_parent=$(dirname "$destination_path") || return 1
+        mkdir -p -- "$destination_parent" || return 1
+        if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
+            rm -rf -- "$destination_path" || return 1
+        fi
+        cp -a -- "$snapshot_path" "$destination_path" || return 1
+        if [ -L "$snapshot_path" ]; then
+            [ -L "$destination_path" ] && \
+                [ "$(readlink -- "$snapshot_path")" = "$(readlink -- "$destination_path")" ]
+        elif [ -f "$snapshot_path" ]; then
+            cmp -s -- "$snapshot_path" "$destination_path"
+        elif [ -d "$snapshot_path" ]; then
+            diff -qr -- "$snapshot_path" "$destination_path" >/dev/null 2>&1
+        else
+            [ -e "$destination_path" ]
+        fi
+    elif [ -f "${marker_path}.absent" ] && [ ! -e "${marker_path}.present" ]; then
+        if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
+            rm -rf -- "$destination_path" || return 1
+        fi
+        [ ! -e "$destination_path" ] && [ ! -L "$destination_path" ]
+    else
+        return 1
+    fi
+}
+
+acquire_node_subscription_lock() {
+    local lock_root="${1:-}"
+    local timeout_seconds="${NODE_SUB_LOCK_TIMEOUT_SECONDS:-30}"
+    local started_at lock_owner
+
+    [ -d "$lock_root" ] && [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+    NODE_SUB_LOCK_PATH="${lock_root}/.subscription-publish.lock.d"
+    started_at=$SECONDS
+    while :; do
+        if (umask 077 && mkdir -- "$NODE_SUB_LOCK_PATH" 2>/dev/null); then
+            chmod 700 "$NODE_SUB_LOCK_PATH" || {
+                rmdir -- "$NODE_SUB_LOCK_PATH" 2>/dev/null || true
+                return 1
+            }
+            printf '%s\n' "$BASHPID" > "${NODE_SUB_LOCK_PATH}/owner" || {
+                rm -f -- "${NODE_SUB_LOCK_PATH}/owner"
+                rmdir -- "$NODE_SUB_LOCK_PATH" 2>/dev/null || true
+                return 1
+            }
+            chmod 600 "${NODE_SUB_LOCK_PATH}/owner" || {
+                rm -f -- "${NODE_SUB_LOCK_PATH}/owner"
+                rmdir -- "$NODE_SUB_LOCK_PATH" 2>/dev/null || true
+                return 1
+            }
+            return 0
+        fi
+        if [ -d "$NODE_SUB_LOCK_PATH" ] && [ ! -L "$NODE_SUB_LOCK_PATH" ] && \
+           [ -r "${NODE_SUB_LOCK_PATH}/owner" ]; then
+            lock_owner=$(cat "${NODE_SUB_LOCK_PATH}/owner" 2>/dev/null || true)
+            if [[ "$lock_owner" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
+                rm -f -- "${NODE_SUB_LOCK_PATH}/owner" 2>/dev/null || true
+                rmdir -- "$NODE_SUB_LOCK_PATH" 2>/dev/null || true
+                continue
+            fi
+        fi
+        [ "$((SECONDS - started_at))" -lt "$timeout_seconds" ] || return 1
+        sleep 0.1
+    done
+}
+
+release_node_subscription_lock() {
+    local lock_path="${NODE_SUB_LOCK_PATH:-}"
+
+    if [ -n "$lock_path" ] && [ -d "$lock_path" ] && [ ! -L "$lock_path" ]; then
+        rm -f -- "${lock_path}/owner" 2>/dev/null || true
+        rmdir -- "$lock_path" 2>/dev/null || true
+    fi
+    NODE_SUB_LOCK_PATH=''
+}
+
+# Temporary compatibility adapter for the lifecycle branch.  The outer config
+# lock is already held, so this takes the subscription lock second and commits
+# a staged base client exactly once.  The subscription-audit merge replaces
+# this body with mutate_base_subscription/publish_subscriptions_locked.  It
+# must never write or restore cfy-url.txt/cfy-sub.txt.
+publish_node_change_subscription() {
+    local staged_client="${1:-}"
+    local subscription_dir='' publish_status=0 rollback_ok=1 recovery_dir=''
+    local client_mode index subscription_committed=0 subscription_traps_installed=0
+    local subscription_previous_hup='' subscription_previous_int=''
+    local subscription_previous_term='' subscription_previous_exit=''
+    local -a owned_paths owned_keys
+
+    _restore_node_subscription_traps() {
+        [ "$subscription_traps_installed" -eq 1 ] || return 0
+        trap - HUP INT TERM EXIT
+        [ -z "$subscription_previous_hup" ] || eval "$subscription_previous_hup"
+        [ -z "$subscription_previous_int" ] || eval "$subscription_previous_int"
+        [ -z "$subscription_previous_term" ] || eval "$subscription_previous_term"
+        [ -z "$subscription_previous_exit" ] || eval "$subscription_previous_exit"
+        subscription_traps_installed=0
+    }
+
+    _retain_node_subscription_recovery() {
+        local reason="${1:-interrupted}"
+
+        recovery_dir="${work_dir}/.node-subscription-recovery.${subscription_dir##*.node-subscription.}"
+        if [ "$subscription_dir" != "$recovery_dir" ]; then
+            mv -- "$subscription_dir" "$recovery_dir" 2>/dev/null || recovery_dir="$subscription_dir"
+        fi
+        {
+            printf 'reason=%s\n' "$reason"
+            printf 'committed=%s\n' "$subscription_committed"
+            printf 'rollback_complete=%s\n' "$rollback_ok"
+        } > "${recovery_dir}/transaction.conf" 2>/dev/null || true
+        chmod 700 "$recovery_dir" 2>/dev/null || true
+        chmod 600 "${recovery_dir}/transaction.conf" 2>/dev/null || true
+    }
+
+    _node_subscription_interrupt_handler() {
+        local event="${1:-EXIT}"
+        local original_status="${2:-2}"
+        local final_status="$original_status"
+
+        trap - HUP INT TERM EXIT
+        rollback_ok=1
+        if [ "$subscription_committed" -eq 0 ] && [ -d "$subscription_dir" ]; then
+            for ((index=${#owned_paths[@]} - 1; index >= 0; index--)); do
+                node_change_restore_path "${owned_paths[$index]}" "$subscription_dir" \
+                    "${owned_keys[$index]}" || rollback_ok=0
+            done
+        fi
+        [ "$final_status" -ne 0 ] || final_status=2
+        _retain_node_subscription_recovery "${event}:${final_status}"
+        release_node_subscription_lock
+        _restore_node_subscription_traps
+        red "订阅发布被 ${event} 中断；恢复材料已保留：${recovery_dir}" >&2
+        exit "$final_status"
+    }
+
+    [ -f "$staged_client" ] && [ ! -L "$staged_client" ] || return 1
+    acquire_node_subscription_lock "$work_dir" || return 1
+    subscription_dir=$(umask 077; mktemp -d "${work_dir}/.node-subscription.XXXXXX") || {
+        release_node_subscription_lock
+        return 1
+    }
+    chmod 700 "$subscription_dir" || {
+        rm -rf -- "$subscription_dir" >/dev/null 2>&1 || true
+        release_node_subscription_lock
+        return 1
+    }
+    owned_paths=(
+        "$client_dir"
+        "${work_dir}/base-sub.txt"
+        "$combined_client_dir"
+        "${work_dir}/all-sub.txt"
+        "${work_dir}/sub.txt"
+    )
+    owned_keys=(client base-sub combined-client all-sub sub)
+    for index in "${!owned_paths[@]}"; do
+        if ! node_change_snapshot_path "${owned_paths[$index]}" "$subscription_dir" \
+            "${owned_keys[$index]}"; then
+            rm -rf -- "$subscription_dir" >/dev/null 2>&1 || true
+            release_node_subscription_lock
+            return 1
+        fi
+    done
+    subscription_previous_hup=$(trap -p HUP || true)
+    subscription_previous_int=$(trap -p INT || true)
+    subscription_previous_term=$(trap -p TERM || true)
+    subscription_previous_exit=$(trap -p EXIT || true)
+    trap '_node_subscription_interrupt_handler HUP 129' HUP
+    trap '_node_subscription_interrupt_handler INT 130' INT
+    trap '_node_subscription_interrupt_handler TERM 143' TERM
+    trap '_node_subscription_interrupt_handler EXIT $?' EXIT
+    subscription_traps_installed=1
+
+    client_mode=$(stat -c '%a' "$client_dir" 2>/dev/null || printf '%s' 600)
+    if ! cp -p -- "$staged_client" "${subscription_dir}/client.candidate" ||
+       ! chmod "$client_mode" "${subscription_dir}/client.candidate" ||
+       ! mv -f -- "${subscription_dir}/client.candidate" "$client_dir"; then
+        rollback_ok=1
+        for ((index=${#owned_paths[@]} - 1; index >= 0; index--)); do
+            node_change_restore_path "${owned_paths[$index]}" "$subscription_dir" \
+                "${owned_keys[$index]}" || rollback_ok=0
+        done
+        if [ "$rollback_ok" -eq 1 ] && rm -rf -- "$subscription_dir"; then
+            _restore_node_subscription_traps
+            release_node_subscription_lock
+            return 1
+        fi
+        recovery_dir="${work_dir}/.node-subscription-recovery.${subscription_dir##*.node-subscription.}"
+        mv -- "$subscription_dir" "$recovery_dir" 2>/dev/null || recovery_dir="$subscription_dir"
+        _restore_node_subscription_traps
+        release_node_subscription_lock
+        red "订阅基础源提交失败且回滚不完整；恢复材料已保留：${recovery_dir}"
+        return 2
+    fi
+
+    if update_sub; then
+        publish_status=0
+    else
+        publish_status=$?
+    fi
+    case "$publish_status" in
+        0|3) ;;
+        *)
+            rollback_ok=1
+            for ((index=${#owned_paths[@]} - 1; index >= 0; index--)); do
+                node_change_restore_path "${owned_paths[$index]}" "$subscription_dir" \
+                    "${owned_keys[$index]}" || rollback_ok=0
+            done
+            if [ "$rollback_ok" -eq 1 ] && [ "$publish_status" -eq 1 ] && \
+               rm -rf -- "$subscription_dir"; then
+                _restore_node_subscription_traps
+                release_node_subscription_lock
+                return 1
+            fi
+            recovery_dir="${work_dir}/.node-subscription-recovery.${subscription_dir##*.node-subscription.}"
+            mv -- "$subscription_dir" "$recovery_dir" 2>/dev/null || recovery_dir="$subscription_dir"
+            {
+                printf 'publish_status=%s\n' "$publish_status"
+                printf 'rollback_complete=%s\n' "$rollback_ok"
+            } > "${recovery_dir}/transaction.conf" 2>/dev/null || true
+            chmod 700 "$recovery_dir" 2>/dev/null || true
+            chmod 600 "${recovery_dir}/transaction.conf" 2>/dev/null || true
+            _restore_node_subscription_traps
+            release_node_subscription_lock
+            red "订阅发布状态不确定或回滚不完整；恢复材料已保留：${recovery_dir}"
+            return 2
+            ;;
+    esac
+
+    subscription_committed=1
+    if ! rm -rf -- "$subscription_dir"; then
+        _restore_node_subscription_traps
+        release_node_subscription_lock
+        yellow "订阅已提交，但安全临时目录未能清理：${subscription_dir}"
+        return 3
+    fi
+    _restore_node_subscription_traps
+    release_node_subscription_lock
+    return "$publish_status"
+}
+
+apply_node_change_transaction() {
+    local mutation_function="${1:-}"
+    local restart_required="${2:-1}"
+    local old_firewall_spec="${3:-}"
+    local new_firewall_rule="${4:-}"
+    shift 4 || return 1
+    local transaction_dir='' recovery_dir='' staged_client='' original_client=''
+    local transaction_status=0 failure_status=0
+    local failure_reason='' rollback_ok=1 cleanup_status=0 publish_status=0
+    local service_was_active=0 argo_was_active=0 argo_restart_attempted=0
+    local conflict_status=0 open_status=0 lock_status=0 old_firewall_rule=''
+    local old_protocol='' old_port='' transport='' new_port='' new_transport=''
+    local old_runtime_PORT="${PORT-}" old_runtime_REALITY_PORT="${REALITY_PORT-}"
+    local old_runtime_NGINX_PORT="${NGINX_PORT-}" old_runtime_TUIC_PORT="${TUIC_PORT-}"
+    local old_runtime_HY2_PORT="${HY2_PORT-}" old_runtime_ARGO_PORT="${ARGO_PORT-}"
+    local old_runtime_vless_port="${vless_port-}" old_runtime_nginx_port="${nginx_port-}"
+    local old_runtime_tuic_port="${tuic_port-}" old_runtime_hy2_port="${hy2_port-}"
+    local old_runtime_argo_port="${argo_port-}"
+    local old_set_PORT="${PORT+x}" old_set_REALITY_PORT="${REALITY_PORT+x}"
+    local old_set_NGINX_PORT="${NGINX_PORT+x}" old_set_TUIC_PORT="${TUIC_PORT+x}"
+    local old_set_HY2_PORT="${HY2_PORT+x}" old_set_ARGO_PORT="${ARGO_PORT+x}"
+    local old_set_vless_port="${vless_port+x}" old_set_nginx_port="${nginx_port+x}"
+    local old_set_tuic_port="${tuic_port+x}" old_set_hy2_port="${hy2_port+x}"
+    local old_set_argo_port="${argo_port+x}"
+    local -a snapshot_paths snapshot_keys new_firewall_records=()
+    local index node_change_committed=0 node_change_traps_installed=0 NODE_CHANGE_STAGE='preparing'
+    local NODE_CHANGE_REQUIRE_ARGO_RESTART=0 NODE_CHANGE_NOOP=0
+    local NODE_CHANGE_ARGO_MODE='' quick_previous_domain='' quick_current_domain=''
+    local node_change_previous_hup='' node_change_previous_int=''
+    local node_change_previous_term='' node_change_previous_exit=''
+
+    _restore_node_change_traps() {
+        [ "$node_change_traps_installed" -eq 1 ] || return 0
+        trap - HUP INT TERM EXIT
+        [ -z "$node_change_previous_hup" ] || eval "$node_change_previous_hup"
+        [ -z "$node_change_previous_int" ] || eval "$node_change_previous_int"
+        [ -z "$node_change_previous_term" ] || eval "$node_change_previous_term"
+        [ -z "$node_change_previous_exit" ] || eval "$node_change_previous_exit"
+        node_change_traps_installed=0
+    }
+
+    _restore_node_change_runtime_values() {
+        if [ -n "$old_set_PORT" ]; then PORT="$old_runtime_PORT"; export PORT; else unset PORT; fi
+        if [ -n "$old_set_REALITY_PORT" ]; then REALITY_PORT="$old_runtime_REALITY_PORT"; export REALITY_PORT; else unset REALITY_PORT; fi
+        if [ -n "$old_set_NGINX_PORT" ]; then NGINX_PORT="$old_runtime_NGINX_PORT"; export NGINX_PORT; else unset NGINX_PORT; fi
+        if [ -n "$old_set_TUIC_PORT" ]; then TUIC_PORT="$old_runtime_TUIC_PORT"; export TUIC_PORT; else unset TUIC_PORT; fi
+        if [ -n "$old_set_HY2_PORT" ]; then HY2_PORT="$old_runtime_HY2_PORT"; export HY2_PORT; else unset HY2_PORT; fi
+        if [ -n "$old_set_ARGO_PORT" ]; then ARGO_PORT="$old_runtime_ARGO_PORT"; export ARGO_PORT; else unset ARGO_PORT; fi
+        if [ -n "$old_set_vless_port" ]; then vless_port="$old_runtime_vless_port"; export vless_port; else unset vless_port; fi
+        if [ -n "$old_set_nginx_port" ]; then nginx_port="$old_runtime_nginx_port"; export nginx_port; else unset nginx_port; fi
+        if [ -n "$old_set_tuic_port" ]; then tuic_port="$old_runtime_tuic_port"; export tuic_port; else unset tuic_port; fi
+        if [ -n "$old_set_hy2_port" ]; then hy2_port="$old_runtime_hy2_port"; export hy2_port; else unset hy2_port; fi
+        if [ -n "$old_set_argo_port" ]; then argo_port="$old_runtime_argo_port"; export argo_port; else unset argo_port; fi
+    }
+
+    _restore_node_change_argo_runtime() {
+        local recovery_previous_domain recovery_domain recovery_publish_status
+
+        [ "$NODE_CHANGE_REQUIRE_ARGO_RESTART" -eq 1 ] || return 0
+        if [ "$argo_was_active" -eq 1 ]; then
+            [ "$argo_restart_attempted" -eq 1 ] || return 0
+            if [ "$NODE_CHANGE_ARGO_MODE" = quick ]; then
+                [ -f "$original_client" ] && [ ! -L "$original_client" ] || return 1
+                cp -p -- "$original_client" "$staged_client" && chmod 600 "$staged_client" || return 1
+                recovery_previous_domain=$(extract_staged_argo_domain "$staged_client") || return 1
+                prepare_quick_argo_domain_capture || return 1
+            fi
+            NODE_CHANGE_STAGE='argo-rollback-restarting'
+            restart_argo_checked >/dev/null 2>&1 && argo_service_is_active || return 1
+            if [ "$NODE_CHANGE_ARGO_MODE" = quick ]; then
+                NODE_CHANGE_STAGE='argo-rollback-domain'
+                recovery_domain=$(wait_for_new_quick_argo_domain "$recovery_previous_domain") || return 1
+                update_staged_argo_domain_file "$staged_client" "$recovery_domain" || return 1
+                NODE_CHANGE_STAGE='argo-rollback-publishing'
+                if publish_node_change_subscription "$staged_client"; then
+                    recovery_publish_status=0
+                else
+                    recovery_publish_status=$?
+                fi
+                [ "$recovery_publish_status" -eq 0 ] || return 1
+                quick_current_domain="$recovery_domain"
+            fi
+        elif argo_service_is_active; then
+            stop_argo_checked >/dev/null 2>&1 && ! argo_service_is_active || return 1
+        fi
+    }
+
+    _retain_node_change_recovery() {
+        local reason="${1:-interrupted}"
+
+        recovery_dir="${work_dir}/.node-change-recovery.${transaction_dir##*.node-change.}"
+        if [ "$transaction_dir" != "$recovery_dir" ]; then
+            mv -- "$transaction_dir" "$recovery_dir" 2>/dev/null || recovery_dir="$transaction_dir"
+        fi
+        {
+            printf '\nreason=%s\n' "$reason"
+            printf 'stage=%s\n' "$NODE_CHANGE_STAGE"
+            printf 'committed=%s\n' "$node_change_committed"
+            printf 'rollback_complete=%s\n' "$rollback_ok"
+        } >> "${recovery_dir}/transaction.conf" 2>/dev/null || true
+        chmod 700 "$recovery_dir" 2>/dev/null || true
+        chmod 600 "${recovery_dir}/transaction.conf" 2>/dev/null || true
+    }
+
+    _node_change_interrupt_handler() {
+        local event="${1:-EXIT}"
+        local original_status="${2:-2}"
+        local final_status="$original_status"
+
+        trap - HUP INT TERM EXIT
+        rollback_ok=1
+        if [ "$node_change_committed" -eq 0 ] && [ -d "$transaction_dir" ]; then
+            for ((index=${#snapshot_paths[@]} - 1; index >= 0; index--)); do
+                node_change_restore_path "${snapshot_paths[$index]}" "$transaction_dir" \
+                    "${snapshot_keys[$index]}" || rollback_ok=0
+            done
+            _restore_node_change_runtime_values
+            if [ "$restart_required" -eq 1 ]; then
+                if [ "$service_was_active" -eq 1 ]; then
+                    restart_singbox_checked >/dev/null 2>&1 && singbox_service_is_active || rollback_ok=0
+                elif singbox_service_is_active; then
+                    stop_singbox_checked >/dev/null 2>&1 && ! singbox_service_is_active || rollback_ok=0
+                fi
+            fi
+            _restore_node_change_argo_runtime || rollback_ok=0
+            if [ "${#new_firewall_records[@]}" -gt 0 ]; then
+                remove_owned_firewall_records_exact "${new_firewall_records[@]}" || rollback_ok=0
+            fi
+            [ "$NODE_CHANGE_STAGE" != publishing ] || rollback_ok=0
+        fi
+        [ "$final_status" -ne 0 ] || final_status=2
+        _retain_node_change_recovery "${event}:${final_status}"
+        release_proxy_transaction_lock
+        _restore_node_change_traps
+        red "配置事务被 ${event} 中断；恢复材料已保留：${recovery_dir}" >&2
+        exit "$final_status"
+    }
+
+    [[ "$mutation_function" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && declare -F "$mutation_function" >/dev/null || return 1
+    case "$restart_required" in 0|1) ;; *) return 1 ;; esac
+    [ -d "$conf_dir" ] && [ -d "$work_dir" ] || return 1
+
+    if acquire_proxy_transaction_lock "$conf_dir"; then
+        lock_status=0
+    else
+        lock_status=$?
+    fi
+    case "$lock_status" in
+        0) ;;
+        1)
+            red "另一个配置事务仍在运行，本次修改已中止。"
+            return 1
+            ;;
+        2)
+            red "检测到未决配置事务，无法确认当前状态；本次修改已安全中止。"
+            return 2
+            ;;
+        *)
+            red "配置事务锁返回未知状态；本次修改已安全中止。"
+            return 2
+            ;;
+    esac
+
+    transaction_dir=$(umask 077; mktemp -d "${work_dir}/.node-change.XXXXXX") || {
+        release_proxy_transaction_lock
+        return 1
+    }
+    chmod 700 "$transaction_dir" || {
+        rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+        release_proxy_transaction_lock
+        return 1
+    }
+
+    if [ -n "$new_firewall_rule" ]; then
+        for index in allow_port remove_owned_firewall_records_exact \
+            remove_owned_firewall_ports_if_unused configured_inbound_port_conflict_exists; do
+            if ! declare -F "$index" >/dev/null; then
+                rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                release_proxy_transaction_lock
+                red "防火墙事务接口不完整，端口修改已安全中止。"
+                return 2
+            fi
+        done
+        new_port="${new_firewall_rule%/*}"
+        new_transport="${new_firewall_rule#*/}"
+        validate_port_value "$new_port" port || {
+            rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+            release_proxy_transaction_lock
+            return 1
+        }
+        case "$new_transport" in tcp|udp) ;; *)
+            rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+            release_proxy_transaction_lock
+            return 1
+        esac
+
+        case "$old_firewall_spec" in
+            auto:*)
+                old_protocol="${old_firewall_spec#auto:}"
+                old_port=$(get_uniform_inbound_port "${conf_dir}/inbounds.json" "$old_protocol") || {
+                    rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                    release_proxy_transaction_lock
+                    return 1
+                }
+                case "$old_protocol" in
+                    reality) transport=tcp ;;
+                    hysteria2|tuic) transport=udp ;;
+                    *)
+                        rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                        release_proxy_transaction_lock
+                        return 1
+                        ;;
+                esac
+                old_firewall_rule="${old_port}/${transport}"
+                ;;
+            '') old_firewall_rule='' ;;
+            *) old_firewall_rule="$old_firewall_spec" ;;
+        esac
+
+        if [ "$old_firewall_rule" = "$new_firewall_rule" ]; then
+            rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+            release_proxy_transaction_lock
+            return 0
+        fi
+
+        configured_inbound_port_conflict_exists "${conf_dir}/inbounds.json" "$new_port" "$new_transport"
+        conflict_status=$?
+        case "$conflict_status" in
+            0)
+                rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                release_proxy_transaction_lock
+                red "目标端口已被现有入站占用。"
+                return 1
+                ;;
+            1) ;;
+            *)
+                rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                release_proxy_transaction_lock
+                red "无法安全确认目标端口是否冲突。"
+                return 2
+                ;;
+        esac
+    fi
+
+    snapshot_paths=(
+        "${conf_dir}/inbounds.json"
+        "$install_env_file"
+        "${work_dir}/tunnel.yml"
+        "${ARGO_SYSTEMD_SERVICE_FILE:-/etc/systemd/system/argo.service}"
+        "${ARGO_OPENRC_SERVICE_FILE:-/etc/init.d/argo}"
+    )
+    snapshot_keys=(
+        inbounds install-env tunnel-yml argo-systemd argo-openrc
+    )
+    for index in "${!snapshot_paths[@]}"; do
+        if ! node_change_snapshot_path "${snapshot_paths[$index]}" "$transaction_dir" "${snapshot_keys[$index]}"; then
+            rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+            release_proxy_transaction_lock
+            return 1
+        fi
+    done
+    {
+        printf 'operation=%s\n' "$mutation_function"
+        printf 'old_firewall_rule=%s\n' "$old_firewall_rule"
+        printf 'new_firewall_rule=%s\n' "$new_firewall_rule"
+        printf 'restart_required=%s\n' "$restart_required"
+    } > "${transaction_dir}/transaction.conf" || {
+        rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+        release_proxy_transaction_lock
+        return 1
+    }
+    chmod 600 "${transaction_dir}/transaction.conf" || {
+        rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+        release_proxy_transaction_lock
+        return 1
+    }
+    staged_client="${transaction_dir}/staged-client"
+    original_client="${transaction_dir}/original-client"
+    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] && \
+        cp -p -- "$client_dir" "$staged_client" && chmod 600 "$staged_client" && \
+        cp -p -- "$staged_client" "$original_client" && chmod 600 "$original_client" || {
+        rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+        release_proxy_transaction_lock
+        return 1
+    }
+    NODE_CHANGE_STAGE='staged'
+
+    if singbox_service_is_active; then
+        service_was_active=1
+    fi
+    if declare -F argo_service_is_active >/dev/null && argo_service_is_active; then
+        argo_was_active=1
+    fi
+    node_change_previous_hup=$(trap -p HUP || true)
+    node_change_previous_int=$(trap -p INT || true)
+    node_change_previous_term=$(trap -p TERM || true)
+    node_change_previous_exit=$(trap -p EXIT || true)
+    trap '_node_change_interrupt_handler HUP 129' HUP
+    trap '_node_change_interrupt_handler INT 130' INT
+    trap '_node_change_interrupt_handler TERM 143' TERM
+    trap '_node_change_interrupt_handler EXIT $?' EXIT
+    node_change_traps_installed=1
+
+    if [ -n "$new_firewall_rule" ]; then
+        allow_port "$new_firewall_rule"
+        open_status=$?
+        case "$open_status" in
+            0)
+                if declare -p FIREWALL_LAST_ADDED_RECORDS >/dev/null 2>&1; then
+                    new_firewall_records=("${FIREWALL_LAST_ADDED_RECORDS[@]}")
+                fi
+                ;;
+            1)
+                rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                _restore_node_change_traps
+                release_proxy_transaction_lock
+                return 1
+                ;;
+            *)
+                rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                _restore_node_change_traps
+                release_proxy_transaction_lock
+                return 2
+                ;;
+        esac
+    fi
+
+    NODE_CHANGE_STAGE='mutating'
+    if "$mutation_function" "$staged_client" "$@"; then
+        transaction_status=0
+    else
+        transaction_status=$?
+        failure_status=1
+        [ "$transaction_status" -eq 2 ] && failure_status=2
+        failure_reason="配置文件修改失败"
+    fi
+    if [ "$NODE_CHANGE_NOOP" -eq 1 ]; then
+        NODE_CHANGE_STAGE='no-op'
+        if ! rm -rf -- "$transaction_dir"; then
+            _restore_node_change_traps
+            release_proxy_transaction_lock
+            if [ "$failure_status" -eq 0 ]; then
+                yellow "配置已是目标状态，但安全临时目录未能清理：${transaction_dir}"
+                return 3
+            fi
+            yellow "配置未变更，但安全临时目录未能清理：${transaction_dir}"
+            return "$failure_status"
+        fi
+        _restore_node_change_traps
+        release_proxy_transaction_lock
+        return "$failure_status"
+    fi
+    if [ "$failure_status" -eq 0 ] && ! validate_singbox_config; then
+        failure_status=1
+        failure_reason="sing-box 配置校验失败"
+    elif [ "$failure_status" -eq 0 ] && [ "$restart_required" -eq 1 ] && [ "$service_was_active" -eq 1 ] && \
+         { NODE_CHANGE_STAGE='restarting'; ! restart_singbox_checked || ! singbox_service_is_active; }; then
+        failure_status=1
+        failure_reason="sing-box 运行状态提交失败"
+    elif [ "$failure_status" -eq 0 ] && [ "$NODE_CHANGE_REQUIRE_ARGO_RESTART" -eq 1 ]; then
+        for index in argo_service_is_active restart_argo_checked stop_argo_checked; do
+            if ! declare -F "$index" >/dev/null; then
+                failure_status=2
+                failure_reason="Argo 服务事务接口不完整"
+                break
+            fi
+        done
+        if [ "$failure_status" -eq 0 ] && [ "$argo_was_active" -eq 1 ] && \
+           [ "$NODE_CHANGE_ARGO_MODE" = quick ]; then
+            quick_previous_domain=$(extract_staged_argo_domain "$staged_client") || {
+                failure_status=1
+                failure_reason="无法确认原临时 Argo 域名"
+            }
+            if [ "$failure_status" -eq 0 ] && ! prepare_quick_argo_domain_capture; then
+                failure_status=1
+                failure_reason="无法安全准备临时 Argo 域名捕获"
+            fi
+        fi
+        if [ "$failure_status" -eq 0 ] && [ "$argo_was_active" -eq 1 ]; then
+            NODE_CHANGE_STAGE='argo-restarting'
+            argo_restart_attempted=1
+            if ! restart_argo_checked || ! argo_service_is_active; then
+                failure_status=1
+                failure_reason="Argo 运行状态提交失败"
+            fi
+        fi
+        if [ "$failure_status" -eq 0 ] && [ "$argo_was_active" -eq 1 ] && \
+           [ "$NODE_CHANGE_ARGO_MODE" = quick ]; then
+            NODE_CHANGE_STAGE='argo-domain'
+            quick_current_domain=$(wait_for_new_quick_argo_domain "$quick_previous_domain") || {
+                failure_status=1
+                failure_reason="未能取得新的临时 Argo 域名"
+            }
+            if [ "$failure_status" -eq 0 ] && \
+               ! update_staged_argo_domain_file "$staged_client" "$quick_current_domain"; then
+                failure_status=1
+                failure_reason="新的临时 Argo 域名未能写入待发布订阅"
+            fi
+        fi
+    fi
+    if [ "$failure_status" -eq 0 ]; then
+        NODE_CHANGE_STAGE='publishing'
+        if publish_node_change_subscription "$staged_client"; then
+            publish_status=0
+        else
+            publish_status=$?
+        fi
+        case "$publish_status" in
+            0) node_change_committed=1; NODE_CHANGE_STAGE='committed' ;;
+            1)
+                failure_status=1
+                failure_reason="订阅发布失败"
+                ;;
+            2)
+                failure_status=2
+                failure_reason="订阅发布状态不确定"
+                ;;
+            3) transaction_status=3; node_change_committed=1; NODE_CHANGE_STAGE='committed' ;;
+            *)
+                failure_status=2
+                failure_reason="订阅发布返回未知状态"
+                ;;
+        esac
+    fi
+
+    if [ "$failure_status" -ne 0 ]; then
+        rollback_ok=1
+        for ((index=${#snapshot_paths[@]} - 1; index >= 0; index--)); do
+            node_change_restore_path "${snapshot_paths[$index]}" "$transaction_dir" \
+                "${snapshot_keys[$index]}" || rollback_ok=0
+        done
+
+        _restore_node_change_runtime_values
+
+        if [ "$restart_required" -eq 1 ]; then
+            if [ "$service_was_active" -eq 1 ]; then
+                restart_singbox_checked >/dev/null 2>&1 && singbox_service_is_active || rollback_ok=0
+            elif singbox_service_is_active; then
+                stop_singbox_checked >/dev/null 2>&1 && ! singbox_service_is_active || rollback_ok=0
+            fi
+        fi
+        _restore_node_change_argo_runtime || rollback_ok=0
+        if [ "${#new_firewall_records[@]}" -gt 0 ]; then
+            remove_owned_firewall_records_exact "${new_firewall_records[@]}" || rollback_ok=0
+        fi
+
+        if [ "$rollback_ok" -eq 1 ] && [ "$failure_status" -eq 1 ]; then
+            if rm -rf -- "$transaction_dir"; then
+                _restore_node_change_traps
+                release_proxy_transaction_lock
+                red "${failure_reason}，已完整恢复原状态。"
+                return 1
+            fi
+            rollback_ok=0
+        fi
+
+        _retain_node_change_recovery "$failure_reason"
+        {
+            printf '\nfailure_status=%s\n' "$failure_status"
+            printf 'failure_reason=%s\n' "$failure_reason"
+            printf 'rollback_complete=%s\n' "$rollback_ok"
+        } >> "${recovery_dir}/transaction.conf" 2>/dev/null || true
+        chmod 700 "$recovery_dir" 2>/dev/null || true
+        chmod 600 "${recovery_dir}/transaction.conf" 2>/dev/null || true
+        _restore_node_change_traps
+        release_proxy_transaction_lock
+        red "${failure_reason}且自动回滚不完整；恢复材料已保留：${recovery_dir}"
+        return 2
+    fi
+
+    if ! rm -rf -- "$transaction_dir"; then
+        cleanup_status=1
+        transaction_status=3
+        yellow "配置已成功提交，但安全临时目录未能清理：${transaction_dir}"
+    fi
+    if [ -n "$old_firewall_rule" ]; then
+        if ! remove_owned_firewall_ports_if_unused "${conf_dir}/inbounds.json" "$old_firewall_rule"; then
+            cleanup_status=1
+            transaction_status=3
+            yellow "新端口已成功提交，但旧防火墙记录未能安全清理。"
+        fi
+    fi
+    _restore_node_change_traps
+    release_proxy_transaction_lock
+    [ "$cleanup_status" -eq 0 ] || return 3
+    return "$transaction_status"
 }
 
 rewrite_public_client_port() {
@@ -5737,6 +6632,386 @@ change_public_inbound_port_transaction() {
     release_public_port_change_lock
     return "$status"
 }
+
+resolve_argo_service_definition() {
+    local systemd_file="${ARGO_SYSTEMD_SERVICE_FILE:-/etc/systemd/system/argo.service}"
+    local openrc_file="${ARGO_OPENRC_SERVICE_FILE:-/etc/init.d/argo}"
+
+    if declare -F command_exists >/dev/null && command_exists rc-service && \
+       [ -f "$openrc_file" ] && [ ! -L "$openrc_file" ] && [ -r "$openrc_file" ]; then
+        printf '%s\n' "$openrc_file"
+    elif [ -f "$systemd_file" ] && [ ! -L "$systemd_file" ] && [ -r "$systemd_file" ]; then
+        printf '%s\n' "$systemd_file"
+    elif [ -f "$openrc_file" ] && [ ! -L "$openrc_file" ] && [ -r "$openrc_file" ]; then
+        printf '%s\n' "$openrc_file"
+    else
+        return 1
+    fi
+}
+
+replace_local_argo_origin_port_file() {
+    local target_file="${1:-}"
+    local old_port="${2:-}"
+    local new_port="${3:-}"
+    local file_kind="${4:-yaml}"
+    local target_dir target_name tmp_file file_mode
+
+    validate_port_value "$old_port" old_argo_port || return 1
+    validate_port_value "$new_port" new_argo_port || return 1
+    case "$file_kind" in yaml|quick) ;; *) return 1 ;; esac
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_dir=$(dirname "$target_file") || return 1
+    target_name=$(basename "$target_file") || return 1
+    tmp_file=$(mktemp "${target_dir}/.tmp.${target_name}.argo-port.XXXXXX") || return 1
+    file_mode=$(stat -c '%a' "$target_file" 2>/dev/null) || file_mode=600
+
+    if ! awk -v old="$old_port" -v new="$new_port" -v kind="$file_kind" '
+        BEGIN {
+            origin = "http://(127[.]0[.]0[.]1|localhost):" old
+            replacement = "http://127.0.0.1:" new
+            matches = 0
+            invalid = 0
+        }
+        {
+            if (kind == "yaml") {
+                if ($0 ~ "^[[:space:]]*service:[[:space:]]*" origin "[[:space:]]*(#.*)?$") {
+                    matches += gsub(origin, replacement)
+                } else if ($0 ~ origin) {
+                    invalid = 1
+                }
+            } else {
+                if ($0 ~ "--url[[:space:]]+" origin) {
+                    matches += gsub(origin, replacement)
+                } else if ($0 ~ origin) {
+                    invalid = 1
+                }
+            }
+            print
+        }
+        END { if (invalid || matches != 1) exit 42 }
+    ' "$target_file" > "$tmp_file"; then
+        rm -f -- "$tmp_file"
+        return 1
+    fi
+    chmod "$file_mode" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    mv -f -- "$tmp_file" "$target_file" || { rm -f -- "$tmp_file"; return 1; }
+}
+
+is_quick_argo_hostname() {
+    local hostname="${1:-}"
+
+    [ "${#hostname}" -le 253 ] && \
+        [[ "$hostname" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*[.]trycloudflare[.]com$ ]]
+}
+
+extract_staged_argo_domain() {
+    local target_file="${1:-}"
+    local domains
+
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    domains=$(sed -n '/^vless:\/\/.*path=%2Fvless-argo/ {
+        s/.*[?&]sni=\([^&#]*\).*/\1/p
+    }' "$target_file" | sort -u) || return 1
+    [ "$(printf '%s\n' "$domains" | sed '/^$/d' | wc -l)" -eq 1 ] || return 1
+    is_quick_argo_hostname "$domains" || return 1
+    printf '%s\n' "$domains"
+}
+
+prepare_quick_argo_domain_capture() {
+    local log_file="${ARGO_LOG_FILE:-${work_dir}/argo.log}"
+
+    [ -d "$work_dir" ] && [ ! -L "$work_dir" ] || return 1
+    if [ -e "$log_file" ] || [ -L "$log_file" ]; then
+        [ -f "$log_file" ] && [ ! -L "$log_file" ] || return 1
+    fi
+    : > "$log_file" || return 1
+    chmod 600 "$log_file"
+}
+
+wait_for_new_quick_argo_domain() {
+    local previous_domain="${1:-}"
+    local attempts="${ARGO_DOMAIN_WAIT_ATTEMPTS:-8}"
+    local interval="${ARGO_DOMAIN_WAIT_INTERVAL:-2}"
+    local attempt candidate
+
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$interval" =~ ^[0-9]+$ ]] || return 1
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+        candidate=$(get_latest_argo_domain 2>/dev/null || true)
+        candidate=$(printf '%s' "$candidate" | tr '[:upper:]' '[:lower:]')
+        if is_quick_argo_hostname "$candidate" && [ "$candidate" != "$previous_domain" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        [ "$attempt" -ge "$attempts" ] || sleep "$interval"
+    done
+    return 1
+}
+
+update_staged_argo_domain_file() {
+    local target_file="${1:-}"
+    local new_domain="${2:-}"
+    local target_dir target_name tmp_file file_mode line updated_count=0
+
+    is_quick_argo_hostname "$new_domain" || return 1
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_dir=$(dirname "$target_file") || return 1
+    target_name=$(basename "$target_file") || return 1
+    tmp_file=$(mktemp "${target_dir}/.tmp.${target_name}.argo-domain.XXXXXX") || return 1
+    file_mode=$(stat -c '%a' "$target_file" 2>/dev/null) || file_mode=600
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == vless://* && "$line" == *'path=%2Fvless-argo'* ]]; then
+            if [[ ! "$line" =~ [\?\&]sni=[^\&\#]+ ]] || [[ ! "$line" =~ [\?\&]host=[^\&\#]+ ]]; then
+                rm -f -- "$tmp_file"
+                return 1
+            fi
+            line=$(printf '%s\n' "$line" | sed -E \
+                "s#([?&]sni=)[^&#]*#\\1${new_domain}#g; s#([?&]host=)[^&#]*#\\1${new_domain}#g") || {
+                rm -f -- "$tmp_file"
+                return 1
+            }
+            updated_count=$((updated_count + 1))
+        fi
+        printf '%s\n' "$line" >> "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    done < "$target_file"
+    [ "$updated_count" -gt 0 ] || { rm -f -- "$tmp_file"; return 1; }
+    chmod "$file_mode" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    mv -f -- "$tmp_file" "$target_file" || { rm -f -- "$tmp_file"; return 1; }
+    [ "$(extract_staged_argo_domain "$target_file")" = "$new_domain" ]
+}
+
+argo_origin_port_conflict_exists() {
+    local target_file="${1:-}"
+    local target_port="${2:-}"
+    local configured_result listener_output listener_status
+
+    validate_port_value "$target_port" argo_port || return 2
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 2
+    configured_result=$(jq -r --argjson port "$target_port" '
+        if (.inbounds | type) != "array" then
+            error("invalid inbounds")
+        else
+            any(.inbounds[]; ((.listen_port? // null) | tostring | tonumber?) == $port)
+        end
+    ' "$target_file" 2>/dev/null) || return 2
+    case "$configured_result" in
+        true) return 0 ;;
+        false) ;;
+        *) return 2 ;;
+    esac
+
+    if command_exists ss; then
+        if listener_output=$(ss -H -ltn "sport = :${target_port}" 2>/dev/null); then
+            [ -z "$listener_output" ] && return 1
+            return 0
+        fi
+        command_exists lsof || return 2
+    fi
+    if command_exists lsof; then
+        lsof -nP -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1
+        listener_status=$?
+        case "$listener_status" in
+            0) return 0 ;;
+            1) return 1 ;;
+            *) return 2 ;;
+        esac
+    fi
+    return 2
+}
+
+mutate_argo_port_files() {
+    local staged_client="${1:-}"
+    local new_port="${2:-}"
+    local old_port service_file tunnel_mode conflict_status
+
+    validate_port_value "$new_port" argo_port || return 1
+    [ -f "$staged_client" ] && [ ! -L "$staged_client" ] || return 1
+    old_port=$(get_uniform_inbound_port "${conf_dir}/inbounds.json" argo) || return 1
+    if [ "$old_port" = "$new_port" ]; then
+        NODE_CHANGE_NOOP=1
+        return 0
+    fi
+    argo_origin_port_conflict_exists "${conf_dir}/inbounds.json" "$new_port"
+    conflict_status=$?
+    case "$conflict_status" in
+        0)
+            NODE_CHANGE_NOOP=1
+            red "目标 Argo 源站端口已被其他入站或进程占用，本次操作未做任何变更。"
+            return 1
+            ;;
+        1) ;;
+        *)
+            NODE_CHANGE_NOOP=1
+            red "无法安全确认目标 Argo 源站端口是否可用，本次操作未做任何变更。"
+            return 2
+            ;;
+    esac
+    service_file=$(resolve_argo_service_definition) || {
+        red "无法安全定位 Argo 服务定义，端口修改已中止。"
+        return 1
+    }
+    tunnel_mode=$(detect_argo_tunnel_mode "$service_file" 2>/dev/null) || {
+        red "无法识别当前 Argo Tunnel 类型，端口修改已中止。"
+        return 1
+    }
+    NODE_CHANGE_ARGO_MODE="$tunnel_mode"
+
+    case "$tunnel_mode" in
+        quick)
+            replace_local_argo_origin_port_file "$service_file" "$old_port" "$new_port" quick || return 1
+            ;;
+        local)
+            replace_local_argo_origin_port_file "${work_dir}/tunnel.yml" "$old_port" "$new_port" yaml || return 1
+            ;;
+        remote)
+            NODE_CHANGE_NOOP=1
+            red "远程托管 Token 隧道的入口规则不在本机；请先在 Cloudflare 端修改源站端口。"
+            return 1
+            ;;
+        *) return 1 ;;
+    esac
+
+    apply_jq_config "${conf_dir}/inbounds.json" --arg port "$new_port" '
+      (.inbounds[] |
+        select(.tag == "vless-ws-argo" or .tag == "vless-ws-argo-ipv6") |
+        .listen_port) = ($port | tonumber)
+    ' || return 1
+    ARGO_PORT="$new_port"
+    argo_port="$new_port"
+    export ARGO_PORT argo_port
+    persist_install_settings "$install_env_file" || return 1
+    NODE_CHANGE_REQUIRE_ARGO_RESTART=1
+}
+
+change_argo_port_transaction() {
+    local new_port="${1:-}"
+    local helper_name
+
+    validate_port_value "$new_port" argo_port || return 1
+    for helper_name in argo_service_is_active restart_argo_checked stop_argo_checked; do
+        declare -F "$helper_name" >/dev/null || {
+            red "Argo 服务事务接口不完整，端口修改已安全中止。"
+            return 2
+        }
+    done
+    apply_node_change_transaction mutate_argo_port_files 1 '' '' "$new_port"
+}
+
+mutate_uuid_node_files() {
+    local staged_client="${1:-}"
+    local new_uuid="${2:-}"
+    local old_uuid tmp_client
+
+    validate_uuid_value "$new_uuid" || return 1
+    old_uuid=$(jq -er '
+        [.inbounds[] |
+          select(.type == "vless" and
+                 (.tag == "vless-ws-argo" or (.tag | startswith("vless-reality")))) |
+          .users[]?.uuid] | unique |
+        if length == 1 then .[0] else empty end
+    ' "${conf_dir}/inbounds.json") || return 1
+    validate_uuid_value "$old_uuid" || return 1
+
+    apply_jq_config "${conf_dir}/inbounds.json" --arg old "$old_uuid" --arg new "$new_uuid" '
+      (.inbounds[] |
+        select(.type == "vless" and
+               (.tag == "vless-ws-argo" or (.tag | startswith("vless-reality")))) |
+        .users[]? | select(.uuid == $old) | .uuid) = $new |
+      (.inbounds[] | select(.type == "hysteria2") |
+        .users[]? | select(.password == $old) | .password) = $new |
+      (.inbounds[] | select(.type == "tuic") |
+        .users[]? | select(.uuid == $old) | .uuid) = $new |
+      (.inbounds[] | select(.type == "tuic") |
+        .users[]? | select(.password == $old) | .password) = $new |
+      (.inbounds[] | select(.type == "anytls" and .tag == "anytls") |
+        .users[]? | select(.password == $old) | .password) = $new
+    ' || return 1
+
+    tmp_client=$(mktemp "${work_dir}/.tmp.node-client.XXXXXX") || return 1
+    sed -E \
+        -e "s#^(vless|hysteria2|anytls)://${old_uuid}@#\\1://${new_uuid}@#" \
+        -e "s#^tuic://${old_uuid}:${old_uuid}@#tuic://${new_uuid}:${new_uuid}@#" \
+        "$staged_client" > "$tmp_client" || { rm -f -- "$tmp_client"; return 1; }
+    chmod "$(stat -c '%a' "$staged_client" 2>/dev/null || printf '%s' 600)" "$tmp_client" || {
+        rm -f -- "$tmp_client"
+        return 1
+    }
+    mv -f -- "$tmp_client" "$staged_client" || { rm -f -- "$tmp_client"; return 1; }
+}
+
+change_uuid_transaction() {
+    local new_uuid="${1:-}"
+
+    validate_uuid_value "$new_uuid" || return 1
+    apply_node_change_transaction mutate_uuid_node_files 1 '' '' "$new_uuid"
+}
+
+mutate_reality_sni_files() {
+    local staged_client="${1:-}"
+    local new_sni="${2:-}"
+    local tmp_client
+
+    is_valid_subscription_domain "$new_sni" || return 1
+    apply_jq_config "${conf_dir}/inbounds.json" --arg sni "$new_sni" '
+      (.inbounds[] |
+        select(.type == "vless" and (.tag | startswith("vless-reality")) and
+               (.tls.reality? != null)) | .tls.server_name) = $sni |
+      (.inbounds[] |
+        select(.type == "vless" and (.tag | startswith("vless-reality")) and
+               (.tls.reality? != null)) | .tls.reality.handshake.server) = $sni
+    ' || return 1
+    tmp_client=$(mktemp "${work_dir}/.tmp.node-client.XXXXXX") || return 1
+    sed -E "/^vless:\/\// { /security=reality/ s#(sni=)[^&]*#\\1${new_sni}#; }" \
+        "$staged_client" > "$tmp_client" || { rm -f -- "$tmp_client"; return 1; }
+    chmod "$(stat -c '%a' "$staged_client" 2>/dev/null || printf '%s' 600)" "$tmp_client" || {
+        rm -f -- "$tmp_client"
+        return 1
+    }
+    mv -f -- "$tmp_client" "$staged_client" || { rm -f -- "$tmp_client"; return 1; }
+}
+
+change_reality_sni_transaction() {
+    local new_sni="${1:-}"
+
+    is_valid_subscription_domain "$new_sni" || return 1
+    apply_node_change_transaction mutate_reality_sni_files 1 '' '' "$new_sni"
+}
+
+mutate_client_ip_files() {
+    local staged_client="${1:-}"
+    local family="${2:-}"
+    local address="${3:-}"
+    local replacement tmp_client
+
+    case "$family" in
+        ipv4) is_valid_ipv4_address "$address" || return 1; replacement="$address" ;;
+        ipv6) is_valid_ipv6_address "$address" || return 1; replacement="[${address}]" ;;
+        *) return 1 ;;
+    esac
+    tmp_client=$(mktemp "${work_dir}/.tmp.node-client.XXXXXX") || return 1
+    sed -E \
+        "/path=%2Fvless-argo/! { /^(vless|hysteria2|tuic|anytls|socks|ss):\/\// s#@(\\[[0-9A-Fa-f:]+\\]|([0-9]{1,3}\\.){3}[0-9]{1,3}):#@${replacement}:#; }" \
+        "$staged_client" > "$tmp_client" || { rm -f -- "$tmp_client"; return 1; }
+    chmod "$(stat -c '%a' "$staged_client" 2>/dev/null || printf '%s' 600)" "$tmp_client" || {
+        rm -f -- "$tmp_client"
+        return 1
+    }
+    mv -f -- "$tmp_client" "$staged_client" || { rm -f -- "$tmp_client"; return 1; }
+}
+
+change_client_ip_transaction() {
+    local family="${1:-}"
+    local address="${2:-}"
+
+    case "$family" in
+        ipv4) is_valid_ipv4_address "$address" || return 1 ;;
+        ipv6) is_valid_ipv6_address "$address" || return 1 ;;
+        *) return 1 ;;
+    esac
+    apply_node_change_transaction mutate_client_ip_files 0 '' '' "$family" "$address"
+}
+
 
 purge_nginx_package() {
     local package="nginx"
@@ -6714,9 +7989,33 @@ handle_failed_install_stage() {
 }
 
 # Fail-fast install orchestration shared by interactive and non-interactive paths.
+detect_usable_init_system() {
+    local systemd_runtime_dir="${SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
+    local openrc_softlevel_file="${OPENRC_SOFTLEVEL_FILE:-/run/openrc/softlevel}"
+
+    if command_exists systemctl && [ -d "$systemd_runtime_dir" ] && \
+       systemctl show-environment >/dev/null 2>&1; then
+        printf 'systemd\n'
+        return 0
+    fi
+    if command_exists rc-update && command_exists rc-service && \
+       [ -f "$openrc_softlevel_file" ]; then
+        printf 'openrc\n'
+        return 0
+    fi
+    return 1
+}
+
+# Fail-fast install orchestration shared by interactive and non-interactive paths.
+
 run_install_flow() {
-    local stage_status
+    local init_system='' stage_status
     local -a install_firewall_records=()
+
+    init_system=$(detect_usable_init_system) || {
+        red "不支持或未运行的 init 系统，安装中止。"
+        return 1
+    }
 
     FIREWALL_LAST_ADDED_RECORDS=()
     clear_install_complete_marker || {
@@ -6939,9 +8238,15 @@ report_node_change_transaction_result() {
 }
 
 change_config() {
-    local singbox_status=$(check_singbox 2>/dev/null)
-    local singbox_installed=$?
-    local port_change_status
+    local singbox_status='' singbox_installed
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local port_change_status transaction_status hy2_transaction_status
+
+    if singbox_status=$(check_singbox 2>/dev/null); then
+        singbox_installed=0
+    else
+        singbox_installed=$?
+    fi
 
     if [ $singbox_installed -eq 2 ]; then
         yellow "sing-box 尚未安装！"; sleep 1; menu; return
@@ -6987,8 +8292,11 @@ change_config() {
                 1)
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    change_public_inbound_port_transaction "$inbounds_file" reality "$new_port" tcp
-                    port_change_status=$?
+                    if change_public_inbound_port_transaction "$inbounds_file" reality "$new_port" tcp; then
+                        port_change_status=0
+                    else
+                        port_change_status=$?
+                    fi
                     [ "$port_change_status" -eq 0 ] || return "$port_change_status"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
@@ -6996,8 +8304,11 @@ change_config() {
                 2)
                     reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    change_public_inbound_port_transaction "$inbounds_file" hysteria2 "$new_port" udp
-                    port_change_status=$?
+                    if change_public_inbound_port_transaction "$inbounds_file" hysteria2 "$new_port" udp; then
+                        port_change_status=0
+                    else
+                        port_change_status=$?
+                    fi
                     [ "$port_change_status" -eq 0 ] || return "$port_change_status"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
@@ -7005,8 +8316,11 @@ change_config() {
                 3)
                     reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    change_public_inbound_port_transaction "$inbounds_file" tuic "$new_port" udp
-                    port_change_status=$?
+                    if change_public_inbound_port_transaction "$inbounds_file" tuic "$new_port" udp; then
+                        port_change_status=0
+                    else
+                        port_change_status=$?
+                    fi
                     [ "$port_change_status" -eq 0 ] || return "$port_change_status"
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
@@ -7014,8 +8328,11 @@ change_config() {
                 4)
                     reading "\n请输入vless-ws-tls-argo端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
-                    change_argo_port_transaction "$new_port"
-                    transaction_status=$?
+                    if change_argo_port_transaction "$new_port"; then
+                        transaction_status=0
+                    else
+                        transaction_status=$?
+                    fi
                     report_node_change_transaction_result "$transaction_status" \
                         "vless-ws-tls-argo端口已修改为：${purple}${new_port}${re}"
                     return $?
@@ -7027,8 +8344,11 @@ change_config() {
         2)
             reading "\n请输入新的UUID(直接回车随机生成UUID): " new_uuid
             [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
-            change_uuid_transaction "$new_uuid"
-            transaction_status=$?
+            if change_uuid_transaction "$new_uuid"; then
+                transaction_status=0
+            else
+                transaction_status=$?
+            fi
             report_node_change_transaction_result "$transaction_status" \
                 "UUID已修改为：${purple}${new_uuid}${re}"
             return $?
@@ -7044,8 +8364,11 @@ change_config() {
                 "4") new_sni="www.cerebrium.ai" ;;
                 "5") new_sni="www.nazhumi.com" ;;
             esac
-            change_reality_sni_transaction "$new_sni"
-            transaction_status=$?
+            if change_reality_sni_transaction "$new_sni"; then
+                transaction_status=0
+            else
+                transaction_status=$?
+            fi
             report_node_change_transaction_result "$transaction_status" \
                 "Reality sni已修改为：${purple}${new_sni}${re}"
             return $?
@@ -7058,8 +8381,11 @@ change_config() {
             reading "\n请输入跳跃结束端口 (需大于起始端口): " max_port
             [ -z "$max_port" ] && max_port=$(($min_port + 100))
             yellow "你的结束端口为：$max_port\n"
-            enable_hy2_port_hopping_transaction "$min_port" "$max_port"
-            hy2_transaction_status=$?
+            if enable_hy2_port_hopping_transaction "$min_port" "$max_port"; then
+                hy2_transaction_status=0
+            else
+                hy2_transaction_status=$?
+            fi
             if [ "$hy2_transaction_status" -ne 0 ]; then
                 [ "$hy2_transaction_status" -eq 2 ] && return 2
                 red "Hysteria2 端口跳跃启用失败，原配置已保留或恢复。"
@@ -7069,8 +8395,11 @@ change_config() {
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
             ;;
         5)
-            disable_hy2_port_hopping_transaction
-            hy2_transaction_status=$?
+            if disable_hy2_port_hopping_transaction; then
+                hy2_transaction_status=0
+            else
+                hy2_transaction_status=$?
+            fi
             if [ "$hy2_transaction_status" -ne 0 ]; then
                 [ "$hy2_transaction_status" -eq 2 ] && return 2
                 red "Hysteria2 端口跳跃删除失败，原配置已保留或恢复。"
@@ -7095,8 +8424,11 @@ change_config() {
                 return 1
             fi
             if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@\[[0-9a-fA-F:]+\]' "$client_dir"; then
-                change_client_ip_transaction ipv4 "$new_ipv4"
-                transaction_status=$?
+                if change_client_ip_transaction ipv4 "$new_ipv4"; then
+                    transaction_status=0
+                else
+                    transaction_status=$?
+                fi
                 report_node_change_transaction_result "$transaction_status" \
                     "已将直连节点地址修改为 IPv4：${new_ipv4}"
                 return $?
@@ -7120,8 +8452,11 @@ change_config() {
                 return 1
             fi
             if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@([0-9]{1,3}\.){3}[0-9]{1,3}' "$client_dir"; then
-                change_client_ip_transaction ipv6 "$new_ipv6"
-                transaction_status=$?
+                if change_client_ip_transaction ipv6 "$new_ipv6"; then
+                    transaction_status=0
+                else
+                    transaction_status=$?
+                fi
                 report_node_change_transaction_result "$transaction_status" \
                     "已将直连节点地址修改为 IPv6：[${new_ipv6}]"
                 return $?

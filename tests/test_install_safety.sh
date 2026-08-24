@@ -1060,6 +1060,12 @@ remove_owned_firewall_records_exact() {
     return "${INSTALL_FIREWALL_ROLLBACK_STATUS:-0}"
 }
 
+SYSTEMD_RUNTIME_DIR="${tmp_dir}/mock-install-systemd-runtime"
+OPENRC_SOFTLEVEL_FILE="${tmp_dir}/mock-install-openrc/softlevel"
+command mkdir -p "$SYSTEMD_RUNTIME_DIR" "$(dirname "$OPENRC_SOFTLEVEL_FILE")"
+command touch "$OPENRC_SOFTLEVEL_FILE"
+
+load_function detect_usable_init_system
 load_function rollback_failed_install_firewall_records
 load_function handle_failed_install_stage
 load_function run_install_flow

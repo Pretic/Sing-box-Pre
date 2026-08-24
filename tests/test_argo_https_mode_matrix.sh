@@ -23,7 +23,7 @@ for function_name in \
     rebuild_argo_client_address_set_file get_current_argo_preferred_endpoint \
     create_argo_transition_snapshot restore_argo_transition_snapshot \
     strip_local_tunnel_subscription_rule remove_local_tunnel_subscription_rule \
-    apply_local_tunnel_subscription_removal disable_cf_https_subscription \
+    apply_local_tunnel_subscription_removal \
     activate_argo_service_mode transition_to_quick_argo transition_to_fixed_argo; do
     function_source="$(extract_function "$function_name")"
     [[ -n "$function_source" ]] || fail "$function_name is not implemented"
@@ -110,6 +110,19 @@ save_subscription_state() {
     else
         printf '%s\n' enabled > "$subscription_state_file"
     fi
+}
+disable_cf_https_subscription() {
+    load_subscription_state
+    [ "${SUB_HTTPS_ENABLED:-0}" = 1 ] || return 0
+    [ "${SUB_TUNNEL_MODE:-}" = local ] || return 1
+    apply_local_tunnel_subscription_removal "${work_dir}/tunnel.yml" || return $?
+    SUB_HTTPS_ENABLED=0
+    SUB_HTTPS_DOMAIN=''
+    SUB_HTTPS_DOMAIN_MODE=''
+    SUB_HTTPS_PATH=''
+    SUB_TUNNEL_MODE=''
+    SUB_HTTPS_VERIFIED_AT=''
+    save_subscription_state
 }
 get_nginx_subscription_port() { printf '18080\n'; }
 get_nginx_subscription_paths() { printf '/token\n'; }
