@@ -1070,6 +1070,10 @@ remove_owned_firewall_records_exact() {
     builtin printf '%s\n' "$*" >> "$INSTALL_FIREWALL_ROLLBACK_LOG"
     return "${INSTALL_FIREWALL_ROLLBACK_STATUS:-0}"
 }
+prepare_partial_install_resume() { return 1; }
+persist_partial_install_resume_state() { :; }
+partial_install_state_path() { printf '%s\n' "${work_dir}/install-resume.state"; }
+clear_partial_install_resume_state() { command rm -f "$(partial_install_state_path)"; }
 
 SYSTEMD_RUNTIME_DIR="${tmp_dir}/mock-install-systemd-runtime"
 OPENRC_SOFTLEVEL_FILE="${tmp_dir}/mock-install-openrc/softlevel"

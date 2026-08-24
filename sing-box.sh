@@ -347,6 +347,7 @@ write_argo_systemd_service() {
 
     {
         printf '%s\n' \
+            '# sing-box-pre:managed-service-v1' \
             '[Unit]' \
             'Description=Cloudflare Tunnel' \
             'After=network.target' \
@@ -383,6 +384,7 @@ write_argo_openrc_service() {
     {
         printf '%s\n' \
             '#!/sbin/openrc-run' \
+            '# sing-box-pre:managed-service-v1' \
             'description="Cloudflare Tunnel"' \
             'command="/etc/sing-box/argo"' \
             "command_args=\"${command_args}\"" \
@@ -415,6 +417,233 @@ persist_install_settings() {
         printf 'ARGO_PORT=%s\n' "$argo_port"
     } | atomic_write_file "$settings_file" 600 || return 1
     chmod 600 "$settings_file"
+}
+
+partial_install_state_path() {
+    printf '%s\n' "${PARTIAL_INSTALL_STATE_FILE:-${work_dir}/install-resume.state}"
+}
+
+# Persist only the values that cannot be reconstructed without changing the
+# published node identity.  The file is written only after both core services
+# are active, so its presence is durable evidence that a late install stage may
+# be resumed without running install_singbox again.
+persist_partial_install_resume_state() {
+    local state_file
+
+    state_file=$(partial_install_state_path) || return 1
+    [[ "${uuid:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] || return 1
+    [[ "${password:-}" =~ ^[A-Za-z0-9]{24}$ ]] || return 1
+    [[ "${private_key:-}" =~ ^[A-Za-z0-9_-]{40,64}$ ]] || return 1
+    [[ "${public_key:-}" =~ ^[A-Za-z0-9_-]{40,64}$ ]] || return 1
+    [[ "${ARGO_FIXED_READY:-0}" =~ ^[01]$ ]] || return 1
+    [ -n "$state_file" ] && [ ! -L "$state_file" ] || return 1
+
+    {
+        printf 'RESUME_VERSION=1\n'
+        printf 'UUID=%s\n' "$uuid"
+        printf 'PASSWORD=%s\n' "$password"
+        printf 'PRIVATE_KEY=%s\n' "$private_key"
+        printf 'PUBLIC_KEY=%s\n' "$public_key"
+        printf 'ARGO_FIXED_READY=%s\n' "${ARGO_FIXED_READY:-0}"
+    } | atomic_write_secret_file "$state_file" || return 1
+    chmod 600 "$state_file"
+}
+
+load_partial_install_resume_state() {
+    local state_file key value mode
+    local resume_version='' resume_uuid='' resume_password=''
+    local resume_private_key='' resume_public_key='' resume_argo_fixed=''
+    local version_count=0 uuid_count=0 password_count=0 private_count=0
+    local public_count=0 argo_count=0
+
+    state_file=$(partial_install_state_path) || return 1
+    [ -f "$state_file" ] && [ ! -L "$state_file" ] && [ -r "$state_file" ] || return 1
+    mode=$(stat -c '%a' "$state_file" 2>/dev/null) || return 1
+    [ "$mode" = 600 ] || return 1
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            RESUME_VERSION) resume_version="$value"; version_count=$((version_count + 1)) ;;
+            UUID) resume_uuid="$value"; uuid_count=$((uuid_count + 1)) ;;
+            PASSWORD) resume_password="$value"; password_count=$((password_count + 1)) ;;
+            PRIVATE_KEY) resume_private_key="$value"; private_count=$((private_count + 1)) ;;
+            PUBLIC_KEY) resume_public_key="$value"; public_count=$((public_count + 1)) ;;
+            ARGO_FIXED_READY) resume_argo_fixed="$value"; argo_count=$((argo_count + 1)) ;;
+            *) return 1 ;;
+        esac
+    done < "$state_file"
+
+    [ "$version_count" -eq 1 ] && [ "$uuid_count" -eq 1 ] && \
+        [ "$password_count" -eq 1 ] && [ "$private_count" -eq 1 ] && \
+        [ "$public_count" -eq 1 ] && [ "$argo_count" -eq 1 ] || return 1
+    [ "$resume_version" = 1 ] || return 1
+    [[ "$resume_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] || return 1
+    [[ "$resume_password" =~ ^[A-Za-z0-9]{24}$ ]] || return 1
+    [[ "$resume_private_key" =~ ^[A-Za-z0-9_-]{40,64}$ ]] || return 1
+    [[ "$resume_public_key" =~ ^[A-Za-z0-9_-]{40,64}$ ]] || return 1
+    [[ "$resume_argo_fixed" =~ ^[01]$ ]] || return 1
+
+    uuid="$resume_uuid"
+    password="$resume_password"
+    private_key="$resume_private_key"
+    public_key="$resume_public_key"
+    ARGO_FIXED_READY="$resume_argo_fixed"
+}
+
+validate_partial_install_config_credentials() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+
+    [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] || return 1
+    jq -e --arg uuid "$uuid" --arg private_key "$private_key" '
+        ([.inbounds[] | select(.type == "vless") | .users[]?.uuid] as $vless |
+            ($vless | length) > 0 and all($vless[]; . == $uuid)) and
+        ([.inbounds[] | select(.type == "hysteria2") | .users[]?.password] as $hy2 |
+            ($hy2 | length) > 0 and all($hy2[]; . == $uuid)) and
+        ([.inbounds[] | select(.type == "tuic") | .users[]?] as $tuic |
+            ($tuic | length) > 0 and
+            all($tuic[]; .uuid == $uuid and .password == $uuid)) and
+        ([.inbounds[] | select(.type == "vless" and
+            ((.tag? // "") | startswith("vless-reality"))) |
+            .tls.reality.private_key] as $reality |
+            ($reality | length) > 0 and all($reality[]; . == $private_key))
+    ' "$inbounds_file" >/dev/null 2>&1
+}
+
+validate_partial_install_config_ports() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local protocol expected actual
+
+    [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] || return 1
+    for protocol in reality hysteria2 tuic argo; do
+        case "$protocol" in
+            reality) expected="$vless_port" ;;
+            hysteria2) expected="$hy2_port" ;;
+            tuic) expected="$tuic_port" ;;
+            argo) expected="$argo_port" ;;
+            *) return 1 ;;
+        esac
+        actual=$(get_uniform_inbound_port "$inbounds_file" "$protocol") || return 1
+        [ "$actual" = "$expected" ] || return 1
+    done
+}
+
+partial_install_service_definition_is_managed() {
+    local init_system="${1:-}" service_name="${2:-}"
+    local definition exec_start command_path command_args
+
+    case "$init_system:$service_name" in
+        systemd:sing-box|systemd:argo)
+            definition="${INSTALL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/${service_name}.service"
+            [ -f "$definition" ] && [ ! -L "$definition" ] && [ -r "$definition" ] || return 1
+            [ "$(grep -Fxc '# sing-box-pre:managed-service-v1' "$definition" 2>/dev/null)" -eq 1 ] || return 1
+            [ "$(grep -c '^ExecStart=' "$definition" 2>/dev/null)" -eq 1 ] || return 1
+            ! grep -Eq '^ExecStart(Pre|Post)=' "$definition" || return 1
+            exec_start=$(sed -n 's/^ExecStart=//p' "$definition") || return 1
+            if [ "$service_name" = sing-box ]; then
+                [ "$(grep -c '^WorkingDirectory=/etc/sing-box$' "$definition" 2>/dev/null)" -eq 1 ] && \
+                    [ "$exec_start" = '/etc/sing-box/sing-box run -C /etc/sing-box/conf' ]
+                return
+            fi
+            case "$exec_start" in
+                '/etc/sing-box/argo tunnel --no-autoupdate run'|\
+                '/etc/sing-box/argo tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run') return 0 ;;
+                "/bin/sh -c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${argo_port} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'") return 0 ;;
+                *) return 1 ;;
+            esac
+            ;;
+        openrc:sing-box|openrc:argo)
+            definition="${INSTALL_OPENRC_INIT_DIR:-/etc/init.d}/${service_name}"
+            [ -f "$definition" ] && [ ! -L "$definition" ] && [ -r "$definition" ] && \
+                [ -x "$definition" ] || return 1
+            [ "$(grep -Fxc '# sing-box-pre:managed-service-v1' "$definition" 2>/dev/null)" -eq 1 ] || return 1
+            [ "$(grep -c '^command=' "$definition" 2>/dev/null)" -eq 1 ] || return 1
+            [ "$(grep -c '^command_args=' "$definition" 2>/dev/null)" -eq 1 ] || return 1
+            command_path=$(sed -n 's/^command="\(.*\)"$/\1/p' "$definition") || return 1
+            command_args=$(sed -n 's/^command_args="\(.*\)"$/\1/p' "$definition") || return 1
+            if [ "$service_name" = sing-box ]; then
+                [ "$command_path" = '/etc/sing-box/sing-box' ] && \
+                    [ "$command_args" = 'run -C /etc/sing-box/conf' ]
+                return
+            fi
+            [ "$command_path" = '/etc/sing-box/argo' ] || return 1
+            case "$command_args" in
+                'tunnel --no-autoupdate run'|\
+                'tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run') return 0 ;;
+                "tunnel --url http://127.0.0.1:${argo_port} --no-autoupdate --edge-ip-version auto --protocol http2") return 0 ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+partial_install_service_is_active() {
+    local init_system="${1:-}" service_name="${2:-}"
+
+    case "$init_system" in
+        systemd) systemctl is-active --quiet "$service_name" >/dev/null 2>&1 ;;
+        openrc) rc-service "$service_name" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+partial_install_nginx_listener_is_managed() {
+    local init_system="${1:-}" config_port
+
+    if ! classify_nginx_subscription_config \
+        "${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}"; then
+        return 1
+    fi
+    config_port=$(get_nginx_subscription_port \
+        "${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}") || return 1
+    [ "$config_port" = "$nginx_port" ] || return 1
+    partial_install_service_is_active "$init_system" nginx
+}
+
+validate_partial_install_resume_runtime() {
+    local init_system="${1:-}" rule port proto
+
+    partial_install_service_definition_is_managed "$init_system" sing-box || return 1
+    partial_install_service_definition_is_managed "$init_system" argo || return 1
+    partial_install_service_is_active "$init_system" sing-box || return 1
+    partial_install_service_is_active "$init_system" argo || return 1
+
+    for rule in \
+        "$vless_port/tcp" \
+        "$tuic_port/udp" \
+        "$hy2_port/udp" \
+        "$argo_port/tcp"; do
+        port="${rule%/*}"
+        proto="${rule#*/}"
+        port_is_listening "$port" "$proto" || return 1
+    done
+    if port_is_listening "$nginx_port" tcp; then
+        partial_install_nginx_listener_is_managed "$init_system" || return 1
+    fi
+}
+
+# Return 0 for a safe resumable late-stage install, 1 when no resume evidence
+# exists, and 2 when evidence exists but cannot be proven safe.  Callers must
+# never fall back to a credential-regenerating install after status 2.
+prepare_partial_install_resume() {
+    local init_system="${1:-}" state_file
+
+    state_file=$(partial_install_state_path) || return 2
+    [ -e "$state_file" ] || [ -L "$state_file" ] || return 1
+    load_partial_install_resume_state || return 2
+    validate_installed_singbox_config_strict || return 2
+    validate_partial_install_config_credentials || return 2
+    validate_partial_install_config_ports || return 2
+    fingerprint=$(get_hy2_certificate_fingerprint) || return 2
+    validate_partial_install_resume_runtime "$init_system" || return 2
+}
+
+clear_partial_install_resume_state() {
+    local state_file
+
+    state_file=$(partial_install_state_path) || return 1
+    [ -n "$state_file" ] || return 1
+    rm -f -- "$state_file"
 }
 
 is_install_complete() {
@@ -484,9 +713,22 @@ legacy_install_is_complete() {
 
 prepare_existing_install() {
     local marker_file="${INSTALL_COMPLETE_MARKER:-${work_dir}/.install-complete}"
+    local resume_file=''
 
     if check_singbox &>/dev/null && is_install_complete; then
+        if declare -F partial_install_state_path >/dev/null 2>&1; then
+            resume_file=$(partial_install_state_path 2>/dev/null || true)
+            if [ -n "$resume_file" ] && { [ -e "$resume_file" ] || [ -L "$resume_file" ]; }; then
+                clear_partial_install_resume_state || return 2
+            fi
+        fi
         return 0
+    fi
+    if declare -F partial_install_state_path >/dev/null 2>&1; then
+        resume_file=$(partial_install_state_path 2>/dev/null || true)
+        if [ -n "$resume_file" ] && { [ -e "$resume_file" ] || [ -L "$resume_file" ]; }; then
+            return 1
+        fi
     fi
     [ ! -e "$marker_file" ] || return 1
     legacy_install_is_complete || return 1
@@ -4327,6 +4569,7 @@ EOF
 # debian/ubuntu/centos 守护进程
 main_systemd_services() {
     cat > /etc/systemd/system/sing-box.service << EOF || return 1
+# sing-box-pre:managed-service-v1
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
@@ -4409,6 +4652,7 @@ EOF
 alpine_openrc_services() {
     cat > /etc/init.d/sing-box << 'EOF' || return 1
 #!/sbin/openrc-run
+# sing-box-pre:managed-service-v1
 description="sing-box service"
 command="/etc/sing-box/sing-box"
 command_args="run -C /etc/sing-box/conf"
@@ -8034,7 +8278,7 @@ detect_usable_init_system() {
 # Fail-fast install orchestration shared by interactive and non-interactive paths.
 
 run_install_flow() {
-    local init_system='' stage_status
+    local init_system='' stage_status resume_status=1 resuming_partial_install=0
     local -a install_firewall_records=()
 
     init_system=$(detect_usable_init_system) || {
@@ -8051,60 +8295,76 @@ run_install_flow() {
         red "依赖安装失败，安装中止。"
         return 1
     }
-    if install_singbox; then stage_status=0; else stage_status=$?; fi
-    install_firewall_records=("${FIREWALL_LAST_ADDED_RECORDS[@]}")
-    if [ "$stage_status" -ne 0 ]; then
-        handle_failed_install_stage "$stage_status" \
-            "sing-box 配置安装失败，安装中止。" "${install_firewall_records[@]}"
-        return $?
-    fi
-    validate_singbox_config || {
-        handle_failed_install_stage 1 "sing-box 配置检查失败，安装中止。" \
-            "${install_firewall_records[@]}"
-        return $?
-    }
-
-    if [ "$init_system" = systemd ]; then
-        main_systemd_services || {
-            red "systemd 服务安装或启动失败，安装中止。"
-            yellow "服务可能已部分启动；保留已登记的防火墙规则，避免现有连接被误断。"
-            return 1
-        }
-        systemctl is-active --quiet sing-box && systemctl is-active --quiet argo || {
-            red "sing-box 或 Argo 服务未处于 active 状态，安装中止。"
-            yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
-            return 1
-        }
-    elif [ "$init_system" = openrc ]; then
-        alpine_openrc_services || {
-            red "OpenRC 服务安装失败，安装中止。"
-            yellow "服务可能已部分注册；保留已登记的防火墙规则供重试或卸载清理。"
-            return 1
-        }
-        change_hosts || {
-            red "OpenRC 主机初始化失败，安装中止。"
-            yellow "服务已进入配置阶段；保留已登记的防火墙规则供重试或卸载清理。"
-            return 1
-        }
-        rc-service sing-box restart || {
-            red "sing-box OpenRC 服务启动失败，安装中止。"
-            yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
-            return 1
-        }
-        rc-service argo restart || {
-            red "Argo OpenRC 服务启动失败，安装中止。"
-            yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
-            return 1
-        }
-        rc-service sing-box status >/dev/null 2>&1 && rc-service argo status >/dev/null 2>&1 || {
-            red "sing-box 或 Argo 服务未启动，安装中止。"
-            yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
-            return 1
-        }
+    if prepare_partial_install_resume "$init_system"; then
+        resuming_partial_install=1
+        yellow "检测到由本脚本管理的未完成安装，继续生成订阅与收尾配置。"
     else
-        handle_failed_install_stage 1 "不支持的 init 系统，安装中止。" \
-            "${install_firewall_records[@]}"
-        return $?
+        resume_status=$?
+        if [ "$resume_status" -eq 2 ]; then
+            red "检测到未完成安装，但无法确认服务和监听器均由本脚本管理；拒绝覆盖凭据。"
+            return 2
+        fi
+
+        if install_singbox; then stage_status=0; else stage_status=$?; fi
+        install_firewall_records=("${FIREWALL_LAST_ADDED_RECORDS[@]}")
+        if [ "$stage_status" -ne 0 ]; then
+            handle_failed_install_stage "$stage_status" \
+                "sing-box 配置安装失败，安装中止。" "${install_firewall_records[@]}"
+            return $?
+        fi
+        validate_singbox_config || {
+            handle_failed_install_stage 1 "sing-box 配置检查失败，安装中止。" \
+                "${install_firewall_records[@]}"
+            return $?
+        }
+
+        if [ "$init_system" = systemd ]; then
+            main_systemd_services || {
+                red "systemd 服务安装或启动失败，安装中止。"
+                yellow "服务可能已部分启动；保留已登记的防火墙规则，避免现有连接被误断。"
+                return 1
+            }
+            systemctl is-active --quiet sing-box && systemctl is-active --quiet argo || {
+                red "sing-box 或 Argo 服务未处于 active 状态，安装中止。"
+                yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
+                return 1
+            }
+        elif [ "$init_system" = openrc ]; then
+            alpine_openrc_services || {
+                red "OpenRC 服务安装失败，安装中止。"
+                yellow "服务可能已部分注册；保留已登记的防火墙规则供重试或卸载清理。"
+                return 1
+            }
+            change_hosts || {
+                red "OpenRC 主机初始化失败，安装中止。"
+                yellow "服务已进入配置阶段；保留已登记的防火墙规则供重试或卸载清理。"
+                return 1
+            }
+            rc-service sing-box restart || {
+                red "sing-box OpenRC 服务启动失败，安装中止。"
+                yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
+                return 1
+            }
+            rc-service argo restart || {
+                red "Argo OpenRC 服务启动失败，安装中止。"
+                yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
+                return 1
+            }
+            rc-service sing-box status >/dev/null 2>&1 && rc-service argo status >/dev/null 2>&1 || {
+                red "sing-box 或 Argo 服务未启动，安装中止。"
+                yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
+                return 1
+            }
+        else
+            handle_failed_install_stage 1 "不支持的 init 系统，安装中止。" \
+                "${install_firewall_records[@]}"
+            return $?
+        fi
+
+        persist_partial_install_resume_state || {
+            red "无法保存安装重试状态；为避免覆盖已生成凭据，安装中止。"
+            return 2
+        }
     fi
 
     sleep 5
@@ -8128,6 +8388,10 @@ run_install_flow() {
         yellow "核心服务已经启动；保留已登记的防火墙规则，避免现有连接被误断。"
         return 1
     }
+    if [ "$resuming_partial_install" -eq 1 ] || [ -e "$(partial_install_state_path)" ]; then
+        clear_partial_install_resume_state || \
+            yellow "安装已完成，但未能清理受限权限的安装重试状态文件。"
+    fi
     green "\nsing-box 安装完成\n"
 }
 
