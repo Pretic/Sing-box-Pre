@@ -756,6 +756,7 @@ fi
 reset_start_transaction
 START_NGINX_ACTIVE=1
 START_STOP_FAIL=1
+detect_usable_init_system() { printf 'systemd\n'; }
 systemctl() {
     case "$1" in
         is-active) [ "$START_NGINX_ACTIVE" -eq 1 ] ;;

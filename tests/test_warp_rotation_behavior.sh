@@ -19,6 +19,20 @@ source /dev/stdin <<< "$auto_select_block"
 
 activation_block=$(sed -n '/^activate_warp_candidate() {/,/^}/p' "$script")
 [[ -n "$activation_block" ]] || fail 'activate_warp_candidate could not be extracted'
+stable_helper_block=$(sed -n '/^singbox_service_is_stably_active() {/,/^}/p' "$script")
+stable_helper_count=$(grep -c '^singbox_service_is_stably_active() {' "$script" || true)
+fast_helper_count=$(grep -c '^singbox_service_is_active() {' "$script" || true)
+[ "$stable_helper_count" -eq 1 ] || \
+    fail "found ${stable_helper_count} stable sing-box service helpers, expected one"
+[ "$fast_helper_count" -eq 1 ] || \
+    fail "found ${fast_helper_count} fast sing-box service helpers, expected one"
+grep -Fq 'detect_usable_init_system' <<< "$stable_helper_block" || \
+    fail 'stable sing-box service helper does not use the active-init detector'
+stable_activation_checks=$(grep -c 'singbox_service_is_stably_active' <<< "$activation_block" || true)
+[ "$stable_activation_checks" -eq 2 ] || \
+    fail "WARP activation performs ${stable_activation_checks} stable service checks, expected two"
+! grep -Fq 'singbox_service_is_active' <<< "$activation_block" || \
+    fail 'WARP activation still uses the fast service helper'
 activation_block=${activation_block/#activate_warp_candidate()/activate_warp_candidate_real()}
 source /dev/stdin <<< "$activation_block"
 
@@ -152,7 +166,7 @@ restart_singbox_checked() {
     [ "$result" -eq 0 ]
 }
 
-singbox_service_is_active() {
+singbox_service_is_stably_active() {
     local result
     SERVICE_CALLS=$((SERVICE_CALLS + 1))
     result="${SERVICE_RESULTS[$((SERVICE_CALLS - 1))]:-0}"

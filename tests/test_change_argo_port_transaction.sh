@@ -40,6 +40,7 @@ atomic_write_file() {
 }
 validate_singbox_config() { jq empty "${conf_dir}/inbounds.json" >/dev/null; }
 command_exists() { [[ "$1" == ss ]]; }
+detect_usable_init_system() { printf '%s\n' "$TEST_INIT_SYSTEM"; }
 ss() {
     case "$LIVE_LISTENER_STATUS" in
         clear) return 0 ;;
@@ -169,6 +170,7 @@ TUIC_PORT=11003
 HY2_PORT=11002
 ARGO_PORT=8001
 ENV
+    TEST_INIT_SYSTEM=systemd
     case "$mode" in
         quick)
             cat > "$ARGO_SYSTEMD_SERVICE_FILE" <<'UNIT'
@@ -197,6 +199,7 @@ ExecStart=/etc/sing-box/argo tunnel --no-autoupdate run
 UNIT
             ;;
         openrc)
+            TEST_INIT_SYSTEM=openrc
             rm -f -- "$ARGO_SYSTEMD_SERVICE_FILE"
             mkdir -p "$(dirname "$ARGO_OPENRC_SERVICE_FILE")"
             cat > "$ARGO_OPENRC_SERVICE_FILE" <<'OPENRC'

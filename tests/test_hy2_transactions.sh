@@ -830,6 +830,7 @@ manage_service_source=$(sed -n '/^manage_service() {/,/^}/p' "$script")
 eval "$manage_service_source"
 check_service() { printf '%s\n' running; }
 command_exists() { [[ "${1:-}" == systemctl ]]; }
+detect_usable_init_system() { printf 'systemd\n'; }
 systemctl() {
     [[ "${1:-}" != restart ]]
 }

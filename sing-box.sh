@@ -324,12 +324,46 @@ write_fixed_argo_credentials() {
     esac
 }
 
-write_argo_systemd_service() {
+render_singbox_systemd_service() {
+    cat <<'EOF'
+# sing-box-pre:managed-service-v1
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+WorkingDirectory=/etc/sing-box
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/etc/sing-box/sing-box run -C /etc/sing-box/conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+render_singbox_openrc_service() {
+    cat <<'EOF'
+#!/sbin/openrc-run
+# sing-box-pre:managed-service-v1
+description="sing-box service"
+command="/etc/sing-box/sing-box"
+command_args="run -C /etc/sing-box/conf"
+command_background=true
+pidfile="/var/run/sing-box.pid"
+EOF
+}
+
+render_argo_systemd_service() {
     local tunnel_mode="${1:-quick}"
-    local install_root="${2:-}"
-    local unit_file="${install_root}/etc/systemd/system/argo.service"
     local environment_file=""
-    local exec_start
+    local exec_start argo_listen_port="${ARGO_PORT:-${argo_port:-}}"
 
     case "$tunnel_mode" in
         token)
@@ -340,31 +374,74 @@ write_argo_systemd_service() {
             exec_start='/etc/sing-box/argo tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run'
             ;;
         quick)
-            exec_start="/bin/sh -c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+            [ -n "$argo_listen_port" ] || return 1
+            exec_start="/bin/sh -c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${argo_listen_port} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
             ;;
         *) return 1 ;;
     esac
 
-    {
+    printf '%s\n' \
+        '# sing-box-pre:managed-service-v1' \
+        '[Unit]' \
+        'Description=Cloudflare Tunnel' \
+        'After=network.target' \
+        '' \
+        '[Service]' \
+        'Type=simple' \
+        'NoNewPrivileges=yes' \
+        'TimeoutStartSec=0'
+    [ -z "$environment_file" ] || printf '%s\n' "$environment_file"
+    printf 'ExecStart=%s\n' "$exec_start"
+    printf '%s\n' \
+        'Restart=on-failure' \
+        'RestartSec=5s' \
+        '' \
+        '[Install]' \
+        'WantedBy=multi-user.target'
+}
+
+render_argo_openrc_service() {
+    local tunnel_mode="${1:-quick}"
+    local command_args argo_listen_port="${ARGO_PORT:-${argo_port:-}}"
+
+    case "$tunnel_mode" in
+        token) command_args='tunnel --no-autoupdate run' ;;
+        local) command_args='tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run' ;;
+        quick)
+            [ -n "$argo_listen_port" ] || return 1
+            command_args="tunnel --url http://127.0.0.1:${argo_listen_port} --no-autoupdate --edge-ip-version auto --protocol http2"
+            ;;
+        *) return 1 ;;
+    esac
+
+    printf '%s\n' \
+        '#!/sbin/openrc-run' \
+        '# sing-box-pre:managed-service-v1' \
+        'description="Cloudflare Tunnel"' \
+        'command="/etc/sing-box/argo"' \
+        "command_args=\"${command_args}\"" \
+        'command_background=true' \
+        'pidfile="/var/run/argo.pid"' \
+        'output_log="/etc/sing-box/argo.log"' \
+        'error_log="/etc/sing-box/argo.log"'
+    if [ "$tunnel_mode" = token ]; then
         printf '%s\n' \
-            '# sing-box-pre:managed-service-v1' \
-            '[Unit]' \
-            'Description=Cloudflare Tunnel' \
-            'After=network.target' \
-            '' \
-            '[Service]' \
-            'Type=simple' \
-            'NoNewPrivileges=yes' \
-            'TimeoutStartSec=0'
-        [ -z "$environment_file" ] || printf '%s\n' "$environment_file"
-        printf 'ExecStart=%s\n' "$exec_start"
-        printf '%s\n' \
-            'Restart=on-failure' \
-            'RestartSec=5s' \
-            '' \
-            '[Install]' \
-            'WantedBy=multi-user.target'
-    } | atomic_write_secret_file "$unit_file" || return 1
+            'start_pre() {' \
+            '    [ -r /etc/sing-box/argo.env ] || return 1' \
+            '    . /etc/sing-box/argo.env' \
+            '    export TUNNEL_TOKEN' \
+            '}'
+    fi
+}
+
+write_argo_systemd_service() {
+    local tunnel_mode="${1:-quick}"
+    local install_root="${2:-}"
+    local unit_file="${install_root}/etc/systemd/system/argo.service"
+    local rendered_service
+
+    rendered_service=$(render_argo_systemd_service "$tunnel_mode") || return 1
+    printf '%s\n' "$rendered_service" | atomic_write_secret_file "$unit_file" || return 1
     chmod 644 "$unit_file"
 }
 
@@ -372,35 +449,10 @@ write_argo_openrc_service() {
     local tunnel_mode="${1:-quick}"
     local install_root="${2:-}"
     local init_file="${install_root}/etc/init.d/argo"
-    local command_args
+    local rendered_service
 
-    case "$tunnel_mode" in
-        token) command_args='tunnel --no-autoupdate run' ;;
-        local) command_args='tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run' ;;
-        quick) command_args="tunnel --url http://127.0.0.1:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2" ;;
-        *) return 1 ;;
-    esac
-
-    {
-        printf '%s\n' \
-            '#!/sbin/openrc-run' \
-            '# sing-box-pre:managed-service-v1' \
-            'description="Cloudflare Tunnel"' \
-            'command="/etc/sing-box/argo"' \
-            "command_args=\"${command_args}\"" \
-            'command_background=true' \
-            'pidfile="/var/run/argo.pid"' \
-            'output_log="/etc/sing-box/argo.log"' \
-            'error_log="/etc/sing-box/argo.log"'
-        if [ "$tunnel_mode" = token ]; then
-            printf '%s\n' \
-                'start_pre() {' \
-                '    [ -r /etc/sing-box/argo.env ] || return 1' \
-                '    . /etc/sing-box/argo.env' \
-                '    export TUNNEL_TOKEN' \
-                '}'
-        fi
-    } | atomic_write_secret_file "$init_file" || return 1
+    rendered_service=$(render_argo_openrc_service "$tunnel_mode") || return 1
+    printf '%s\n' "$rendered_service" | atomic_write_secret_file "$init_file" || return 1
     chmod 700 "$init_file"
 }
 
@@ -424,9 +476,9 @@ partial_install_state_path() {
 }
 
 # Persist only the values that cannot be reconstructed without changing the
-# published node identity.  The file is written only after both core services
-# are active, so its presence is durable evidence that a late install stage may
-# be resumed without running install_singbox again.
+# published node identity. The file is written after managed definitions exist
+# and before enable/start, so its presence is durable evidence that a partial
+# install may be resumed without running install_singbox again.
 persist_partial_install_resume_state() {
     local state_file
 
@@ -529,49 +581,33 @@ validate_partial_install_config_ports() {
 
 partial_install_service_definition_is_managed() {
     local init_system="${1:-}" service_name="${2:-}"
-    local definition exec_start command_path command_args
+    local definition tunnel_mode
 
     case "$init_system:$service_name" in
         systemd:sing-box|systemd:argo)
             definition="${INSTALL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/${service_name}.service"
             [ -f "$definition" ] && [ ! -L "$definition" ] && [ -r "$definition" ] || return 1
-            [ "$(grep -Fxc '# sing-box-pre:managed-service-v1' "$definition" 2>/dev/null)" -eq 1 ] || return 1
-            [ "$(grep -c '^ExecStart=' "$definition" 2>/dev/null)" -eq 1 ] || return 1
-            ! grep -Eq '^ExecStart(Pre|Post)=' "$definition" || return 1
-            exec_start=$(sed -n 's/^ExecStart=//p' "$definition") || return 1
             if [ "$service_name" = sing-box ]; then
-                [ "$(grep -c '^WorkingDirectory=/etc/sing-box$' "$definition" 2>/dev/null)" -eq 1 ] && \
-                    [ "$exec_start" = '/etc/sing-box/sing-box run -C /etc/sing-box/conf' ]
-                return
+                cmp -s -- "$definition" <(render_singbox_systemd_service)
+                return $?
             fi
-            case "$exec_start" in
-                '/etc/sing-box/argo tunnel --no-autoupdate run'|\
-                '/etc/sing-box/argo tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run') return 0 ;;
-                "/bin/sh -c '/etc/sing-box/argo tunnel --url http://127.0.0.1:${argo_port} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'") return 0 ;;
-                *) return 1 ;;
-            esac
+            for tunnel_mode in quick token local; do
+                cmp -s -- "$definition" <(render_argo_systemd_service "$tunnel_mode") && return 0
+            done
+            return 1
             ;;
         openrc:sing-box|openrc:argo)
             definition="${INSTALL_OPENRC_INIT_DIR:-/etc/init.d}/${service_name}"
             [ -f "$definition" ] && [ ! -L "$definition" ] && [ -r "$definition" ] && \
                 [ -x "$definition" ] || return 1
-            [ "$(grep -Fxc '# sing-box-pre:managed-service-v1' "$definition" 2>/dev/null)" -eq 1 ] || return 1
-            [ "$(grep -c '^command=' "$definition" 2>/dev/null)" -eq 1 ] || return 1
-            [ "$(grep -c '^command_args=' "$definition" 2>/dev/null)" -eq 1 ] || return 1
-            command_path=$(sed -n 's/^command="\(.*\)"$/\1/p' "$definition") || return 1
-            command_args=$(sed -n 's/^command_args="\(.*\)"$/\1/p' "$definition") || return 1
             if [ "$service_name" = sing-box ]; then
-                [ "$command_path" = '/etc/sing-box/sing-box' ] && \
-                    [ "$command_args" = 'run -C /etc/sing-box/conf' ]
-                return
+                cmp -s -- "$definition" <(render_singbox_openrc_service)
+                return $?
             fi
-            [ "$command_path" = '/etc/sing-box/argo' ] || return 1
-            case "$command_args" in
-                'tunnel --no-autoupdate run'|\
-                'tunnel --config /etc/sing-box/tunnel.yml --no-autoupdate run') return 0 ;;
-                "tunnel --url http://127.0.0.1:${argo_port} --no-autoupdate --edge-ip-version auto --protocol http2") return 0 ;;
-                *) return 1 ;;
-            esac
+            for tunnel_mode in quick token local; do
+                cmp -s -- "$definition" <(render_argo_openrc_service "$tunnel_mode") && return 0
+            done
+            return 1
             ;;
         *) return 1 ;;
     esac
@@ -585,6 +621,43 @@ partial_install_service_is_active() {
         openrc) rc-service "$service_name" status >/dev/null 2>&1 ;;
         *) return 1 ;;
     esac
+}
+
+enable_install_services() {
+    local init_system="${1:-}"
+
+    case "$init_system" in
+        systemd)
+            systemctl daemon-reload >/dev/null 2>&1 || return 1
+            systemctl enable sing-box >/dev/null 2>&1 || return 1
+            systemctl enable argo >/dev/null 2>&1 || return 1
+            ;;
+        openrc)
+            rc-update add sing-box default >/dev/null 2>&1 || return 1
+            rc-update add argo default >/dev/null 2>&1 || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+start_pending_install_services() {
+    local init_system="${1:-}" service_name runtime_status
+
+    case "$init_system" in systemd|openrc) ;; *) return 1 ;; esac
+    for service_name in sing-box argo; do
+        if ! partial_install_service_is_active "$init_system" "$service_name"; then
+            case "$init_system" in
+                systemd) systemctl start "$service_name" >/dev/null 2>&1 || return 1 ;;
+                openrc) rc-service "$service_name" start >/dev/null 2>&1 || return 1 ;;
+            esac
+        fi
+        partial_install_service_is_active "$init_system" "$service_name" || return 1
+        if [ "$service_name" = sing-box ]; then
+            validate_partial_install_resume_runtime "$init_system"
+            runtime_status=$?
+            [ "$runtime_status" -eq 0 ] || return "$runtime_status"
+        fi
+    done
 }
 
 partial_install_nginx_listener_is_managed() {
@@ -601,12 +674,11 @@ partial_install_nginx_listener_is_managed() {
 }
 
 validate_partial_install_resume_runtime() {
-    local init_system="${1:-}" rule port proto
+    local init_system="${1:-}" rule port proto singbox_active=0
 
-    partial_install_service_definition_is_managed "$init_system" sing-box || return 1
-    partial_install_service_definition_is_managed "$init_system" argo || return 1
-    partial_install_service_is_active "$init_system" sing-box || return 1
-    partial_install_service_is_active "$init_system" argo || return 1
+    partial_install_service_definition_is_managed "$init_system" sing-box || return 2
+    partial_install_service_definition_is_managed "$init_system" argo || return 2
+    partial_install_service_is_active "$init_system" sing-box && singbox_active=1
 
     for rule in \
         "$vless_port/tcp" \
@@ -615,10 +687,14 @@ validate_partial_install_resume_runtime() {
         "$argo_port/tcp"; do
         port="${rule%/*}"
         proto="${rule#*/}"
-        port_is_listening "$port" "$proto" || return 1
+        if [ "$singbox_active" -eq 1 ]; then
+            port_is_listening "$port" "$proto" || return 2
+        elif port_is_listening "$port" "$proto"; then
+            return 2
+        fi
     done
     if port_is_listening "$nginx_port" tcp; then
-        partial_install_nginx_listener_is_managed "$init_system" || return 1
+        partial_install_nginx_listener_is_managed "$init_system" || return 2
     fi
 }
 
@@ -666,26 +742,29 @@ clear_install_complete_marker() {
 }
 
 legacy_services_are_active() {
-    local service_name service_definition
+    local service_name service_definition init_system
 
-    if command_exists systemctl; then
-        for service_definition in sing-box.service argo.service; do
-            [ -s "${LEGACY_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/${service_definition}" ] || return 1
-        done
-        for service_name in sing-box argo nginx; do
-            systemctl is-active --quiet "$service_name" >/dev/null 2>&1 || return 1
-        done
-    elif command_exists rc-service; then
-        for service_definition in sing-box argo; do
-            [ -s "${LEGACY_OPENRC_INIT_DIR:-/etc/init.d}/${service_definition}" ] && \
-                [ -x "${LEGACY_OPENRC_INIT_DIR:-/etc/init.d}/${service_definition}" ] || return 1
-        done
-        for service_name in sing-box argo nginx; do
-            rc-service "$service_name" status >/dev/null 2>&1 || return 1
-        done
-    else
-        return 1
-    fi
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        systemd)
+            for service_definition in sing-box.service argo.service; do
+                [ -s "${LEGACY_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/${service_definition}" ] || return 1
+            done
+            for service_name in sing-box argo nginx; do
+                systemctl is-active --quiet "$service_name" >/dev/null 2>&1 || return 1
+            done
+            ;;
+        openrc)
+            for service_definition in sing-box argo; do
+                [ -s "${LEGACY_OPENRC_INIT_DIR:-/etc/init.d}/${service_definition}" ] && \
+                    [ -x "${LEGACY_OPENRC_INIT_DIR:-/etc/init.d}/${service_definition}" ] || return 1
+            done
+            for service_name in sing-box argo nginx; do
+                rc-service "$service_name" status >/dev/null 2>&1 || return 1
+            done
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 legacy_install_is_complete() {
@@ -916,14 +995,20 @@ download_binary() {
 check_service() {
     local service_name=$1
     local service_file=$2
+    local init_system
 
     [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
 
-    if command_exists apk; then
-        rc-service "${service_name}" status | grep -q "started" && green "running" || yellow "not running"
-    else
-        systemctl is-active "${service_name}" | grep -q "^active$" && green "running" || yellow "not running"
-    fi
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        openrc)
+            rc-service "${service_name}" status | grep -q "started" && green "running" || yellow "not running"
+            ;;
+        systemd)
+            systemctl is-active "${service_name}" | grep -q "^active$" && green "running" || yellow "not running"
+            ;;
+        *) return 1 ;;
+    esac
     return $?
 }
 
@@ -1426,15 +1511,15 @@ is_valid_tunnel_subscription_regex() {
 
 detect_argo_tunnel_mode() {
     local service_file="${1:-}"
+    local init_system
 
     if [ -z "$service_file" ]; then
-        if command_exists rc-service && [ -r /etc/init.d/argo ]; then
-            service_file=/etc/init.d/argo
-        elif [ -r /etc/systemd/system/argo.service ]; then
-            service_file=/etc/systemd/system/argo.service
-        else
-            return 1
-        fi
+        init_system=$(detect_usable_init_system) || return 1
+        case "$init_system" in
+            systemd) service_file="${ARGO_SYSTEMD_SERVICE_FILE:-/etc/systemd/system/argo.service}" ;;
+            openrc) service_file="${ARGO_OPENRC_SERVICE_FILE:-/etc/init.d/argo}" ;;
+            *) return 1 ;;
+        esac
     fi
     [ -r "$service_file" ] || return 1
 
@@ -4568,27 +4653,7 @@ EOF
 
 # debian/ubuntu/centos 守护进程
 main_systemd_services() {
-    cat > /etc/systemd/system/sing-box.service << EOF || return 1
-# sing-box-pre:managed-service-v1
-[Unit]
-Description=sing-box service
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
-
-[Service]
-User=root
-WorkingDirectory=/etc/sing-box
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-ExecStart=/etc/sing-box/sing-box run -C /etc/sing-box/conf
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=10
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    render_singbox_systemd_service > /etc/systemd/system/sing-box.service || return 1
 
     local argo_mode=""
     local tunnel_id=""
@@ -4641,24 +4706,11 @@ EOF
         yum update -y ca-certificates || return 1
         bash -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range' || return 1
     fi
-    systemctl daemon-reload || return 1
-    systemctl enable sing-box || return 1
-    systemctl start sing-box || return 1
-    systemctl enable argo || return 1
-    systemctl start argo || return 1
 }
 
 # 适配alpine 守护进程
 alpine_openrc_services() {
-    cat > /etc/init.d/sing-box << 'EOF' || return 1
-#!/sbin/openrc-run
-# sing-box-pre:managed-service-v1
-description="sing-box service"
-command="/etc/sing-box/sing-box"
-command_args="run -C /etc/sing-box/conf"
-command_background=true
-pidfile="/var/run/sing-box.pid"
-EOF
+    render_singbox_openrc_service > /etc/init.d/sing-box || return 1
 
     local argo_mode=""
     local tunnel_id=""
@@ -4705,8 +4757,6 @@ EOF
     write_argo_openrc_service "$argo_mode" || return 1
     chmod +x /etc/init.d/sing-box || return 1
     chmod +x /etc/init.d/argo || return 1
-    rc-update add sing-box default > /dev/null 2>&1 || return 1
-    rc-update add argo default     > /dev/null 2>&1 || return 1
 }
 
 # 生成节点和订阅链接
@@ -5046,7 +5096,7 @@ apply_nginx_subscription_config() {
     local config_file="${5:-${NGINX_SUBSCRIPTION_CONF:-/etc/nginx/conf.d/sing-box.conf}}"
     local config_dir tmp_file backup_file had_config=0
     local preserve_service_state="${4:-start}"
-    local has_ipv6=0
+    local has_ipv6=0 init_system
 
     command_exists nginx || { red "nginx未安装，无法配置订阅服务"; return 1; }
     case "$preserve_service_state" in 0|1|start) ;; *) return 1 ;; esac
@@ -5080,29 +5130,36 @@ apply_nginx_subscription_config() {
         return 1
     fi
 
-    if [ "$preserve_service_state" = 0 ]; then
-        return 0
-    elif command_exists rc-service; then
-        if ! rc-service nginx reload > /dev/null 2>&1 && ! rc-service nginx restart > /dev/null 2>&1; then
-            if [ "$had_config" = 1 ]; then
-                cp -p "$backup_file" "$config_file"
-            else
-                rm -f "$config_file"
+    [ "$preserve_service_state" = 0 ] && return 0
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        openrc)
+            if ! rc-service nginx reload > /dev/null 2>&1 && \
+               ! rc-service nginx restart > /dev/null 2>&1; then
+                if [ "$had_config" = 1 ]; then
+                    cp -p "$backup_file" "$config_file"
+                else
+                    rm -f "$config_file"
+                fi
+                rc-service nginx restart > /dev/null 2>&1 || true
+                return 1
             fi
-            rc-service nginx restart > /dev/null 2>&1 || true
-            return 1
-        fi
-    elif ! nginx -s reload > /dev/null 2>&1 && \
-         { [ "$preserve_service_state" = 1 ] && ! restart_nginx > /dev/null 2>&1 ||
-           [ "$preserve_service_state" = start ] && ! start_nginx > /dev/null 2>&1; }; then
-        if [ "$had_config" = 1 ]; then
-            cp -p "$backup_file" "$config_file"
-        else
-            rm -f "$config_file"
-        fi
-        restart_nginx > /dev/null 2>&1 || true
-        return 1
-    fi
+            ;;
+        systemd)
+            if ! systemctl reload nginx > /dev/null 2>&1 && \
+               { [ "$preserve_service_state" = 1 ] && ! systemctl restart nginx > /dev/null 2>&1 ||
+                 [ "$preserve_service_state" = start ] && ! systemctl start nginx > /dev/null 2>&1; }; then
+                if [ "$had_config" = 1 ]; then
+                    cp -p "$backup_file" "$config_file"
+                else
+                    rm -f "$config_file"
+                fi
+                systemctl restart nginx > /dev/null 2>&1 || true
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
 
     return 0
 }
@@ -5483,7 +5540,7 @@ remove_managed_nginx_include() {
 add_nginx_conf() {
     local main_conf="${NGINX_MAIN_CONF:-/etc/nginx/nginx.conf}"
     local nginx_conf_dir="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
-    local backup_file
+    local backup_file init_system
 
     command_exists nginx || { red "nginx未安装，无法配置订阅服务"; return 1; }
     mkdir -p "$nginx_conf_dir" || return 1
@@ -5500,6 +5557,20 @@ add_nginx_conf() {
     }
 
     if apply_nginx_subscription_config "$nginx_port" "/$password" ""; then
+        init_system=$(detect_usable_init_system) || {
+            rm -f "$backup_file"
+            red "无法确认 Nginx 所属 init backend，安装中止。"
+            return 1
+        }
+        case "$init_system" in
+            systemd) systemctl enable nginx >/dev/null 2>&1 ;;
+            openrc) rc-update add nginx default >/dev/null 2>&1 ;;
+            *) return 1 ;;
+        esac || {
+            rm -f "$backup_file"
+            red "Nginx 配置已加载，但服务 enable 失败；安装重试状态已保留。"
+            return 1
+        }
         rm -f "$backup_file"
         green "nginx订阅配置已加载"
     else
@@ -5526,7 +5597,7 @@ get_current_uuid() {
 manage_service() {
     local service_name="$1"
     local action="$2"
-    local service_file='' status='' check_status=0 action_status=1
+    local service_file='' status='' check_status=0 action_status=1 init_system
 
     if [ -z "$service_name" ] || [ -z "$action" ]; then
         red "缺少服务名或操作参数\n"; return 1
@@ -5537,6 +5608,10 @@ manage_service() {
         argo) service_file="${work_dir}/argo" ;;
         nginx) service_file=$(command -v nginx 2>/dev/null || true) ;;
     esac
+    init_system=$(detect_usable_init_system) || {
+        red "找不到可用的服务管理器。\n"
+        return 1
+    }
     status=$(check_service "$service_name" "$service_file" 2>/dev/null) || check_status=$?
 
     case "$action" in
@@ -5547,15 +5622,16 @@ manage_service() {
                 *"running"*) yellow "${service_name} 正在运行\n"; return 0 ;;
             esac
             yellow "正在启动 ${service_name} 服务\n"
-            if command_exists rc-service; then
-                rc-service "$service_name" start
-                action_status=$?
-            elif command_exists systemctl; then
-                if systemctl daemon-reload; then
-                    systemctl start "$service_name"
-                    action_status=$?
-                fi
-            fi
+            case "$init_system" in
+                openrc) rc-service "$service_name" start; action_status=$? ;;
+                systemd)
+                    if systemctl daemon-reload; then
+                        systemctl start "$service_name"
+                        action_status=$?
+                    fi
+                    ;;
+                *) return 1 ;;
+            esac
             ;;
         "stop")
             [ "$check_status" -eq 2 ] && { yellow "${service_name} 尚未安装！\n"; return 2; }
@@ -5563,26 +5639,25 @@ manage_service() {
                 *"not running"*) yellow "${service_name} 未运行\n"; return 1 ;;
             esac
             yellow "正在停止 ${service_name} 服务\n"
-            if command_exists rc-service; then
-                rc-service "$service_name" stop
-                action_status=$?
-            elif command_exists systemctl; then
-                systemctl stop "$service_name"
-                action_status=$?
-            fi
+            case "$init_system" in
+                openrc) rc-service "$service_name" stop; action_status=$? ;;
+                systemd) systemctl stop "$service_name"; action_status=$? ;;
+                *) return 1 ;;
+            esac
             ;;
         "restart")
             [ "$check_status" -eq 2 ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
             yellow "正在重启 ${service_name} 服务\n"
-            if command_exists rc-service; then
-                rc-service "$service_name" restart
-                action_status=$?
-            elif command_exists systemctl; then
-                if systemctl daemon-reload; then
-                    systemctl restart "$service_name"
-                    action_status=$?
-                fi
-            fi
+            case "$init_system" in
+                openrc) rc-service "$service_name" restart; action_status=$? ;;
+                systemd)
+                    if systemctl daemon-reload; then
+                        systemctl restart "$service_name"
+                        action_status=$?
+                    fi
+                    ;;
+                *) return 1 ;;
+            esac
             ;;
         *)
             red "无效的操作: $action\n"; return 1 ;;
@@ -5605,23 +5680,25 @@ start_nginx()    { manage_service "nginx" "start"; }
 restart_nginx()  { manage_service "nginx" "restart"; }
 
 nginx_service_is_active() {
-    if command_exists rc-service; then
-        rc-service nginx status >/dev/null 2>&1
-    elif command_exists systemctl; then
-        systemctl is-active --quiet nginx
-    else
-        return 1
-    fi
+    local init_system
+
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        openrc) rc-service nginx status >/dev/null 2>&1 ;;
+        systemd) systemctl is-active --quiet nginx ;;
+        *) return 1 ;;
+    esac
 }
 
 stop_nginx_checked() {
-    if command_exists rc-service; then
-        rc-service nginx stop >/dev/null 2>&1
-    elif command_exists systemctl; then
-        systemctl stop nginx >/dev/null 2>&1
-    else
-        return 1
-    fi
+    local init_system
+
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        openrc) rc-service nginx stop >/dev/null 2>&1 ;;
+        systemd) systemctl stop nginx >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
 }
 
 validate_singbox_config() {
@@ -6862,17 +6939,16 @@ change_public_inbound_port_transaction() {
 resolve_argo_service_definition() {
     local systemd_file="${ARGO_SYSTEMD_SERVICE_FILE:-/etc/systemd/system/argo.service}"
     local openrc_file="${ARGO_OPENRC_SERVICE_FILE:-/etc/init.d/argo}"
+    local init_system service_file
 
-    if declare -F command_exists >/dev/null && command_exists rc-service && \
-       [ -f "$openrc_file" ] && [ ! -L "$openrc_file" ] && [ -r "$openrc_file" ]; then
-        printf '%s\n' "$openrc_file"
-    elif [ -f "$systemd_file" ] && [ ! -L "$systemd_file" ] && [ -r "$systemd_file" ]; then
-        printf '%s\n' "$systemd_file"
-    elif [ -f "$openrc_file" ] && [ ! -L "$openrc_file" ] && [ -r "$openrc_file" ]; then
-        printf '%s\n' "$openrc_file"
-    else
-        return 1
-    fi
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        systemd) service_file="$systemd_file" ;;
+        openrc) service_file="$openrc_file" ;;
+        *) return 1 ;;
+    esac
+    [ -f "$service_file" ] && [ ! -L "$service_file" ] && [ -r "$service_file" ] || return 1
+    printf '%s\n' "$service_file"
 }
 
 replace_local_argo_origin_port_file() {
@@ -8320,39 +8396,14 @@ run_install_flow() {
 
         if [ "$init_system" = systemd ]; then
             main_systemd_services || {
-                red "systemd 服务安装或启动失败，安装中止。"
-                yellow "服务可能已部分启动；保留已登记的防火墙规则，避免现有连接被误断。"
-                return 1
-            }
-            systemctl is-active --quiet sing-box && systemctl is-active --quiet argo || {
-                red "sing-box 或 Argo 服务未处于 active 状态，安装中止。"
-                yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
+                red "systemd 服务定义安装失败，安装中止。"
+                yellow "保留已登记的防火墙规则供重试或卸载清理。"
                 return 1
             }
         elif [ "$init_system" = openrc ]; then
             alpine_openrc_services || {
-                red "OpenRC 服务安装失败，安装中止。"
-                yellow "服务可能已部分注册；保留已登记的防火墙规则供重试或卸载清理。"
-                return 1
-            }
-            change_hosts || {
-                red "OpenRC 主机初始化失败，安装中止。"
-                yellow "服务已进入配置阶段；保留已登记的防火墙规则供重试或卸载清理。"
-                return 1
-            }
-            rc-service sing-box restart || {
-                red "sing-box OpenRC 服务启动失败，安装中止。"
-                yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
-                return 1
-            }
-            rc-service argo restart || {
-                red "Argo OpenRC 服务启动失败，安装中止。"
-                yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
-                return 1
-            }
-            rc-service sing-box status >/dev/null 2>&1 && rc-service argo status >/dev/null 2>&1 || {
-                red "sing-box 或 Argo 服务未启动，安装中止。"
-                yellow "服务已进入启动阶段；保留已登记的防火墙规则供重试或卸载清理。"
+                red "OpenRC 服务定义安装失败，安装中止。"
+                yellow "保留已登记的防火墙规则供重试或卸载清理。"
                 return 1
             }
         else
@@ -8366,6 +8417,26 @@ run_install_flow() {
             return 2
         }
     fi
+
+    if [ "$init_system" = openrc ]; then
+        change_hosts || {
+            red "OpenRC 主机初始化失败，安装中止。"
+            yellow "安装重试状态已保留；重试不会重新生成凭据。"
+            return 1
+        }
+    fi
+    enable_install_services "$init_system" || {
+        red "核心服务启用失败，安装中止。"
+        yellow "安装重试状态已保留；重试不会重新生成凭据。"
+        return 1
+    }
+    start_pending_install_services "$init_system" || {
+        stage_status=$?
+        red "sing-box 或 Argo 服务启动复核失败，安装中止。"
+        yellow "安装重试状态已保留；重试仅补启未运行的服务。"
+        [ "$stage_status" -eq 2 ] && return 2
+        return 1
+    }
 
     sleep 5
     add_nginx_conf || {
@@ -9662,33 +9733,20 @@ rotate_subscription_token() {
 }
 
 _stop_subscription_service_locked() {
-    local status
-
     if command_exists nginx; then
-        if command_exists rc-service 2>/dev/null; then
-            if rc-service nginx status 2>/dev/null | grep -q "started"; then
-                rc-service nginx stop || return 1
-                if rc-service nginx status 2>/dev/null | grep -q "started"; then
-                    return 1
-                fi
-            else
-                red "nginx not running"
+        detect_usable_init_system >/dev/null || return 1
+        if nginx_service_is_active; then
+            stop_nginx_checked || return 1
+            if nginx_service_is_active; then
+                return 1
             fi
         else
-            systemctl is-active --quiet nginx
-            status=$?
-            case "$status" in
-                0)
-                    systemctl stop nginx || return 1
-                    systemctl is-active --quiet nginx && return 1
-                    ;;
-                3) red "nginx not running" ;;
-                *) return 1 ;;
-            esac
+            red "nginx not running"
         fi
     else
         yellow "nginx未安装，节点订阅本来就未运行。"
     fi
+    return 0
 }
 
 stop_subscription_service_transaction() {
@@ -10047,7 +10105,7 @@ manage_singbox() {
 manage_argo() {
     local service_file="${1:-}"
     local argo_status=$(check_argo 2>/dev/null)
-    local transition_rc
+    local transition_rc argo_mode
     clear; echo ""
     green "=== Argo 隧道管理 ===\n"
     green "Argo当前状态: $argo_status\n"
@@ -10071,12 +10129,22 @@ manage_argo() {
         2) stop_argo ;;
         3)
             clear
-            if command_exists rc-service 2>/dev/null; then
-                grep -Eq -- '--url http://(127\.0\.0\.1|localhost)' /etc/init.d/argo && get_quick_tunnel && change_argo_domain || \
-                    { green "\n当前使用固定隧道,无需获取临时域名"; sleep 2; menu; }
+            if [ -z "$service_file" ]; then
+                service_file=$(resolve_argo_service_definition) || {
+                    red "无法解析当前 Argo 服务定义。"
+                    return 1
+                }
+            fi
+            argo_mode=$(detect_argo_tunnel_mode "$service_file" 2>/dev/null) || {
+                red "无法识别当前 Argo Tunnel 类型。"
+                return 1
+            }
+            if [ "$argo_mode" = quick ]; then
+                get_quick_tunnel && change_argo_domain
             else
-                grep -Eq 'ExecStart=.*--url http://(127\.0\.0\.1|localhost)' /etc/systemd/system/argo.service && get_quick_tunnel && change_argo_domain || \
-                    { green "\n当前使用固定隧道,无需获取临时域名"; sleep 2; menu; }
+                green "\n当前使用固定隧道,无需获取临时域名"
+                sleep 2
+                menu
             fi
             ;;
         4)
@@ -11872,7 +11940,7 @@ activate_warp_candidate() {
       "$endpoint_file" > "$endpoint_tmp" || ! install -m 600 "${candidate_dir}/account.json" "$state_dir/account.json" || \
       ! install -m 600 "${candidate_dir}/endpoint.json" "$state_dir/endpoint.json" || ! chmod 600 "$endpoint_tmp" || \
       ! mv -f "$endpoint_tmp" "$endpoint_file" || ! validate_singbox_config || ! restart_singbox_checked || \
-      ! singbox_service_is_active || \
+      ! singbox_service_is_stably_active || \
       ! verify_activated_warp "$expected_ip" "$strict_selection"; then
         local rollback_ok=true
         rm -f -- "$endpoint_tmp"
@@ -11880,7 +11948,7 @@ activate_warp_candidate() {
         if [ -e "$backup_dir/had-account" ]; then install -m 600 "$backup_dir/account.json" "$state_dir/account.json" || rollback_ok=false; else rm -f -- "$state_dir/account.json" || rollback_ok=false; fi
         if [ -e "$backup_dir/had-endpoint" ]; then install -m 600 "$backup_dir/endpoint.json" "$state_dir/endpoint.json" || rollback_ok=false; else rm -f -- "$state_dir/endpoint.json" || rollback_ok=false; fi
         restart_singbox_checked >/dev/null 2>&1 || rollback_ok=false
-        singbox_service_is_active || rollback_ok=false
+        singbox_service_is_stably_active || rollback_ok=false
         if [ "$rollback_ok" = true ]; then
             remove_warp_activation_backup "$backup_dir" || yellow "回滚已完成，但激活备份目录清理失败，已保留: ${backup_dir}"
             return 1
@@ -11922,9 +11990,11 @@ verify_activated_warp() {
     return "$rc"
 }
 
-singbox_service_is_active() {
-    local attempt pid_before pid_after
-    if command_exists systemctl; then
+singbox_service_is_stably_active() {
+    local attempt pid_before pid_after init_system
+
+    init_system=$(detect_usable_init_system) || return 1
+    if [ "$init_system" = systemd ]; then
         for attempt in 1 2 3 4; do
             if systemctl is-active --quiet sing-box; then
                 pid_before=$(systemctl show -p MainPID --value sing-box 2>/dev/null)
@@ -11937,7 +12007,7 @@ singbox_service_is_active() {
             fi
         done
         return 1
-    elif command_exists rc-service; then
+    elif [ "$init_system" = openrc ]; then
         for attempt in 1 2 3 4; do
             rc-service sing-box status >/dev/null 2>&1 && { sleep 1; rc-service sing-box status >/dev/null 2>&1 && return 0; }
             sleep 1
@@ -11949,13 +12019,14 @@ singbox_service_is_active() {
 }
 
 stop_singbox_checked() {
-    if command_exists rc-service; then
-        rc-service sing-box stop
-    elif command_exists systemctl; then
-        systemctl stop sing-box
-    else
-        return 1
-    fi
+    local init_system
+
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        openrc) rc-service sing-box stop ;;
+        systemd) systemctl stop sing-box ;;
+        *) return 1 ;;
+    esac
 }
 
 remove_warp_candidate_dir() {
@@ -12352,16 +12423,19 @@ ensure_warp_prerequisites() {
 }
 
 restart_singbox_checked() {
+    local init_system restart_status
+
     yellow "正在重启 sing-box 服务\n"
-    if command_exists rc-service; then
-        rc-service sing-box restart
-    elif command_exists systemctl; then
-        systemctl daemon-reload && systemctl restart sing-box
-    else
+    init_system=$(detect_usable_init_system) || {
         red "找不到可用的服务管理器，sing-box 未重启。"
         return 1
-    fi
-    local restart_status=$?
+    }
+    case "$init_system" in
+        openrc) rc-service sing-box restart ;;
+        systemd) systemctl daemon-reload && systemctl restart sing-box ;;
+        *) return 1 ;;
+    esac
+    restart_status=$?
     if [ "$restart_status" -eq 0 ]; then
         green "sing-box 服务已成功重启\n"
         return 0
@@ -12371,26 +12445,30 @@ restart_singbox_checked() {
 }
 
 argo_service_is_active() {
-    if command_exists rc-service; then
-        rc-service argo status >/dev/null 2>&1
-    elif command_exists systemctl; then
-        systemctl is-active --quiet argo
-    else
-        return 1
-    fi
+    local init_system
+
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        openrc) rc-service argo status >/dev/null 2>&1 ;;
+        systemd) systemctl is-active --quiet argo ;;
+        *) return 1 ;;
+    esac
 }
 
 restart_argo_checked() {
+    local init_system restart_status
+
     yellow "正在重启 Argo 服务\n"
-    if command_exists rc-service; then
-        rc-service argo restart
-    elif command_exists systemctl; then
-        systemctl daemon-reload && systemctl restart argo
-    else
+    init_system=$(detect_usable_init_system) || {
         red "找不到可用的服务管理器，Argo 未重启。"
         return 1
-    fi
-    local restart_status=$?
+    }
+    case "$init_system" in
+        openrc) rc-service argo restart ;;
+        systemd) systemctl daemon-reload && systemctl restart argo ;;
+        *) return 1 ;;
+    esac
+    restart_status=$?
     if [ "$restart_status" -eq 0 ]; then
         green "Argo 服务已成功重启\n"
         return 0
@@ -12400,13 +12478,14 @@ restart_argo_checked() {
 }
 
 stop_argo_checked() {
-    if command_exists rc-service; then
-        rc-service argo stop
-    elif command_exists systemctl; then
-        systemctl stop argo
-    else
-        return 1
-    fi
+    local init_system
+
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        openrc) rc-service argo stop ;;
+        systemd) systemctl stop argo ;;
+        *) return 1 ;;
+    esac
 }
 
 singbox_check_config_dir() {
@@ -12422,13 +12501,14 @@ singbox_check_config_dir() {
 }
 
 singbox_service_is_active() {
-    if command_exists rc-service; then
-        rc-service sing-box status >/dev/null 2>&1
-    elif command_exists systemctl; then
-        systemctl is-active --quiet sing-box
-    else
-        return 1
-    fi
+    local init_system
+
+    init_system=$(detect_usable_init_system) || return 1
+    case "$init_system" in
+        openrc) rc-service sing-box status >/dev/null 2>&1 ;;
+        systemd) systemctl is-active --quiet sing-box ;;
+        *) return 1 ;;
+    esac
 }
 
 atomic_replace_config_file() {

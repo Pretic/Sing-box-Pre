@@ -17,7 +17,7 @@ extract_function() {
 }
 
 for function_name in \
-    atomic_write_secret_file write_argo_systemd_service \
+    atomic_write_secret_file render_argo_systemd_service write_argo_systemd_service \
     use_quick_argo_fallback is_valid_ipv4_address is_valid_ipv6_address \
     is_valid_endpoint_hostname parse_cfip_endpoint format_vless_endpoint \
     rebuild_argo_client_address_set_file get_current_argo_preferred_endpoint \

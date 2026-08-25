@@ -82,9 +82,9 @@ rollback_dir="$(mktemp -d)"
 rollback_config="${rollback_dir}/sing-box.conf"
 NGINX_SUBSCRIPTION_CONF="$rollback_config"
 command_exists() { [[ "$1" == nginx ]]; }
+detect_usable_init_system() { printf 'systemd\n'; }
 nginx() { [[ "${1:-}" == -t ]]; }
-start_nginx() { return 1; }
-restart_nginx() { return 0; }
+systemctl() { return 1; }
 if apply_nginx_subscription_config 8080 "/${token}" ''; then
     echo 'FAIL: nginx apply succeeded despite reload/start failure' >&2
     exit 1

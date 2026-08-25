@@ -25,6 +25,8 @@ done
 green() { :; }
 red() { :; }
 command_exists() { [[ "$1" == nginx ]]; }
+detect_usable_init_system() { printf 'systemd\n'; }
+systemctl() { :; }
 nginx_port=18080
 password=0123456789abcdefghjkmnpqrstvwxyz
 apply_status=0

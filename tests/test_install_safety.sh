@@ -946,6 +946,55 @@ for NGINX_FAILURE in mkdir cp sed include write; do
     run_add_nginx_failure "$NGINX_FAILURE"
 done
 
+run_add_nginx_enable_case() {
+    local init_system="$1" enable_status="$2"
+    local fixture="${tmp_dir}/nginx-enable-${init_system}-${enable_status}"
+    local result
+
+    command rm -rf "$fixture"
+    command mkdir -p "$fixture/conf.d"
+    NGINX_MAIN_CONF="${fixture}/nginx.conf"
+    NGINX_CONF_DIR="${fixture}/conf.d"
+    NGINX_SUBSCRIPTION_CONF="${fixture}/conf.d/sing-box.conf"
+    NGINX_ENABLE_LOG="${fixture}/enable.log"
+    NGINX_INIT_SYSTEM="$init_system"
+    NGINX_ENABLE_STATUS="$enable_status"
+    printf '%s\n' 'http {' '}' > "$NGINX_MAIN_CONF"
+    : > "$NGINX_ENABLE_LOG"
+
+    command_exists() { [[ "$1" == nginx ]]; }
+    ensure_nginx_conf_d_include() { :; }
+    apply_nginx_subscription_config() { :; }
+    detect_usable_init_system() { printf '%s\n' "$NGINX_INIT_SYSTEM"; }
+    systemctl() {
+        printf 'systemctl %s\n' "$*" >> "$NGINX_ENABLE_LOG"
+        return "$NGINX_ENABLE_STATUS"
+    }
+    rc-update() {
+        printf 'rc-update %s\n' "$*" >> "$NGINX_ENABLE_LOG"
+        return "$NGINX_ENABLE_STATUS"
+    }
+
+    set +e
+    add_nginx_conf >/dev/null 2>&1
+    result=$?
+    set -e
+    [[ "$result" -eq "$enable_status" ]] || \
+        fail "${init_system} nginx enable returned ${result}, expected ${enable_status}"
+    if [ "$init_system" = systemd ]; then
+        assert_file_content 'systemctl enable nginx' "$NGINX_ENABLE_LOG" \
+            'systemd nginx config did not explicitly enable the service'
+    else
+        assert_file_content 'rc-update add nginx default' "$NGINX_ENABLE_LOG" \
+            'OpenRC nginx config did not explicitly enable the service'
+    fi
+}
+
+for NGINX_INIT_SYSTEM in systemd openrc; do
+    run_add_nginx_enable_case "$NGINX_INIT_SYSTEM" 0
+    run_add_nginx_enable_case "$NGINX_INIT_SYSTEM" 1
+done
+
 shortcut_source="$(extract_function create_shortcut)"
 [[ -n "$shortcut_source" ]] || fail 'create_shortcut is not implemented'
 grep -Fq 'SHORTCUT_ROOT' <<< "$shortcut_source" || \
@@ -1074,6 +1123,8 @@ prepare_partial_install_resume() { return 1; }
 persist_partial_install_resume_state() { :; }
 partial_install_state_path() { printf '%s\n' "${work_dir}/install-resume.state"; }
 clear_partial_install_resume_state() { command rm -f "$(partial_install_state_path)"; }
+enable_install_services() { :; }
+start_pending_install_services() { :; }
 
 SYSTEMD_RUNTIME_DIR="${tmp_dir}/mock-install-systemd-runtime"
 OPENRC_SOFTLEVEL_FILE="${tmp_dir}/mock-install-openrc/softlevel"

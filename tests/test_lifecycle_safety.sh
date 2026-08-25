@@ -62,6 +62,144 @@ fi
 [[ ! -s "$install_log" ]] || \
     fail "dead systemctl caused side effects: $(tr '\n' ' ' < "$install_log")"
 
+# Every lifecycle entry point must select its backend through the active-init
+# detector. Merely having apk/rc-service installed must not divert a running
+# systemd host (and vice versa when OpenRC is active).
+direct_backend_functions=(
+    check_service
+    legacy_services_are_active
+    detect_argo_tunnel_mode
+    apply_nginx_subscription_config
+    manage_service
+    nginx_service_is_active
+    stop_nginx_checked
+    resolve_argo_service_definition
+    restart_singbox_checked
+    stop_singbox_checked
+    singbox_service_is_stably_active
+    singbox_service_is_active
+    argo_service_is_active
+    restart_argo_checked
+    stop_argo_checked
+)
+for function_name in "${direct_backend_functions[@]}"; do
+    function_source="$(extract_function "$function_name")"
+    [[ -n "$function_source" ]] || fail "$function_name is not implemented"
+    grep -Fq 'detect_usable_init_system' <<< "$function_source" || \
+        fail "$function_name does not use the canonical active-init detector"
+    if grep -Eq 'command_exists (apk|rc-service|systemctl)' <<< "$function_source"; then
+        fail "$function_name still selects lifecycle backend from command presence"
+    fi
+    source <(printf '%s\n' "$function_source")
+done
+
+for function_name in _stop_subscription_service_locked manage_argo; do
+    function_source="$(extract_function "$function_name")"
+    [[ -n "$function_source" ]] || fail "$function_name is not implemented"
+    if grep -Eq 'command_exists (apk|rc-service|systemctl)' <<< "$function_source"; then
+        fail "$function_name still selects lifecycle backend from command presence"
+    fi
+    source <(printf '%s\n' "$function_source")
+done
+stop_subscription_source="$(extract_function _stop_subscription_service_locked)"
+grep -Fq 'nginx_service_is_active' <<< "$stop_subscription_source" || \
+    fail 'subscription stop does not delegate active-backend status checks'
+grep -Fq 'stop_nginx_checked' <<< "$stop_subscription_source" || \
+    fail 'subscription stop does not delegate active-backend stop'
+manage_argo_source="$(extract_function manage_argo)"
+grep -Fq 'resolve_argo_service_definition' <<< "$manage_argo_source" || \
+    fail 'Argo menu does not resolve its definition through the active backend'
+
+backend_root="${tmp_dir}/backend-coexist"
+work_dir="${backend_root}/etc/sing-box"
+server_name=sing-box
+ARGO_SYSTEMD_SERVICE_FILE="${backend_root}/etc/systemd/system/argo.service"
+ARGO_OPENRC_SERVICE_FILE="${backend_root}/etc/init.d/argo"
+mkdir -p "$work_dir" "$(dirname "$ARGO_SYSTEMD_SERVICE_FILE")" \
+    "$(dirname "$ARGO_OPENRC_SERVICE_FILE")"
+: > "${work_dir}/sing-box"
+: > "${work_dir}/argo"
+: > "${work_dir}/nginx"
+cat > "$ARGO_SYSTEMD_SERVICE_FILE" <<'EOF'
+ExecStart=/bin/sh -c '/etc/sing-box/argo tunnel --url http://127.0.0.1:8001 --no-autoupdate'
+EOF
+cat > "$ARGO_OPENRC_SERVICE_FILE" <<'EOF'
+start_pre() { . /etc/sing-box/argo.env; }
+command_args="tunnel --no-autoupdate run"
+EOF
+BACKEND_LOG="${backend_root}/backend.log"
+NGINX_MOCK_ACTIVE=1
+command_exists() { return 0; }
+command() {
+    if [[ "${1:-}" == -v && "${2:-}" == nginx ]]; then
+        printf '%s\n' "${work_dir}/nginx"
+        return 0
+    fi
+    builtin command "$@"
+}
+systemctl() {
+    printf 'systemctl %s\n' "$*" >> "$BACKEND_LOG"
+    case "$*" in
+        'is-active --quiet nginx') [ "$NGINX_MOCK_ACTIVE" -eq 1 ]; return $? ;;
+        'stop nginx') NGINX_MOCK_ACTIVE=0 ;;
+    esac
+    return 0
+}
+rc-service() {
+    printf 'rc-service %s\n' "$*" >> "$BACKEND_LOG"
+    case "$*" in
+        'nginx status') [ "$NGINX_MOCK_ACTIVE" -eq 1 ]; return $? ;;
+        'nginx stop') NGINX_MOCK_ACTIVE=0 ;;
+    esac
+    return 0
+}
+red() { :; }
+yellow() { :; }
+green() { printf '%s\n' "$*"; }
+
+exercise_selected_backend() {
+    local selected_backend="$1" expected_mode expected_definition
+
+    SELECTED_INIT_SYSTEM="$selected_backend"
+    detect_usable_init_system() { printf '%s\n' "$SELECTED_INIT_SYSTEM"; }
+    NGINX_MOCK_ACTIVE=1
+    : > "$BACKEND_LOG"
+    check_service sing-box "${work_dir}/sing-box" >/dev/null
+    manage_service sing-box restart >/dev/null
+    nginx_service_is_active
+    stop_nginx_checked
+    restart_singbox_checked >/dev/null
+    stop_singbox_checked
+    argo_service_is_active
+    restart_argo_checked >/dev/null
+    stop_argo_checked
+    NGINX_MOCK_ACTIVE=1
+    _stop_subscription_service_locked >/dev/null
+
+    if [ "$selected_backend" = systemd ]; then
+        ! grep -Fq 'rc-service ' "$BACKEND_LOG" || \
+            fail 'systemd lifecycle was diverted to coexisting rc-service'
+        grep -Fq 'systemctl ' "$BACKEND_LOG" || \
+            fail 'systemd lifecycle did not use systemctl'
+        expected_mode=quick
+        expected_definition="$ARGO_SYSTEMD_SERVICE_FILE"
+    else
+        ! grep -Fq 'systemctl ' "$BACKEND_LOG" || \
+            fail 'OpenRC lifecycle was diverted to coexisting systemctl'
+        grep -Fq 'rc-service ' "$BACKEND_LOG" || \
+            fail 'OpenRC lifecycle did not use rc-service'
+        expected_mode=remote
+        expected_definition="$ARGO_OPENRC_SERVICE_FILE"
+    fi
+    [[ "$(detect_argo_tunnel_mode)" == "$expected_mode" ]] || \
+        fail "${selected_backend} Argo mode used the wrong service definition"
+    [[ "$(resolve_argo_service_definition)" == "$expected_definition" ]] || \
+        fail "${selected_backend} Argo definition resolver chose the wrong backend"
+}
+
+exercise_selected_backend systemd
+exercise_selected_backend openrc
+
 load_function perform_singbox_uninstall
 
 # A service stop failure is a hard boundary: definitions, NAT recovery state,

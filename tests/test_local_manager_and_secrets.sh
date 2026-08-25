@@ -55,6 +55,8 @@ for function_name in \
     atomic_write_secret_file \
     harden_runtime_secret_permissions \
     write_fixed_argo_credentials \
+    render_argo_systemd_service \
+    render_argo_openrc_service \
     write_argo_systemd_service \
     write_argo_openrc_service \
     write_local_manager_wrapper \
@@ -439,6 +441,22 @@ assert_equal 1 "$(wc -l < "$argo_env" | tr -d '[:space:]')" \
     'fixed Tunnel environment file contains injected directives'
 [[ "$(cat "$argo_env")" =~ ^TUNNEL_TOKEN=[A-Za-z0-9._=-]+$ ]] || \
     fail 'fixed Tunnel environment file contains unsafe shell/systemd syntax'
+
+unset ARGO_PORT argo_port
+missing_port_root="${tmp_dir}/missing-argo-port"
+mkdir -p "${missing_port_root}/etc/systemd/system" "${missing_port_root}/etc/init.d"
+write_argo_systemd_without_pipefail() {
+    (set +o pipefail; write_argo_systemd_service quick "$missing_port_root")
+}
+write_argo_openrc_without_pipefail() {
+    (set +o pipefail; write_argo_openrc_service quick "$missing_port_root")
+}
+assert_fail write_argo_systemd_without_pipefail
+assert_fail write_argo_openrc_without_pipefail
+[[ ! -s "${missing_port_root}/etc/systemd/system/argo.service" ]] || \
+    fail 'missing Argo port produced a systemd service definition'
+[[ ! -s "${missing_port_root}/etc/init.d/argo" ]] || \
+    fail 'missing Argo port produced an OpenRC service definition'
 
 ARGO_PORT=8001
 assert_ok write_argo_systemd_service token "$secret_root"
