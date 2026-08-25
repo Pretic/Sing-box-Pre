@@ -10651,6 +10651,7 @@ change_argo_transition_subscription() {
     green "vless-ws-tls-argo节点已更新\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
     [ -s "${work_dir}/cfy-url.txt" ] && grep 'path=%2Fvless-argo' "${work_dir}/cfy-url.txt" | while IFS= read -r line; do purple "$line\n"; done
+    return 0
 }
 
 get_current_argo_preferred_endpoint() {
@@ -10834,6 +10835,7 @@ _transition_to_quick_argo_locked() {
                 return 0
             fi
         elif [ -n "${ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE:-}" ]; then
+            subscription_rollback_file="$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE"
             rollback_ok=0
         fi
     fi
@@ -10863,7 +10865,11 @@ _transition_to_quick_argo_locked() {
         }
         return 1
     fi
-    red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}"
+    if [ -n "$subscription_rollback_file" ]; then
+        red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}；订阅回滚凭据已保留：${subscription_rollback_file}"
+    else
+        red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}"
+    fi
     return 2
 }
 
@@ -10872,7 +10878,7 @@ _transition_to_fixed_argo_locked() {
     local init_system old_mode snapshot_dir preferred_host preferred_port tunnel_id
     local old_argo_domain="${ARGO_DOMAIN:-}" old_argo_auth="${ARGO_AUTH:-}"
     local old_fixed_ready="${ARGO_FIXED_READY:-0}" old_runtime_domain="${ArgoDomain:-}"
-    local rollback_ok=1
+    local rollback_ok=1 subscription_status=0 subscription_rollback_file=''
 
     [ -n "$new_domain" ] && [ -n "$auth_value" ] || return 1
     [[ "$auth_type" == json || "$auth_type" == token ]] || return 1
@@ -10922,13 +10928,26 @@ EOF
     fi
 
     if [ "$rollback_ok" -eq 1 ] && \
-       activate_argo_service_mode "$([ "$auth_type" = json ] && printf local || printf token)" "$init_system" && \
-       change_argo_transition_subscription fixed "$new_domain" "$preferred_host" "$preferred_port"; then
-        if ! rm -rf -- "$snapshot_dir"; then
-            yellow "Argo 固定 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
-            return 3
+       activate_argo_service_mode "$([ "$auth_type" = json ] && printf local || printf token)" "$init_system"; then
+        change_argo_transition_subscription fixed "$new_domain" \
+            "$preferred_host" "$preferred_port" 1 || subscription_status=$?
+        subscription_rollback_file="${ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE:-}"
+        if [ "$subscription_status" -eq 0 ]; then
+            if [ -n "$subscription_rollback_file" ] && \
+               ! rm -f -- "$subscription_rollback_file"; then
+                yellow "Argo 固定 Tunnel 已成功切换，但订阅回滚凭据未能清理：${subscription_rollback_file}"
+                return 3
+            fi
+            ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE=''
+            ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=''
+            ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
+            if ! rm -rf -- "$snapshot_dir"; then
+                yellow "Argo 固定 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
+                return 3
+            fi
+            return 0
         fi
-        return 0
+        [ "$subscription_status" -eq 1 ] || rollback_ok=0
     fi
 
     restore_argo_transition_snapshot "$snapshot_dir" "$init_system" || rollback_ok=0
@@ -10944,7 +10963,11 @@ EOF
         }
         return 1
     fi
-    red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}"
+    if [ -n "$subscription_rollback_file" ]; then
+        red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}；订阅回滚凭据已保留：${subscription_rollback_file}"
+    else
+        red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}"
+    fi
     return 2
 }
 

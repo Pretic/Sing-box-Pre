@@ -66,7 +66,8 @@ systemctl() { printf 'systemctl %s\n' "$*" >> "$transition_log"; }
 restart_argo() { printf '%s\n' restart >> "$transition_log"; }
 get_quick_tunnel() { ArgoDomain=quick.trycloudflare.com; printf '%s\n' quick-domain >> "$transition_log"; }
 use_quick_argo_fallback() { ARGO_FIXED_READY=0; ARGO_DOMAIN=''; ARGO_AUTH=''; }
-load_subscription_state() { SUB_HTTPS_ENABLED=1; }
+subscription_https_enabled=1
+load_subscription_state() { SUB_HTTPS_ENABLED="$subscription_https_enabled"; }
 disable_status=0
 FRONTEND_RECOVERY_PATH=''
 _disable_cf_https_subscription_locked() {
@@ -84,6 +85,27 @@ acquire_proxy_transaction_lock_checked() {
     return "$PROXY_LOCK_STATUS"
 }
 release_proxy_transaction_lock() { printf '%s\n' proxy-unlock >> "$transition_log"; }
+
+# Optional cfy display output must not turn a successful tracked publication
+# into rc=1 after the base subscription has already committed.
+if ! (
+    display_work_dir="${tmp_dir}/display-only"
+    mkdir -p "$display_work_dir"
+    work_dir="$display_work_dir"
+    client_dir="${display_work_dir}/url.txt"
+    ArgoDomain=fixed.example.com
+    printf '%s\n' \
+        'vless://id@fixed.example.com:443?path=%2Fvless-argo#Node-vless-ws-tls-argo' > "$client_dir"
+    with_subscription_lock() { "$@"; }
+    publish_tracked_argo_transition_subscription_locked() { return 0; }
+    green() { :; }
+    purple() { :; }
+    source <(extract_function change_argo_transition_subscription)
+    change_argo_transition_subscription fixed fixed.example.com preferred.example.com 443 1
+); then
+    fail 'successful tracked Argo publication became rc=1 without optional cfy output'
+fi
+
 publish_status=1
 concurrent_base_on_publish_failure=0
 ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE=''
@@ -95,18 +117,37 @@ change_argo_transition_subscription() {
     if [[ "$publish_status" -ne 0 && "$concurrent_base_on_publish_failure" -eq 1 ]]; then
         printf '%s\n' concurrent-base-generation > "$client_dir"
     fi
+    if [[ "$publish_status" -eq 2 && "${5:-0}" -eq 1 ]]; then
+        ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE="${work_dir}/.mock-argo-subscription-rollback"
+        ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=mock-old-generation
+        ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
+        printf '%s\n' mock-preimage > "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE"
+        chmod 600 "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE"
+        printf '%s\n' publisher-unresolved-generation > "$client_dir"
+    fi
     if [[ "$publish_status" -eq 0 && "${5:-0}" -eq 1 ]]; then
         ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE="${work_dir}/.mock-argo-subscription-rollback"
         ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=mock-old-generation
         ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=mock-new-generation
         printf '%s\n' mock-preimage > "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE"
+        if [ "${1:-}" = fixed ]; then
+            printf '%s\n' fixed-published-generation > "$client_dir"
+        fi
     fi
     return "$publish_status"
 }
+CAS_ROLLBACK_FILE_ARG=''
+CAS_ROLLBACK_OLD_GENERATION_ARG=''
+CAS_ROLLBACK_NEW_GENERATION_ARG=''
 restore_argo_transition_subscription() {
     printf '%s\n' rollback-subscription-cas >> "$transition_log"
+    CAS_ROLLBACK_FILE_ARG="${1:-}"
+    CAS_ROLLBACK_OLD_GENERATION_ARG="${2:-}"
+    CAS_ROLLBACK_NEW_GENERATION_ARG="${3:-}"
     if [ "$CAS_ROLLBACK_STATUS" -eq 0 ]; then
         command rm -f -- "$1"
+    else
+        printf '%s\n' concurrent-base-after-cas-conflict > "$client_dir"
     fi
     return "$CAS_ROLLBACK_STATUS"
 }
@@ -233,10 +274,12 @@ snapshots=("${work_dir}"/.argo-transition.*)
 : > "$transition_log"
 publish_status=0
 disable_status=2
+disable_log="${tmp_dir}/disable-unresolved.log"
 set +e
-disable_output="$(transition_to_quick_argo 2>&1)"
+transition_to_quick_argo >"$disable_log" 2>&1
 disable_transition_status=$?
 set -e
+disable_output="$(command cat "$disable_log")"
 [[ "$disable_transition_status" -eq 2 ]] || \
     fail "HTTPS disable rc=2 was converted into ${disable_transition_status}"
 snapshots=("${work_dir}"/.argo-transition.*)
@@ -246,7 +289,39 @@ snapshots=("${work_dir}"/.argo-transition.*)
     fail 'HTTPS disable rc=2 did not report the surrounding recovery snapshot'
 [[ "$(command cat "$service_file")" == "$before_service" ]] || \
     fail 'HTTPS disable rc=2 did not restore the fixed service definition'
+[[ "$CAS_ROLLBACK_FILE_ARG" == "${work_dir}/.mock-argo-subscription-rollback" && \
+   "$CAS_ROLLBACK_OLD_GENERATION_ARG" == mock-old-generation && \
+   "$CAS_ROLLBACK_NEW_GENERATION_ARG" == mock-new-generation ]] || \
+    fail 'quick transition did not pass its tracked old/new generations to CAS rollback'
 rm -rf -- "${snapshots[0]}"
+disable_status=0
+
+# If a concurrent base generation defeats the quick-transition CAS rollback,
+# both recovery locations must be reported and neither may be discarded.
+: > "$transition_log"
+CAS_ROLLBACK_STATUS=2
+disable_status=1
+cas_conflict_log="${tmp_dir}/cas-conflict.log"
+set +e
+transition_to_quick_argo >"$cas_conflict_log" 2>&1
+cas_conflict_status=$?
+set -e
+cas_conflict_output="$(command cat "$cas_conflict_log")"
+[[ "$cas_conflict_status" -eq 2 ]] || \
+    fail "quick subscription CAS conflict returned ${cas_conflict_status} instead of rc=2"
+snapshots=("${work_dir}"/.argo-transition.*)
+[[ "${#snapshots[@]}" -eq 1 ]] || \
+    fail 'quick subscription CAS conflict did not retain the outer snapshot'
+[[ -f "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE" ]] || \
+    fail 'quick subscription CAS conflict discarded its subscription preimage'
+[[ "$cas_conflict_output" == *"${snapshots[0]}"* && \
+   "$cas_conflict_output" == *"$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE"* ]] || \
+    fail 'quick subscription CAS conflict did not report both recovery paths'
+[[ "$(command cat "$client_dir")" == concurrent-base-after-cas-conflict ]] || \
+    fail 'quick subscription CAS conflict overwrote the concurrent base generation'
+command rm -f -- "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE"
+command rm -rf -- "${snapshots[0]}"
+CAS_ROLLBACK_STATUS=0
 disable_status=0
 
 # HTTPS disable rc=3 means the target state committed with retained recovery
@@ -313,6 +388,7 @@ CLEANUP_FAIL=0
 # A failed quick-to-fixed transition restores the prior quick mode, client and
 # absence of fixed credentials.
 : > "$transition_log"
+subscription_https_enabled=0
 before_service="$(command cat "$service_file")"
 before_client="$(command cat "$client_dir")"
 publish_status=1
@@ -325,5 +401,69 @@ fi
 [[ "$(command cat "$service_file")" == "$before_service" ]] || fail 'quick service was not restored'
 [[ "$(command cat "$client_dir")" == "$before_client" ]] || fail 'quick client was not restored'
 [[ ! -e "${work_dir}/argo.env" ]] || fail 'failed fixed credential survived rollback'
+
+# A fixed-mode publisher rc=2 is an unresolved subscription transaction. The
+# outer service rollback must preserve that status and the publisher's preimage
+# instead of treating the transition as a completely recoverable rc=1.
+: > "$transition_log"
+before_service="$(command cat "$service_file")"
+publish_status=2
+fixed_unresolved_log="${tmp_dir}/fixed-unresolved.log"
+set +e
+transition_to_fixed_argo fixed2.example.com token new-token >"$fixed_unresolved_log" 2>&1
+fixed_unresolved_status=$?
+set -e
+fixed_unresolved_output="$(command cat "$fixed_unresolved_log")"
+[[ "$fixed_unresolved_status" -eq 2 ]] || \
+    fail "fixed subscription publisher rc=2 became ${fixed_unresolved_status}"
+[[ "$(command cat "$service_file")" == "$before_service" ]] || \
+    fail 'fixed publisher rc=2 did not restore the quick service'
+[[ "$(command cat "$client_dir")" == publisher-unresolved-generation ]] || \
+    fail 'fixed publisher rc=2 was overwritten by the outer Argo rollback'
+[[ -f "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE" ]] || \
+    fail 'fixed publisher rc=2 discarded its subscription preimage'
+[[ "$(stat -c '%a' "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE")" == 600 ]] || \
+    fail 'fixed publisher rc=2 retained an insecure subscription preimage'
+snapshots=("${work_dir}"/.argo-transition.*)
+[[ "${#snapshots[@]}" -eq 1 ]] || \
+    fail 'fixed publisher rc=2 did not retain the outer recovery snapshot'
+[[ "$fixed_unresolved_output" == *"${snapshots[0]}"* ]] || \
+    fail 'fixed publisher rc=2 did not report the outer recovery snapshot'
+command rm -f -- "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE"
+command rm -rf -- "${snapshots[0]}"
+
+# Fixed publication is the final commit point. A later snapshot-cleanup failure
+# is rc=3 with the fixed service/subscription left committed, not an outer
+# rollback of the completed transaction.
+: > "$transition_log"
+cat > "$client_dir" <<'EOF'
+vless://id@quick.trycloudflare.com:443?security=tls&sni=quick.trycloudflare.com&type=ws&host=quick.trycloudflare.com&path=%2Fvless-argo#Node-vless-ws-tls-argo
+EOF
+publish_status=0
+CLEANUP_FAIL=1
+fixed_cleanup_log="${tmp_dir}/fixed-cleanup.log"
+set +e
+transition_to_fixed_argo fixed2.example.com token new-token >"$fixed_cleanup_log" 2>&1
+fixed_cleanup_status=$?
+set -e
+fixed_cleanup_output="$(command cat "$fixed_cleanup_log")"
+[[ "$fixed_cleanup_status" -eq 3 ]] || \
+    fail "fixed final-commit cleanup failure returned ${fixed_cleanup_status} instead of rc=3"
+grep -Fqx token-service "$service_file" || \
+    fail 'fixed cleanup rc=3 rolled back the committed service'
+grep -Fqx 'TUNNEL_TOKEN=new-token' "${work_dir}/argo.env" || \
+    fail 'fixed cleanup rc=3 rolled back the committed credential'
+[[ "$(command cat "$client_dir")" == fixed-published-generation ]] || \
+    fail 'fixed cleanup rc=3 rolled back the committed subscription'
+[[ -z "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE" && \
+   ! -e "${work_dir}/.mock-argo-subscription-rollback" ]] || \
+    fail 'fixed final commit did not disarm its subscription rollback token'
+snapshots=("${work_dir}"/.argo-transition.*)
+[[ "${#snapshots[@]}" -eq 1 ]] || \
+    fail 'fixed cleanup rc=3 did not retain the failed-cleanup snapshot'
+[[ "$fixed_cleanup_output" == *'已成功'*"${snapshots[0]}"* ]] || \
+    fail 'fixed cleanup rc=3 did not report committed success and retained snapshot'
+command rm -rf -- "${snapshots[0]}"
+CLEANUP_FAIL=0
 
 printf 'Argo mode transaction tests passed.\n'
