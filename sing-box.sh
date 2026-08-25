@@ -10549,20 +10549,104 @@ rebuild_argo_transition_subscription_file() {
     update_argo_subscription_file "$staged_base_file" "$new_domain"
 }
 
+publish_tracked_argo_transition_subscription_locked() {
+    local mode="${1:-}"
+    local stable_domain="${2:-}"
+    local fallback_host="${3:-}"
+    local fallback_port="${4:-}"
+    local rollback_file old_generation new_generation publish_status=0
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    [ -f "$client_dir" ] && [ ! -L "$client_dir" ] || return 1
+    rollback_file=$(mktemp "${work_dir}/.argo-subscription-rollback.XXXXXX") || return 1
+    cp -p -- "$client_dir" "$rollback_file" || { rm -f "$rollback_file"; return 1; }
+    chmod 600 "$rollback_file" || { rm -f "$rollback_file"; return 1; }
+    old_generation=$(get_base_subscription_generation_locked "$client_dir") || {
+        rm -f "$rollback_file"
+        return 1
+    }
+
+    if grep -Fq 'path=%2Fvless-argo' "$client_dir"; then
+        mutate_base_subscription_locked rebuild_argo_transition_subscription_file \
+            "$mode" "$stable_domain" "$fallback_host" "$fallback_port" "$ArgoDomain" || \
+            publish_status=$?
+    else
+        mutate_base_subscription_locked update_argo_subscription_file "$ArgoDomain" || \
+            publish_status=$?
+    fi
+    if [ "$publish_status" -ne 0 ]; then
+        if [ "$publish_status" -eq 1 ] && rm -f "$rollback_file"; then
+            return 1
+        fi
+        ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE="$rollback_file"
+        ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION="$old_generation"
+        ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
+        [ "$publish_status" -ne 1 ] || publish_status=2
+        return "$publish_status"
+    fi
+    new_generation=$(get_base_subscription_generation_locked "$client_dir") || {
+        ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE="$rollback_file"
+        ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION="$old_generation"
+        ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
+        return 2
+    }
+    ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE="$rollback_file"
+    ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION="$old_generation"
+    ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION="$new_generation"
+}
+
+restore_argo_transition_subscription_locked() {
+    local rollback_file="${1:-}"
+    local old_generation="${2:-}"
+    local expected_generation="${3:-}"
+    local current_generation rollback_generation staged_file publish_status=0
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 2
+    [ -f "$rollback_file" ] && [ ! -L "$rollback_file" ] || return 2
+    current_generation=$(get_base_subscription_generation_locked "$client_dir") || return 2
+    [ "$current_generation" = "$expected_generation" ] || return 2
+    rollback_generation=$(get_base_subscription_generation_locked "$rollback_file") || return 2
+    [ "$rollback_generation" = "$old_generation" ] || return 2
+    staged_file=$(mktemp "${work_dir}/.tmp.$(basename "$client_dir").argo-rollback.XXXXXX") || return 2
+    cp -p -- "$rollback_file" "$staged_file" || { rm -f "$staged_file"; return 2; }
+    chmod 600 "$staged_file" || { rm -f "$staged_file"; return 2; }
+    publish_subscriptions_locked "$staged_file" || publish_status=$?
+    if [ "$publish_status" -ne 0 ]; then
+        rm -f "$staged_file"
+        return 2
+    fi
+    current_generation=$(get_base_subscription_generation_locked "$client_dir") || return 2
+    [ "$current_generation" = "$old_generation" ] || return 2
+    rm -f -- "$rollback_file" || return 2
+}
+
+restore_argo_transition_subscription() {
+    with_subscription_lock restore_argo_transition_subscription_locked "$@"
+}
+
 change_argo_transition_subscription() {
     local mode="${1:-}"
     local stable_domain="${2:-}"
     local fallback_host="${3:-}"
     local fallback_port="${4:-}"
+    local track_rollback="${5:-0}"
 
     [ -n "${ArgoDomain:-}" ] || { red "未获取到Argo域名，无法更新节点"; return 1; }
     [[ "$mode" == fixed || "$mode" == quick ]] || return 1
-    if [ ! -s "$client_dir" ] || ! grep -Fq 'path=%2Fvless-argo' "$client_dir"; then
+    [[ "$track_rollback" == 0 || "$track_rollback" == 1 ]] || return 1
+    ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE=''
+    ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=''
+    ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
+    if [ "$track_rollback" = 1 ]; then
+        with_subscription_lock publish_tracked_argo_transition_subscription_locked \
+            "$mode" "$stable_domain" "$fallback_host" "$fallback_port" || return $?
+    elif [ ! -s "$client_dir" ] || ! grep -Fq 'path=%2Fvless-argo' "$client_dir"; then
         change_argo_domain
         return $?
+    else
+        mutate_base_subscription rebuild_argo_transition_subscription_file \
+            "$mode" "$stable_domain" "$fallback_host" "$fallback_port" "$ArgoDomain" || return $?
     fi
-    mutate_base_subscription rebuild_argo_transition_subscription_file \
-        "$mode" "$stable_domain" "$fallback_host" "$fallback_port" "$ArgoDomain" || return $?
 
     green "vless-ws-tls-argo节点已更新\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
@@ -10604,10 +10688,9 @@ create_argo_transition_snapshot() {
     else
         service_file="${install_root}/etc/init.d/argo"
     fi
-    for name in service tunnel.json tunnel.yml argo.env client; do
+    for name in service tunnel.json tunnel.yml argo.env; do
         case "$name" in
             service) source_file="$service_file" ;;
-            client) source_file="$client_dir" ;;
             *) source_file="${work_dir}/${name}" ;;
         esac
         if [ -e "$source_file" ]; then
@@ -10651,10 +10734,9 @@ restore_argo_transition_snapshot() {
     else
         return 1
     fi
-    for name in service tunnel.json tunnel.yml argo.env client; do
+    for name in service tunnel.json tunnel.yml argo.env; do
         case "$name" in
             service) target_file="$service_file" ;;
-            client) target_file="$client_dir" ;;
             *) target_file="${work_dir}/${name}" ;;
         esac
         if [ -f "${snapshot_dir}/${name}" ]; then
@@ -10694,11 +10776,13 @@ activate_argo_service_mode() {
     restart_argo
 }
 
-transition_to_quick_argo() {
+_transition_to_quick_argo_locked() {
     local init_system old_mode snapshot_dir preferred_host preferred_port
     local old_argo_domain="${ARGO_DOMAIN:-}" old_argo_auth="${ARGO_AUTH:-}"
     local old_fixed_ready="${ARGO_FIXED_READY:-0}" old_runtime_domain="${ArgoDomain:-}"
-    local rollback_ok=1 https_disable_rc=0
+    local rollback_ok=1 https_disable_rc=0 https_disable_committed=0 committed_warning=0
+    local subscription_status=0 subscription_published=0
+    local subscription_rollback_file='' subscription_old_generation='' subscription_new_generation=''
 
     init_system=$(detect_usable_init_system) || return 1
     old_mode=$(detect_argo_tunnel_mode 2>/dev/null || printf 'unknown')
@@ -10711,24 +10795,46 @@ transition_to_quick_argo() {
     snapshot_dir=$(create_argo_transition_snapshot "$init_system") || return 1
 
     use_quick_argo_fallback
-    if activate_argo_service_mode quick "$init_system" && \
-       get_quick_tunnel && \
-       change_argo_transition_subscription quick "$ArgoDomain" "$preferred_host" "$preferred_port"; then
-        load_subscription_state
-        if [ "${SUB_HTTPS_ENABLED:-0}" = 1 ]; then
-            if disable_cf_https_subscription; then
-                https_disable_rc=0
-            else
-                https_disable_rc=$?
+    if activate_argo_service_mode quick "$init_system" && get_quick_tunnel; then
+        change_argo_transition_subscription quick "$ArgoDomain" \
+            "$preferred_host" "$preferred_port" 1 || subscription_status=$?
+        if [ "$subscription_status" -eq 0 ]; then
+            subscription_published=1
+            subscription_rollback_file="${ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE:-}"
+            subscription_old_generation="${ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION:-}"
+            subscription_new_generation="${ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION:-}"
+            load_subscription_state
+            if [ "${SUB_HTTPS_ENABLED:-0}" = 1 ]; then
+                if _disable_cf_https_subscription_locked; then
+                    https_disable_rc=0
+                    https_disable_committed=1
+                else
+                    https_disable_rc=$?
+                    if [ "$https_disable_rc" -eq 3 ]; then
+                        https_disable_committed=1
+                        committed_warning=1
+                    fi
+                fi
             fi
-        fi
-        if [ "$https_disable_rc" -eq 0 ] && \
-           rm -f "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml" "${work_dir}/argo.env"; then
-            if ! rm -rf -- "$snapshot_dir"; then
-                yellow "Argo 临时 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
-                return 3
+            if { [ "$https_disable_rc" -eq 0 ] || [ "$https_disable_rc" -eq 3 ]; } && \
+               rm -f "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml" "${work_dir}/argo.env"; then
+                if [ -n "$subscription_rollback_file" ] && \
+                   ! rm -f -- "$subscription_rollback_file"; then
+                    yellow "Argo 临时 Tunnel 已成功切换，但订阅回滚凭据未能清理：${subscription_rollback_file}"
+                    return 3
+                fi
+                ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE=''
+                ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=''
+                ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
+                if ! rm -rf -- "$snapshot_dir"; then
+                    yellow "Argo 临时 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
+                    return 3
+                fi
+                [ "$committed_warning" -eq 0 ] || return 3
+                return 0
             fi
-            return 0
+        elif [ -n "${ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE:-}" ]; then
+            rollback_ok=0
         fi
     fi
 
@@ -10738,8 +10844,18 @@ transition_to_quick_argo() {
     ARGO_FIXED_READY="$old_fixed_ready"
     ArgoDomain="$old_runtime_domain"
     restart_argo >/dev/null 2>&1 || rollback_ok=0
-    update_sub >/dev/null 2>&1 || rollback_ok=0
+    if [ "$subscription_published" -eq 1 ]; then
+        if [ -n "$subscription_rollback_file" ] && \
+           [ -n "$subscription_old_generation" ] && \
+           [ -n "$subscription_new_generation" ]; then
+            restore_argo_transition_subscription "$subscription_rollback_file" \
+                "$subscription_old_generation" "$subscription_new_generation" || rollback_ok=0
+        else
+            rollback_ok=0
+        fi
+    fi
     [ "$https_disable_rc" -ne 2 ] || rollback_ok=0
+    [ "$https_disable_committed" -ne 1 ] || rollback_ok=0
     if [ "$rollback_ok" -eq 1 ]; then
         rm -rf -- "$snapshot_dir" || {
             red "Argo 模式切换失败；运行状态已恢复，但临时快照无法清理：${snapshot_dir}"
@@ -10751,7 +10867,7 @@ transition_to_quick_argo() {
     return 2
 }
 
-transition_to_fixed_argo() {
+_transition_to_fixed_argo_locked() {
     local new_domain="${1:-}" auth_type="${2:-}" auth_value="${3:-}"
     local init_system old_mode snapshot_dir preferred_host preferred_port tunnel_id
     local old_argo_domain="${ARGO_DOMAIN:-}" old_argo_auth="${ARGO_AUTH:-}"
@@ -10821,7 +10937,6 @@ EOF
     ARGO_FIXED_READY="$old_fixed_ready"
     ArgoDomain="$old_runtime_domain"
     restart_argo >/dev/null 2>&1 || rollback_ok=0
-    update_sub >/dev/null 2>&1 || rollback_ok=0
     if [ "$rollback_ok" -eq 1 ]; then
         rm -rf -- "$snapshot_dir" || {
             red "Argo 模式切换失败；运行状态已恢复，但临时快照无法清理：${snapshot_dir}"
@@ -10831,6 +10946,30 @@ EOF
     fi
     red "Argo 模式切换失败且自动回滚不完整；恢复快照已保留：${snapshot_dir}"
     return 2
+}
+
+transition_to_quick_argo() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "Argo 临时 Tunnel 切换"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _transition_to_quick_argo_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
+}
+
+transition_to_fixed_argo() {
+    local status
+
+    acquire_proxy_transaction_lock_checked "${conf_dir}" "Argo 固定 Tunnel 切换"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    _transition_to_fixed_argo_locked "$@"
+    status=$?
+    release_proxy_transaction_lock
+    return "$status"
 }
 
 change_cfip() {
@@ -14426,6 +14565,7 @@ _add_extra_protocol_transaction_locked() {
     local mutation_callback="${3:-}"
     shift 3 || return 1
     local delimiter_seen=0 backup_dir was_active=0 transaction_status=0 has_v4 has_v6
+    local publisher_unresolved=0
     local firewall_rule rule_port rule_proto conflict_status nginx_conflict_status tag_status
     local expected_tag
     local -a firewall_rules=() callback_args=() new_firewall_records=()
@@ -14548,11 +14688,13 @@ _add_extra_protocol_transaction_locked() {
     if [ "$transaction_status" -eq 0 ]; then
         durable_transaction_checkpoint publishing || transaction_status=2
     fi
-    [ "$transaction_status" -ne 0 ] || \
+    if [ "$transaction_status" -eq 0 ]; then
         append_base_subscription_url "$client_line" || transaction_status=$?
+        [ "$transaction_status" -ne 2 ] || publisher_unresolved=1
+    fi
     if [ "$transaction_status" -ne 0 ]; then
         handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
-            "$transaction_status" 0 \
+            "$transaction_status" "$publisher_unresolved" \
             "$EXTRA_PROTOCOL_SERVICE_TOUCHED" \
             "${new_firewall_records[@]}"
         transaction_status=$?
@@ -14596,6 +14738,7 @@ _remove_extra_protocol_transaction_locked() {
     local mutation_callback="${3:-}"
     shift 3 || return 1
     local delimiter_seen=0 backup_dir was_active=0 cleanup_status=0 transaction_status=0
+    local publisher_unresolved=0
     local firewall_rule rule_proto current_port port_status expected_tag
     local -a firewall_rules=() callback_args=() firewall_protocols=()
 
@@ -14660,10 +14803,13 @@ _remove_extra_protocol_transaction_locked() {
     if [ "$transaction_status" -eq 0 ]; then
         durable_transaction_checkpoint publishing || transaction_status=2
     fi
-    [ "$transaction_status" -ne 0 ] || remove_url_by_tag "$url_scheme" || transaction_status=$?
+    if [ "$transaction_status" -eq 0 ]; then
+        remove_url_by_tag "$url_scheme" || transaction_status=$?
+        [ "$transaction_status" -ne 2 ] || publisher_unresolved=1
+    fi
     if [ "$transaction_status" -ne 0 ]; then
         handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
-            "$transaction_status" 0 \
+            "$transaction_status" "$publisher_unresolved" \
             "$EXTRA_PROTOCOL_SERVICE_TOUCHED"
         transaction_status=$?
         if [ -n "${EXTRA_PROTOCOL_RECOVERY_PATH:-}" ]; then
@@ -14680,18 +14826,12 @@ _remove_extra_protocol_transaction_locked() {
     fi
     remove_owned_firewall_ports_if_unused "$inbounds_file" "${firewall_rules[@]}" || cleanup_status=$?
     if [ "$cleanup_status" -ne 0 ]; then
+        disarm_durable_transaction keep >/dev/null 2>&1 || true
         if [ "$cleanup_status" -eq 2 ]; then
-            disarm_durable_transaction keep >/dev/null 2>&1 || true
             red "额外协议已删除，但防火墙清理状态未决；恢复证据已保留：${EXTRA_PROTOCOL_RECOVERY_PATH:-$backup_dir}"
             return 2
         fi
-        if ! cleanup_extra_protocol_backup "$backup_dir"; then
-            disarm_durable_transaction keep >/dev/null 2>&1 || true
-            yellow "额外协议已删除，但旧防火墙规则与事务备份均未能清理：${EXTRA_PROTOCOL_RECOVERY_PATH:-$backup_dir}"
-            return 3
-        fi
-        disarm_durable_transaction cleanup >/dev/null 2>&1 || true
-        yellow "额外协议已删除，但旧防火墙规则未能完全清理。"
+        yellow "额外协议已删除，但旧防火墙规则未能完全清理；恢复证据已保留：${EXTRA_PROTOCOL_RECOVERY_PATH:-$backup_dir}"
         return 3
     fi
 

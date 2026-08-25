@@ -608,6 +608,17 @@ grep -Fq 'remove-exact:ufw|4|24000|tcp ufw|4|24000|udp' "$call_log" || \
     fail 'failed add leaked new firewall ownership records'
 
 reset_fixture
+UPDATE_STATUS=2
+if add_extra_protocol_transaction "$inbounds_file" 'new-client' mutation_add \
+    --families 1 1 24000/tcp 24000/udp -- socks-tag; then
+    add_status=0
+else
+    add_status=$?
+fi
+[ "$add_status" -eq 2 ] || \
+    fail "unresolved subscription publisher status was downgraded to rc ${add_status} during add"
+
+reset_fixture
 UPDATE_STATUS=3
 if add_extra_protocol_transaction "$inbounds_file" 'new-client' mutation_add \
     --families 1 1 24000/tcp 24000/udp -- socks-tag; then
@@ -708,6 +719,19 @@ fi
 reset_fixture
 printf 'new-config:socks-tag\n' > "$inbounds_file"
 printf 'old-client\nnew-client\n' > "$client_dir"
+UPDATE_STATUS=2
+if remove_extra_protocol_transaction "$inbounds_file" socks mutation_remove \
+    24000/tcp 24000/udp -- socks-tag; then
+    remove_status=0
+else
+    remove_status=$?
+fi
+[ "$remove_status" -eq 2 ] || \
+    fail "unresolved subscription publisher status was downgraded to rc ${remove_status} during remove"
+
+reset_fixture
+printf 'new-config:socks-tag\n' > "$inbounds_file"
+printf 'old-client\nnew-client\n' > "$client_dir"
 before_config="$(<"$inbounds_file")"
 before_client="$(<"$client_dir")"
 UPDATE_STATUS=3
@@ -733,6 +757,13 @@ else
 fi
 [ "$remove_cleanup_status" -eq 3 ] || \
     fail "clean firewall residue returned ${remove_cleanup_status} instead of committed rc 3"
+[ -d "$EXTRA_PROTOCOL_RECOVERY_PATH" ] || \
+    fail 'committed firewall cleanup rc 1 discarded durable recovery evidence'
+[ -f "${conf_dir}/.durable-transaction.pending" ] && \
+    [ "$(<"${conf_dir}/.durable-transaction.pending")" = "$EXTRA_PROTOCOL_RECOVERY_PATH" ] || \
+    fail 'committed firewall cleanup rc 1 discarded its pending durable registry'
+grep -Fxq 'stage=firewall-mutating' "$EXTRA_PROTOCOL_RECOVERY_PATH/manifest" || \
+    fail 'committed firewall cleanup rc 1 lost its cleanup-stage manifest'
 grep -Fxq 'removed-config:socks-tag' "$inbounds_file" || \
     fail 'clean firewall residue rolled back the committed config removal'
 grep -Fxq 'client-without:socks' "$client_dir" || \

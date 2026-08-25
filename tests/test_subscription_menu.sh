@@ -37,8 +37,8 @@ grep -Fq 'transition_to_quick_argo' <<< "$argo_source" || {
     echo 'FAIL: switching to a quick Tunnel bypasses the transaction helper' >&2
     exit 1
 }
-quick_transition_source="$(extract_function transition_to_quick_argo)"
-grep -Fq 'disable_cf_https_subscription' <<< "$quick_transition_source" || {
+quick_transition_source="$(extract_function _transition_to_quick_argo_locked)"
+grep -Fq '_disable_cf_https_subscription_locked' <<< "$quick_transition_source" || {
     echo 'FAIL: quick Tunnel transaction does not remove the active HTTPS route' >&2
     exit 1
 }

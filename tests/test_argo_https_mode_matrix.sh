@@ -24,7 +24,8 @@ for function_name in \
     create_argo_transition_snapshot restore_argo_transition_snapshot \
     strip_local_tunnel_subscription_rule remove_local_tunnel_subscription_rule \
     apply_local_tunnel_subscription_removal \
-    activate_argo_service_mode transition_to_quick_argo transition_to_fixed_argo; do
+    activate_argo_service_mode _transition_to_quick_argo_locked \
+    _transition_to_fixed_argo_locked transition_to_quick_argo transition_to_fixed_argo; do
     function_source="$(extract_function "$function_name")"
     [[ -n "$function_source" ]] || fail "$function_name is not implemented"
     source <(printf '%s\n' "$function_source")
@@ -32,6 +33,7 @@ done
 
 root="${tmp_dir}/root"
 work_dir="${root}/etc/sing-box"
+conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
 subscription_state_file="${work_dir}/subscription.conf"
 NGINX_SUBSCRIPTION_CONF="${root}/etc/nginx/conf.d/sing-box.conf"
@@ -40,7 +42,7 @@ ARGO_PORT=18001
 CFIP=default-edge.example.com
 CFPORT=443
 
-mkdir -p "${root}/etc/systemd/system" "${root}/etc/nginx/conf.d" "$work_dir"
+mkdir -p "${root}/etc/systemd/system" "${root}/etc/nginx/conf.d" "$conf_dir"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "${work_dir}/argo"
 chmod 700 "${work_dir}/argo"
 cat > "${root}/etc/systemd/system/argo.service" <<'EOF'
@@ -82,7 +84,8 @@ systemctl() { return 0; }
 restart_argo() { return 0; }
 get_quick_tunnel() { ArgoDomain=quick.trycloudflare.com; }
 change_argo_transition_subscription() { return 0; }
-update_sub() { return 0; }
+acquire_proxy_transaction_lock_checked() { return 0; }
+release_proxy_transaction_lock() { :; }
 load_subscription_state() {
     if [[ "$(< "$subscription_state_file")" == disabled ]]; then
         SUB_TOKEN=token
@@ -111,7 +114,7 @@ save_subscription_state() {
         printf '%s\n' enabled > "$subscription_state_file"
     fi
 }
-disable_cf_https_subscription() {
+_disable_cf_https_subscription_locked() {
     load_subscription_state
     [ "${SUB_HTTPS_ENABLED:-0}" = 1 ] || return 0
     [ "${SUB_TUNNEL_MODE:-}" = local ] || return 1

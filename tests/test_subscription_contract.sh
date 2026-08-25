@@ -35,6 +35,9 @@ for function_name in \
     mutate_base_subscription \
     get_base_subscription_generation_locked \
     get_base_subscription_generation \
+    publish_tracked_argo_transition_subscription_locked \
+    restore_argo_transition_subscription_locked \
+    restore_argo_transition_subscription \
     verify_base_subscription_generation_locked \
     publish_generated_base_locked \
     publish_generated_base \
@@ -497,6 +500,71 @@ else
     printf 'SKIP: util-linux flock is unavailable; real concurrency check requires Linux CI.\n'
 fi
 
+# Quick-mode rollback owns only the exact generation it published. A newer base
+# generation must survive the short-lock CAS, while an unchanged published
+# generation can be restored from the independent 0600 preimage.
+printf '%s\n' argo-old-generation > "$client_dir"
+update_sub || fail 'could not publish the Argo CAS baseline'
+argo_rollback_file="$(mktemp "${work_dir}/.argo-subscription-rollback.XXXXXX")"
+cp -p -- "$client_dir" "$argo_rollback_file"
+chmod 600 "$argo_rollback_file"
+argo_old_generation="$(get_base_subscription_generation)"
+printf '%s\n' argo-published-generation > "$client_dir"
+update_sub || fail 'could not publish the Argo CAS candidate'
+argo_new_generation="$(get_base_subscription_generation)"
+printf '%s\n' concurrent-newer-generation > "$client_dir"
+update_sub || fail 'could not publish the concurrent Argo generation'
+if restore_argo_transition_subscription "$argo_rollback_file" \
+    "$argo_old_generation" "$argo_new_generation"; then
+    fail 'Argo CAS rollback overwrote a newer base generation'
+else
+    argo_cas_status=$?
+fi
+[[ "$argo_cas_status" -eq 2 ]] || \
+    fail "Argo CAS generation conflict returned ${argo_cas_status} instead of rc 2"
+[[ "$(<"$client_dir")" == concurrent-newer-generation ]] || \
+    fail 'Argo CAS generation conflict changed the concurrent base source'
+[[ -f "$argo_rollback_file" ]] || \
+    fail 'Argo CAS generation conflict discarded its recovery preimage'
+printf '%s\n' argo-published-generation > "$client_dir"
+update_sub || fail 'could not reset the Argo CAS candidate'
+restore_argo_transition_subscription "$argo_rollback_file" \
+    "$argo_old_generation" "$argo_new_generation" || \
+    fail 'Argo CAS could not restore its unchanged published generation'
+[[ "$(<"$client_dir")" == argo-old-generation ]] || \
+    fail 'Argo CAS restored the wrong base preimage'
+[[ ! -e "$argo_rollback_file" ]] || \
+    fail 'successful Argo CAS retained a stale recovery preimage'
+
+# A publisher rc=2 means its own atomic rollback is unresolved. The tracked
+# publisher must retain the old preimage even though no trustworthy new
+# generation exists for an automatic CAS.
+saved_mutate_base_subscription_locked="$(declare -f mutate_base_subscription_locked)"
+mutate_base_subscription_locked() { return 2; }
+ArgoDomain=quick.trycloudflare.com
+ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE=''
+ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=''
+ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
+SUBSCRIPTION_LOCK_HELD=1
+if publish_tracked_argo_transition_subscription_locked quick quick.trycloudflare.com \
+    preferred.example.com 443; then
+    tracked_publish_status=0
+else
+    tracked_publish_status=$?
+fi
+unset SUBSCRIPTION_LOCK_HELD
+eval "$saved_mutate_base_subscription_locked"
+[[ "$tracked_publish_status" -eq 2 ]] || \
+    fail "tracked Argo publisher rc 2 became ${tracked_publish_status}"
+[[ -f "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE" ]] || \
+    fail 'tracked Argo publisher rc 2 discarded its base preimage evidence'
+[[ -n "$ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION" && \
+   -z "$ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION" ]] || \
+    fail 'tracked Argo publisher rc 2 exposed invalid rollback generations'
+rm -f -- "$ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE"
+ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE=''
+ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=''
+
 if grep -Eq 'sed[[:space:]].*-i.*\$\{?client_dir|echo.*>>.*\$\{?client_dir|mv.*\$\{?client_dir|rm.*\$\{?client_dir' "$script"; then
     fail 'Sing-box still directly mutates url.txt outside the shared subscription transaction'
 fi
@@ -527,12 +595,23 @@ fi
 
 for transition_name in transition_to_quick_argo transition_to_fixed_argo; do
     transition_source="$(extract_function "$transition_name")"
+    grep -Fq 'acquire_proxy_transaction_lock_checked' <<< "$transition_source" || \
+        fail "${transition_name} does not fail-close under the canonical proxy lock"
+    locked_transition_name="_${transition_name}_locked"
+    grep -Fq "$locked_transition_name" <<< "$transition_source" || \
+        fail "${transition_name} does not delegate to a non-nesting locked implementation"
+    locked_transition_source="$(extract_function "$locked_transition_name")"
+    [[ -n "$locked_transition_source" ]] || \
+        fail "${locked_transition_name} is not implemented"
     if grep -Fq 'rebuild_argo_client_address_set_file "$client_dir"' <<< "$transition_source"; then
         fail "${transition_name} rebuilds live url.txt outside the canonical subscription lock"
     fi
-    grep -Fq 'change_argo_transition_subscription' <<< "$transition_source" || \
+    grep -Fq 'change_argo_transition_subscription' <<< "$locked_transition_source" || \
         fail "${transition_name} bypasses the locked Argo subscription transition"
 done
+quick_locked_source="$(extract_function _transition_to_quick_argo_locked)"
+grep -Fq '_disable_cf_https_subscription_locked' <<< "$quick_locked_source" || \
+    fail 'quick Argo locked implementation reacquires the proxy lock through the public HTTPS wrapper'
 argo_transition_source="$(extract_function change_argo_transition_subscription)"
 grep -Fq 'mutate_base_subscription rebuild_argo_transition_subscription_file' \
     <<< "$argo_transition_source" || \
