@@ -434,26 +434,126 @@ render_argo_openrc_service() {
     fi
 }
 
+managed_service_definition_is_canonical() {
+    local target_file="${1:-}"
+    local definition_kind="${2:-}"
+    local target_dir target_name candidate_file variant status=1 cleanup_status=0
+
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_dir=$(dirname "$target_file") || return 1
+    target_name=$(basename "$target_file") || return 1
+    candidate_file=$(mktemp "${target_dir}/.managed-service-validate.${target_name}.XXXXXX") || return 1
+    chmod 600 "$candidate_file" || { rm -f -- "$candidate_file"; return 1; }
+
+    case "$definition_kind" in
+        systemd-singbox)
+            if render_singbox_systemd_service > "$candidate_file" && \
+               cmp -s -- "$target_file" "$candidate_file"; then
+                status=0
+            fi
+            ;;
+        openrc-singbox)
+            if render_singbox_openrc_service > "$candidate_file" && \
+               cmp -s -- "$target_file" "$candidate_file"; then
+                status=0
+            fi
+            ;;
+        systemd-argo)
+            for variant in quick token local; do
+                if render_argo_systemd_service "$variant" > "$candidate_file" && \
+                   cmp -s -- "$target_file" "$candidate_file"; then
+                    status=0
+                    break
+                fi
+            done
+            ;;
+        openrc-argo)
+            for variant in quick token local; do
+                if render_argo_openrc_service "$variant" > "$candidate_file" && \
+                   cmp -s -- "$target_file" "$candidate_file"; then
+                    status=0
+                    break
+                fi
+            done
+            ;;
+        *) status=1 ;;
+    esac
+
+    rm -f -- "$candidate_file" || cleanup_status=1
+    [ "$cleanup_status" -eq 0 ] || return 1
+    return "$status"
+}
+
+write_guarded_managed_service_definition() {
+    local target_file="${1:-}"
+    local final_mode="${2:-}"
+    local definition_kind="${3:-}"
+    local renderer="${4:-}"
+    local target_dir target_name tmp_file
+    shift 4 || return 1
+
+    [ -n "$target_file" ] && [ -n "$renderer" ] || return 1
+    case "$final_mode" in 644|700) ;; *) return 1 ;; esac
+    case "$definition_kind" in
+        systemd-singbox|openrc-singbox|systemd-argo|openrc-argo) ;;
+        *) return 1 ;;
+    esac
+    declare -F "$renderer" >/dev/null || return 1
+
+    if [ -e "$target_file" ] || [ -L "$target_file" ]; then
+        [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
+        managed_service_definition_is_canonical "$target_file" "$definition_kind" || return 1
+    fi
+
+    target_dir=$(dirname "$target_file") || return 1
+    target_name=$(basename "$target_file") || return 1
+    mkdir -p "$target_dir" || return 1
+    tmp_file=$(mktemp "${target_dir}/.managed-service.${target_name}.XXXXXX") || return 1
+    chmod 600 "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    if ! "$renderer" "$@" > "$tmp_file"; then
+        rm -f -- "$tmp_file"
+        return 1
+    fi
+    if ! managed_service_definition_is_canonical "$tmp_file" "$definition_kind"; then
+        rm -f -- "$tmp_file"
+        return 1
+    fi
+    chmod "$final_mode" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    mv -f -- "$tmp_file" "$target_file" || { rm -f -- "$tmp_file"; return 1; }
+}
+
+write_singbox_systemd_service() {
+    local install_root="${1:-}"
+    local unit_file="${install_root}/etc/systemd/system/sing-box.service"
+
+    write_guarded_managed_service_definition "$unit_file" 644 \
+        systemd-singbox render_singbox_systemd_service
+}
+
+write_singbox_openrc_service() {
+    local install_root="${1:-}"
+    local init_file="${install_root}/etc/init.d/sing-box"
+
+    write_guarded_managed_service_definition "$init_file" 700 \
+        openrc-singbox render_singbox_openrc_service
+}
+
 write_argo_systemd_service() {
     local tunnel_mode="${1:-quick}"
     local install_root="${2:-}"
     local unit_file="${install_root}/etc/systemd/system/argo.service"
-    local rendered_service
 
-    rendered_service=$(render_argo_systemd_service "$tunnel_mode") || return 1
-    printf '%s\n' "$rendered_service" | atomic_write_secret_file "$unit_file" || return 1
-    chmod 644 "$unit_file"
+    write_guarded_managed_service_definition "$unit_file" 644 \
+        systemd-argo render_argo_systemd_service "$tunnel_mode"
 }
 
 write_argo_openrc_service() {
     local tunnel_mode="${1:-quick}"
     local install_root="${2:-}"
     local init_file="${install_root}/etc/init.d/argo"
-    local rendered_service
 
-    rendered_service=$(render_argo_openrc_service "$tunnel_mode") || return 1
-    printf '%s\n' "$rendered_service" | atomic_write_secret_file "$init_file" || return 1
-    chmod 700 "$init_file"
+    write_guarded_managed_service_definition "$init_file" 700 \
+        openrc-argo render_argo_openrc_service "$tunnel_mode"
 }
 
 persist_install_settings() {
@@ -4653,7 +4753,7 @@ EOF
 
 # debian/ubuntu/centos 守护进程
 main_systemd_services() {
-    render_singbox_systemd_service > /etc/systemd/system/sing-box.service || return 1
+    write_singbox_systemd_service || return 1
 
     local argo_mode=""
     local tunnel_id=""
@@ -4710,7 +4810,7 @@ EOF
 
 # 适配alpine 守护进程
 alpine_openrc_services() {
-    render_singbox_openrc_service > /etc/init.d/sing-box || return 1
+    write_singbox_openrc_service || return 1
 
     local argo_mode=""
     local tunnel_id=""
@@ -4755,8 +4855,6 @@ EOF
         argo_mode=quick
     fi
     write_argo_openrc_service "$argo_mode" || return 1
-    chmod +x /etc/init.d/sing-box || return 1
-    chmod +x /etc/init.d/argo || return 1
 }
 
 # 生成节点和订阅链接

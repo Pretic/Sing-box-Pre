@@ -57,6 +57,8 @@ for function_name in \
     write_fixed_argo_credentials \
     render_argo_systemd_service \
     render_argo_openrc_service \
+    managed_service_definition_is_canonical \
+    write_guarded_managed_service_definition \
     write_argo_systemd_service \
     write_argo_openrc_service \
     write_local_manager_wrapper \

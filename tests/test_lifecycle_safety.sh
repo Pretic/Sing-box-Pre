@@ -110,6 +110,39 @@ manage_argo_source="$(extract_function manage_argo)"
 grep -Fq 'resolve_argo_service_definition' <<< "$manage_argo_source" || \
     fail 'Argo menu does not resolve its definition through the active backend'
 
+# When both backends are installed and report usable runtimes, the canonical
+# detector's systemd priority must also govern lifecycle helpers.
+mixed_root="${tmp_dir}/mixed-active-init"
+mixed_service_file="${mixed_root}/sing-box"
+MIXED_BACKEND_LOG="${mixed_root}/backend.log"
+SYSTEMD_RUNTIME_DIR="${mixed_root}/run/systemd/system"
+OPENRC_SOFTLEVEL_FILE="${mixed_root}/run/openrc/softlevel"
+mkdir -p "$SYSTEMD_RUNTIME_DIR" "$(dirname "$OPENRC_SOFTLEVEL_FILE")"
+: > "$OPENRC_SOFTLEVEL_FILE"
+: > "$mixed_service_file"
+: > "$MIXED_BACKEND_LOG"
+command_exists() {
+    case "${1:-}" in systemctl|rc-update|rc-service) return 0 ;; *) return 1 ;; esac
+}
+green() { :; }
+yellow() { :; }
+systemctl() {
+    printf 'systemctl %s\n' "$*" >> "$MIXED_BACKEND_LOG"
+    case "$*" in
+        show-environment) return 0 ;;
+        'is-active sing-box') printf 'active\n'; return 0 ;;
+        *) return 0 ;;
+    esac
+}
+rc-service() { printf 'rc-service %s\n' "$*" >> "$MIXED_BACKEND_LOG"; return 0; }
+assert_equal systemd "$(detect_usable_init_system)" \
+    'mixed active init detector priority'
+check_service sing-box "$mixed_service_file" >/dev/null
+grep -Fq 'systemctl is-active sing-box' "$MIXED_BACKEND_LOG" || \
+    fail 'mixed active lifecycle helper did not use the canonical systemd backend'
+! grep -Fq 'rc-service ' "$MIXED_BACKEND_LOG" || \
+    fail 'mixed active lifecycle helper also invoked OpenRC'
+
 backend_root="${tmp_dir}/backend-coexist"
 work_dir="${backend_root}/etc/sing-box"
 server_name=sing-box

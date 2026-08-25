@@ -17,7 +17,9 @@ extract_function() {
 }
 
 for function_name in \
-    atomic_write_secret_file render_argo_systemd_service write_argo_systemd_service \
+    atomic_write_secret_file render_argo_systemd_service \
+    managed_service_definition_is_canonical write_guarded_managed_service_definition \
+    write_argo_systemd_service \
     use_quick_argo_fallback is_valid_ipv4_address is_valid_ipv6_address \
     is_valid_endpoint_hostname parse_cfip_endpoint format_vless_endpoint \
     rebuild_argo_client_address_set_file get_current_argo_preferred_endpoint \
@@ -45,11 +47,8 @@ CFPORT=443
 mkdir -p "${root}/etc/systemd/system" "${root}/etc/nginx/conf.d" "$conf_dir"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "${work_dir}/argo"
 chmod 700 "${work_dir}/argo"
-cat > "${root}/etc/systemd/system/argo.service" <<'EOF'
-[Service]
-EnvironmentFile=-/etc/sing-box/argo.env
-ExecStart=/etc/sing-box/argo tunnel --no-autoupdate run
-EOF
+render_argo_systemd_service token > "${root}/etc/systemd/system/argo.service"
+chmod 644 "${root}/etc/systemd/system/argo.service"
 printf '%s\n' 'TUNNEL_TOKEN=old-token' > "${work_dir}/argo.env"
 printf '%s\n' '{"TunnelID":"fixture"}' > "${work_dir}/tunnel.json"
 cat > "${work_dir}/tunnel.yml" <<'EOF'
