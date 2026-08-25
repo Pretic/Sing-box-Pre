@@ -51,6 +51,7 @@ vless://id@fixed.example.com:443?security=tls&sni=fixed.example.com&type=ws&host
 vless://id@user-edge.example.com:8443?security=tls&sni=fixed.example.com&type=ws&host=fixed.example.com&path=%2Fvless-argo#Node-vless-ws-tls-argo-preferred
 EOF
 cp "$client_dir" "${work_dir}/cfy-url.txt"
+printf '%s\n' old-cfy-generation > "${work_dir}/cfy-source.generation"
 
 detect_usable_init_system() { printf 'systemd\n'; }
 detect_argo_tunnel_mode() {
@@ -71,7 +72,10 @@ disable_cf_https_subscription() {
     return "$disable_status"
 }
 publish_status=1
-change_argo_domain() { printf '%s\n' publish-domain >> "$transition_log"; return "$publish_status"; }
+change_argo_transition_subscription() {
+    printf '%s\n' publish-domain >> "$transition_log"
+    return "$publish_status"
+}
 rollback_publish_status=0
 update_sub() {
     printf '%s\n' rollback-publish >> "$transition_log"
@@ -87,6 +91,30 @@ rm() {
     fi
     command rm "$@"
 }
+
+# Argo transition recovery owns the service, credentials and base client only.
+# A cfy run may publish a new optimized source and matching generation after
+# the transition snapshot is created; restoring that snapshot must leave both
+# cfy-owned files untouched and must not retain copies of either one.
+ownership_snapshot="$(create_argo_transition_snapshot systemd)" || \
+    fail 'could not create Argo ownership snapshot'
+cfy_snapshot_artifact=0
+[[ ! -e "${ownership_snapshot}/cfy" && ! -e "${ownership_snapshot}/cfy.absent" ]] || \
+    cfy_snapshot_artifact=1
+[[ ! -e "${ownership_snapshot}/cfy-source.generation" && \
+   ! -e "${ownership_snapshot}/cfy-source.generation.absent" ]] || \
+    cfy_snapshot_artifact=1
+printf '%s\n' cfy-owner-new-url > "${work_dir}/cfy-url.txt"
+printf '%s\n' cfy-owner-new-generation > "${work_dir}/cfy-source.generation"
+restore_argo_transition_snapshot "$ownership_snapshot" systemd || \
+    fail 'could not restore Argo ownership snapshot'
+[[ "$cfy_snapshot_artifact" -eq 0 ]] || \
+    fail 'Argo transition snapshot retained cfy-owned artifacts'
+[[ "$(command cat "${work_dir}/cfy-url.txt")" == cfy-owner-new-url ]] || \
+    fail 'Argo transition rollback overwrote cfy-url.txt'
+[[ "$(command cat "${work_dir}/cfy-source.generation")" == cfy-owner-new-generation ]] || \
+    fail 'Argo transition rollback overwrote cfy-source.generation'
+command rm -rf -- "$ownership_snapshot"
 
 before_service="$(command cat "$service_file")"
 before_client="$(command cat "$client_dir")"

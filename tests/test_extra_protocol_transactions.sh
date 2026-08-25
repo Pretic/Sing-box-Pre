@@ -114,6 +114,7 @@ CURRENT_EXTRA_PORT_STATUS=0
 MUTATION_STATUS=0
 CLEANUP_BACKUP_STATUS=0
 DURABLE_HOOK_LOG=0
+DURABLE_HOOK_FAIL_STAGE=''
 
 reset_fixture() {
     command rm -f -- "${conf_dir}/.durable-transaction.pending"
@@ -143,6 +144,7 @@ reset_fixture() {
     MUTATION_STATUS=0
     CLEANUP_BACKUP_STATUS=0
     DURABLE_HOOK_LOG=0
+    DURABLE_HOOK_FAIL_STAGE=''
     FIREWALL_LAST_ADDED_RECORDS=()
     reset_durable_transaction_state
 }
@@ -180,6 +182,10 @@ update_sub() {
     fi
     [ "$UPDATE_STATUS" -eq 0 ] || return "$UPDATE_STATUS"
 }
+append_base_subscription_url() {
+    update_sub || return $?
+    printf '\n%s\n' "$1" >> "$client_dir"
+}
 remove_owned_firewall_records_exact() {
     printf 'remove-exact:%s\n' "$*" >> "$call_log"
     [ "$REMOVE_EXACT_FAIL" -eq 0 ]
@@ -209,8 +215,8 @@ acquire_proxy_transaction_lock() {
 }
 release_proxy_transaction_lock() { printf 'unlock\n' >> "$call_log"; }
 durable_transaction_hook() {
-    [ "$DURABLE_HOOK_LOG" -eq 1 ] || return 0
-    printf 'durable:%s\n' "$1" >> "$call_log"
+    [ "$DURABLE_HOOK_LOG" -ne 1 ] || printf 'durable:%s\n' "$1" >> "$call_log"
+    [ -z "$DURABLE_HOOK_FAIL_STAGE" ] || [ "$1" != "$DURABLE_HOOK_FAIL_STAGE" ]
 }
 validate_port_value() {
     [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
@@ -219,6 +225,38 @@ cleanup_extra_protocol_backup() {
     [ "$CLEANUP_BACKUP_STATUS" -eq 0 ] || return "$CLEANUP_BACKUP_STATUS"
     command rm -rf -- "$1"
 }
+
+# The outer config/firewall transaction owns only inbounds.json. Subscription
+# publication has its own canonical lock and atomic rollback, so restoring an
+# outer snapshot must not overwrite a newer base/served/cfy-sub generation.
+reset_fixture
+subscription_files=(
+    "$client_dir"
+    "${work_dir}/base-sub.txt"
+    "$combined_client_dir"
+    "${work_dir}/all-sub.txt"
+    "${work_dir}/sub.txt"
+    "${work_dir}/cfy-sub.txt"
+)
+for subscription_file in "${subscription_files[@]}"; do
+    printf '%s\n' outer-old-generation > "$subscription_file"
+done
+backup_extra_protocol_transaction "$inbounds_file" || \
+    fail 'could not create extra-protocol ownership backup'
+ownership_backup="$EXTRA_PROTOCOL_BACKUP_DIR"
+printf '%s\n' changed-config > "$inbounds_file"
+for subscription_file in "${subscription_files[@]}"; do
+    printf '%s\n' concurrent-publisher-generation > "$subscription_file"
+done
+restore_extra_protocol_files "$ownership_backup" "$inbounds_file" || \
+    fail 'could not restore extra-protocol ownership backup'
+[ "$(<"$inbounds_file")" = old-config ] || \
+    fail 'extra-protocol rollback did not restore its owned inbounds config'
+for subscription_file in "${subscription_files[@]}"; do
+    [ "$(<"$subscription_file")" = concurrent-publisher-generation ] || \
+        fail "extra-protocol rollback overwrote concurrent subscription state: ${subscription_file}"
+done
+command rm -rf -- "$ownership_backup"
 
 # Exercise the production tag/port readers before replacing them with
 # transaction-order mocks below.
@@ -291,6 +329,7 @@ mutation_remove() {
 }
 remove_url_by_tag() {
     printf 'remove-url:%s\n' "$1" >> "$call_log"
+    update_sub || return $?
     printf 'client-without:%s\n' "$1" > "$client_dir"
 }
 
@@ -408,6 +447,21 @@ add_extra_protocol_transaction "$inbounds_file" 'new-client' mutation_add \
 durable_stages="$(grep '^durable:' "$call_log")"
 [ "$durable_stages" = $'durable:firewall-mutating\ndurable:precommit\ndurable:config-mutated\ndurable:publishing\ndurable:committed' ] || \
     fail "extra-protocol durable checkpoints are incomplete or unsafe: ${durable_stages}"
+
+reset_fixture
+DURABLE_HOOK_FAIL_STAGE=committed
+if add_extra_protocol_transaction "$inbounds_file" 'new-client' mutation_add \
+    --families 1 1 24000/tcp 24000/udp -- socks-tag; then
+    committed_checkpoint_status=0
+else
+    committed_checkpoint_status=$?
+fi
+[ "$committed_checkpoint_status" -eq 2 ] || \
+    fail "post-publish committed checkpoint failure returned ${committed_checkpoint_status} instead of 2"
+grep -Fxq 'new-client' "$client_dir" || \
+    fail 'post-publish committed checkpoint failure rolled back the committed subscription'
+grep -Fxq 'new-config:socks-tag' "$inbounds_file" || \
+    fail 'post-publish committed checkpoint failure rolled back the committed config'
 
 reset_fixture
 LOCK_SET_TAG_PRESENT=1
@@ -606,7 +660,7 @@ printf 'new-config:socks-tag\n' > "$inbounds_file"
 printf 'old-client\nnew-client\n' > "$client_dir"
 remove_extra_protocol_transaction "$inbounds_file" socks mutation_remove \
     24000/tcp 24000/udp -- socks-tag || fail 'remove transaction did not commit'
-expected_remove=$'lock\nport-read:socks-tag\nmutate-remove:socks-tag\nremove-url:socks\nvalidate\nrestart\nsubscription\nremove-ports:'"${inbounds_file} 24000/tcp 24000/udp"$'\nunlock'
+expected_remove=$'lock\nport-read:socks-tag\nmutate-remove:socks-tag\nvalidate\nrestart\nremove-url:socks\nsubscription\nremove-ports:'"${inbounds_file} 24000/tcp 24000/udp"$'\nunlock'
 [ "$(cat "$call_log")" = "$expected_remove" ] || fail 'remove transaction order is unsafe'
 
 reset_fixture
@@ -673,9 +727,16 @@ printf 'old-client\nnew-client\n' > "$client_dir"
 REMOVE_PORTS_STATUS=1
 if remove_extra_protocol_transaction "$inbounds_file" socks mutation_remove \
     24000/tcp 24000/udp -- socks-tag; then
-    fail 'firewall cleanup failure was reported as successful remove'
+    remove_cleanup_status=0
+else
+    remove_cleanup_status=$?
 fi
-grep -Fxq 'new-config:socks-tag' "$inbounds_file" || fail 'firewall cleanup failure did not restore config'
+[ "$remove_cleanup_status" -eq 3 ] || \
+    fail "clean firewall residue returned ${remove_cleanup_status} instead of committed rc 3"
+grep -Fxq 'removed-config:socks-tag' "$inbounds_file" || \
+    fail 'clean firewall residue rolled back the committed config removal'
+grep -Fxq 'client-without:socks' "$client_dir" || \
+    fail 'clean firewall residue rolled back the committed subscription removal'
 
 reset_fixture
 printf 'new-config:socks-tag\n' > "$inbounds_file"
@@ -690,6 +751,10 @@ else
 fi
 [ "$fatal_status" -eq 2 ] || fail 'fatal firewall cleanup was downgraded during remove rollback'
 [ -d "$EXTRA_PROTOCOL_RECOVERY_PATH" ] || fail 'fatal remove did not preserve recovery backup'
+grep -Fxq 'removed-config:socks-tag' "$inbounds_file" || \
+    fail 'uncertain post-publish firewall cleanup rolled back the committed config removal'
+grep -Fxq 'client-without:socks' "$client_dir" || \
+    fail 'uncertain post-publish firewall cleanup rolled back the committed subscription removal'
 
 reset_fixture
 printf 'new-config:socks-tag\n' > "$inbounds_file"
@@ -703,6 +768,10 @@ else
 fi
 [ "$cleanup_status" -eq 3 ] || fail 'healthy remove with only backup residue did not return rc 3'
 [ -d "$EXTRA_PROTOCOL_RECOVERY_PATH" ] || fail 'healthy remove cleanup residue did not expose its path'
+grep -Fxq 'removed-config:socks-tag' "$inbounds_file" || \
+    fail 'remove backup cleanup residue rolled back the committed config removal'
+grep -Fxq 'client-without:socks' "$client_dir" || \
+    fail 'remove backup cleanup residue rolled back the committed subscription removal'
 
 # One real interactive wrapper path: NAT maps public 25000 to local 24000.
 # The generated inbound/firewall use 24000, publication uses 25000, and remove

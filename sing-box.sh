@@ -10536,6 +10536,39 @@ rebuild_argo_client_address_set_file() {
     mv -f "$tmp_file" "$target_file"
 }
 
+rebuild_argo_transition_subscription_file() {
+    local staged_base_file="${1:-}"
+    local mode="${2:-}"
+    local stable_domain="${3:-}"
+    local fallback_host="${4:-}"
+    local fallback_port="${5:-}"
+    local new_domain="${6:-}"
+
+    rebuild_argo_client_address_set_file "$staged_base_file" \
+        "$mode" "$stable_domain" "$fallback_host" "$fallback_port" || return 1
+    update_argo_subscription_file "$staged_base_file" "$new_domain"
+}
+
+change_argo_transition_subscription() {
+    local mode="${1:-}"
+    local stable_domain="${2:-}"
+    local fallback_host="${3:-}"
+    local fallback_port="${4:-}"
+
+    [ -n "${ArgoDomain:-}" ] || { red "未获取到Argo域名，无法更新节点"; return 1; }
+    [[ "$mode" == fixed || "$mode" == quick ]] || return 1
+    if [ ! -s "$client_dir" ] || ! grep -Fq 'path=%2Fvless-argo' "$client_dir"; then
+        change_argo_domain
+        return $?
+    fi
+    mutate_base_subscription rebuild_argo_transition_subscription_file \
+        "$mode" "$stable_domain" "$fallback_host" "$fallback_port" "$ArgoDomain" || return $?
+
+    green "vless-ws-tls-argo节点已更新\n"
+    grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
+    [ -s "${work_dir}/cfy-url.txt" ] && grep 'path=%2Fvless-argo' "${work_dir}/cfy-url.txt" | while IFS= read -r line; do purple "$line\n"; done
+}
+
 get_current_argo_preferred_endpoint() {
     local target_file="${1:-}"
     local allow_stable="${2:-0}"
@@ -10571,11 +10604,10 @@ create_argo_transition_snapshot() {
     else
         service_file="${install_root}/etc/init.d/argo"
     fi
-    for name in service tunnel.json tunnel.yml argo.env client cfy; do
+    for name in service tunnel.json tunnel.yml argo.env client; do
         case "$name" in
             service) source_file="$service_file" ;;
             client) source_file="$client_dir" ;;
-            cfy) source_file="${work_dir}/cfy-url.txt" ;;
             *) source_file="${work_dir}/${name}" ;;
         esac
         if [ -e "$source_file" ]; then
@@ -10619,11 +10651,10 @@ restore_argo_transition_snapshot() {
     else
         return 1
     fi
-    for name in service tunnel.json tunnel.yml argo.env client cfy; do
+    for name in service tunnel.json tunnel.yml argo.env client; do
         case "$name" in
             service) target_file="$service_file" ;;
             client) target_file="$client_dir" ;;
-            cfy) target_file="${work_dir}/cfy-url.txt" ;;
             *) target_file="${work_dir}/${name}" ;;
         esac
         if [ -f "${snapshot_dir}/${name}" ]; then
@@ -10682,9 +10713,7 @@ transition_to_quick_argo() {
     use_quick_argo_fallback
     if activate_argo_service_mode quick "$init_system" && \
        get_quick_tunnel && \
-       { [ ! -s "$client_dir" ] || ! grep -Fq 'path=%2Fvless-argo' "$client_dir" || \
-           rebuild_argo_client_address_set_file "$client_dir" quick "$ArgoDomain" "$preferred_host" "$preferred_port"; } && \
-       change_argo_domain; then
+       change_argo_transition_subscription quick "$ArgoDomain" "$preferred_host" "$preferred_port"; then
         load_subscription_state
         if [ "${SUB_HTTPS_ENABLED:-0}" = 1 ]; then
             if disable_cf_https_subscription; then
@@ -10778,9 +10807,7 @@ EOF
 
     if [ "$rollback_ok" -eq 1 ] && \
        activate_argo_service_mode "$([ "$auth_type" = json ] && printf local || printf token)" "$init_system" && \
-       { [ ! -s "$client_dir" ] || ! grep -Fq 'path=%2Fvless-argo' "$client_dir" || \
-           rebuild_argo_client_address_set_file "$client_dir" fixed "$new_domain" "$preferred_host" "$preferred_port"; } && \
-       change_argo_domain; then
+       change_argo_transition_subscription fixed "$new_domain" "$preferred_host" "$preferred_port"; then
         if ! rm -rf -- "$snapshot_dir"; then
             yellow "Argo 固定 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
             return 3
@@ -14237,21 +14264,11 @@ read_extra_protocol_ports() {
 
 backup_extra_protocol_transaction() {
     local inbounds_file="${1:-}"
-    local combined_path="${combined_client_dir:-${work_dir}/all-url.txt}"
     local backup_parent backup_dir path index
-    local -a files=(
-        "$inbounds_file"
-        "$client_dir"
-        "${work_dir}/base-sub.txt"
-        "$combined_path"
-        "${work_dir}/all-sub.txt"
-        "${work_dir}/sub.txt"
-        "${work_dir}/cfy-sub.txt"
-    )
+    local -a files=("$inbounds_file")
 
     EXTRA_PROTOCOL_BACKUP_DIR=''
     [ -n "$inbounds_file" ] && [ -f "$inbounds_file" ] && [ ! -L "$inbounds_file" ] || return 1
-    [ -n "${client_dir:-}" ] && [ ! -L "$client_dir" ] || return 1
     backup_parent=$(dirname "$inbounds_file") || return 1
     [ -d "$backup_parent" ] && [ ! -L "$backup_parent" ] || return 1
     backup_dir=$(mktemp -d "${backup_parent}/.extra-protocol.XXXXXX") || return 1
@@ -14279,17 +14296,8 @@ backup_extra_protocol_transaction() {
 restore_extra_protocol_files() {
     local backup_dir="${1:-}"
     local inbounds_file="${2:-}"
-    local combined_path="${combined_client_dir:-${work_dir}/all-url.txt}"
     local path parent name tmp_file index
-    local -a files=(
-        "$inbounds_file"
-        "$client_dir"
-        "${work_dir}/base-sub.txt"
-        "$combined_path"
-        "${work_dir}/all-sub.txt"
-        "${work_dir}/sub.txt"
-        "${work_dir}/cfy-sub.txt"
-    )
+    local -a files=("$inbounds_file")
 
     [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ] || return 1
     [ -n "$inbounds_file" ] && [ ! -L "$inbounds_file" ] || return 1
@@ -14532,8 +14540,6 @@ _add_extra_protocol_transaction_locked() {
 
     transaction_status=0
     "$mutation_callback" "$inbounds_file" "${callback_args[@]}" || transaction_status=$?
-    [ "$transaction_status" -ne 0 ] || \
-        printf '\n%s\n' "$client_line" >> "$client_dir" || transaction_status=$?
     if [ "$transaction_status" -eq 0 ]; then
         durable_transaction_checkpoint config-mutated || transaction_status=2
     fi
@@ -14542,7 +14548,8 @@ _add_extra_protocol_transaction_locked() {
     if [ "$transaction_status" -eq 0 ]; then
         durable_transaction_checkpoint publishing || transaction_status=2
     fi
-    [ "$transaction_status" -ne 0 ] || update_sub || transaction_status=$?
+    [ "$transaction_status" -ne 0 ] || \
+        append_base_subscription_url "$client_line" || transaction_status=$?
     if [ "$transaction_status" -ne 0 ]; then
         handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
             "$transaction_status" 0 \
@@ -14645,7 +14652,6 @@ _remove_extra_protocol_transaction_locked() {
     fi
 
     "$mutation_callback" "$inbounds_file" "${callback_args[@]}" || transaction_status=$?
-    [ "$transaction_status" -ne 0 ] || remove_url_by_tag "$url_scheme" || transaction_status=$?
     if [ "$transaction_status" -eq 0 ]; then
         durable_transaction_checkpoint config-mutated || transaction_status=2
     fi
@@ -14654,7 +14660,7 @@ _remove_extra_protocol_transaction_locked() {
     if [ "$transaction_status" -eq 0 ]; then
         durable_transaction_checkpoint publishing || transaction_status=2
     fi
-    [ "$transaction_status" -ne 0 ] || update_sub || transaction_status=$?
+    [ "$transaction_status" -ne 0 ] || remove_url_by_tag "$url_scheme" || transaction_status=$?
     if [ "$transaction_status" -ne 0 ]; then
         handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
             "$transaction_status" 0 \
@@ -14675,19 +14681,18 @@ _remove_extra_protocol_transaction_locked() {
     remove_owned_firewall_ports_if_unused "$inbounds_file" "${firewall_rules[@]}" || cleanup_status=$?
     if [ "$cleanup_status" -ne 0 ]; then
         if [ "$cleanup_status" -eq 2 ]; then
-            handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
-                "$cleanup_status" 1 "$EXTRA_PROTOCOL_SERVICE_TOUCHED"
-        else
-            handle_extra_protocol_transaction_failure "$backup_dir" "$inbounds_file" "$was_active" \
-                "$cleanup_status" 0 "$EXTRA_PROTOCOL_SERVICE_TOUCHED"
-        fi
-        transaction_status=$?
-        if [ -n "${EXTRA_PROTOCOL_RECOVERY_PATH:-}" ]; then
             disarm_durable_transaction keep >/dev/null 2>&1 || true
-        elif ! disarm_durable_transaction cleanup; then
+            red "额外协议已删除，但防火墙清理状态未决；恢复证据已保留：${EXTRA_PROTOCOL_RECOVERY_PATH:-$backup_dir}"
             return 2
         fi
-        return "$transaction_status"
+        if ! cleanup_extra_protocol_backup "$backup_dir"; then
+            disarm_durable_transaction keep >/dev/null 2>&1 || true
+            yellow "额外协议已删除，但旧防火墙规则与事务备份均未能清理：${EXTRA_PROTOCOL_RECOVERY_PATH:-$backup_dir}"
+            return 3
+        fi
+        disarm_durable_transaction cleanup >/dev/null 2>&1 || true
+        yellow "额外协议已删除，但旧防火墙规则未能完全清理。"
+        return 3
     fi
 
     if ! durable_transaction_checkpoint committed; then

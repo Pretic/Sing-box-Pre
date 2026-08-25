@@ -81,7 +81,7 @@ detect_argo_tunnel_mode() { printf '%s\n' "$detected_mode"; }
 systemctl() { return 0; }
 restart_argo() { return 0; }
 get_quick_tunnel() { ArgoDomain=quick.trycloudflare.com; }
-change_argo_domain() { return 0; }
+change_argo_transition_subscription() { return 0; }
 update_sub() { return 0; }
 load_subscription_state() {
     if [[ "$(< "$subscription_state_file")" == disabled ]]; then

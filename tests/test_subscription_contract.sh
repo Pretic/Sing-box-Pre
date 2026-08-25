@@ -525,4 +525,24 @@ if grep -Fq 'update_vless_argo_domain_file "${work_dir}/cfy-url.txt"' <<< "$argo
     fail 'Sing-box Argo changes still rewrite the cfy-owned source file'
 fi
 
+for transition_name in transition_to_quick_argo transition_to_fixed_argo; do
+    transition_source="$(extract_function "$transition_name")"
+    if grep -Fq 'rebuild_argo_client_address_set_file "$client_dir"' <<< "$transition_source"; then
+        fail "${transition_name} rebuilds live url.txt outside the canonical subscription lock"
+    fi
+    grep -Fq 'change_argo_transition_subscription' <<< "$transition_source" || \
+        fail "${transition_name} bypasses the locked Argo subscription transition"
+done
+argo_transition_source="$(extract_function change_argo_transition_subscription)"
+grep -Fq 'mutate_base_subscription rebuild_argo_transition_subscription_file' \
+    <<< "$argo_transition_source" || \
+    fail 'Argo address/domain transition does not mutate and publish under the canonical subscription lock'
+
+extra_add_source="$(extract_function _add_extra_protocol_transaction_locked)"
+if grep -Fq '>> "$client_dir"' <<< "$extra_add_source"; then
+    fail 'extra-protocol add writes live url.txt outside the canonical subscription lock'
+fi
+grep -Fq 'append_base_subscription_url "$client_line"' <<< "$extra_add_source" || \
+    fail 'extra-protocol add bypasses the locked base-subscription append helper'
+
 printf 'Sing-box subscription contract tests passed.\n'
