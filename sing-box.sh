@@ -681,6 +681,17 @@ with_transaction_lock_with_legacy() {
     return "$callback_status"
 }
 
+finish_transaction_release() {
+    local operation_status="${1:-}" release_callback="${2:-}" release_status=0
+
+    [[ "$operation_status" =~ ^[0-9]+$ ]] && [ "$operation_status" -le 255 ] || return 2
+    [[ "$release_callback" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && \
+        declare -F "$release_callback" >/dev/null 2>&1 || return 2
+    "$release_callback" || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
+    return "$operation_status"
+}
+
 port_is_listening() {
     local port="${1:-}"
     local proto="${2:-}"
@@ -5030,15 +5041,13 @@ enable_hy2_port_hopping_transaction_locked() {
 }
 
 enable_hy2_port_hopping_transaction() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "Hysteria2 端口跳跃操作"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _enable_hy2_port_hopping_transaction_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _enable_hy2_port_hopping_transaction_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 _disable_hy2_port_hopping_transaction_locked() {
@@ -5074,15 +5083,13 @@ disable_hy2_port_hopping_transaction_locked() {
 }
 
 disable_hy2_port_hopping_transaction() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "Hysteria2 端口跳跃操作"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _disable_hy2_port_hopping_transaction_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _disable_hy2_port_hopping_transaction_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 render_vless_reality_inbound() {
@@ -7723,15 +7730,13 @@ _change_public_inbound_port_transaction_locked() {
 }
 
 change_public_inbound_port_transaction() {
-    local status
+    local status=0
 
     acquire_public_port_change_lock
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _change_public_inbound_port_transaction_locked "$@"
-    status=$?
-    release_public_port_change_lock
-    return "$status"
+    _change_public_inbound_port_transaction_locked "$@" || status=$?
+    finish_transaction_release "$status" release_public_port_change_lock
 }
 
 resolve_argo_service_definition() {
@@ -9879,15 +9884,13 @@ _configure_cf_https_subscription_locked() {
 }
 
 configure_cf_https_subscription() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "HTTPS 订阅操作"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _configure_cf_https_subscription_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _configure_cf_https_subscription_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 _disable_cf_https_subscription_locked() {
@@ -10073,15 +10076,13 @@ _disable_cf_https_subscription_locked() {
 }
 
 disable_cf_https_subscription() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "HTTPS 订阅操作"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _disable_cf_https_subscription_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _disable_cf_https_subscription_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 update_cf_https_subscription_origin() {
@@ -10385,15 +10386,13 @@ _change_subscription_port_transaction_locked() {
 }
 
 change_subscription_port_transaction() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅端口修改"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _change_subscription_port_transaction_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _change_subscription_port_transaction_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 _rotate_subscription_token_locked() {
@@ -10520,15 +10519,13 @@ _rotate_subscription_token_locked() {
 }
 
 rotate_subscription_token() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅密钥轮换"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _rotate_subscription_token_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _rotate_subscription_token_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 _stop_subscription_service_locked() {
@@ -10555,15 +10552,13 @@ _stop_subscription_service_locked() {
 }
 
 stop_subscription_service_transaction() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅服务停止"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _stop_subscription_service_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _stop_subscription_service_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 _start_subscription_service_locked() {
@@ -10769,15 +10764,13 @@ _start_subscription_service_locked() {
 }
 
 start_subscription_service_transaction() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅服务启动"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _start_subscription_service_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _start_subscription_service_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 _restart_subscription_service_locked() {
@@ -10785,15 +10778,13 @@ _restart_subscription_service_locked() {
 }
 
 restart_subscription_service_transaction() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "订阅服务重启"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _restart_subscription_service_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _restart_subscription_service_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 disable_open_sub() {
@@ -11845,27 +11836,23 @@ EOF
 }
 
 transition_to_quick_argo() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "Argo 临时 Tunnel 切换"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _transition_to_quick_argo_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _transition_to_quick_argo_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 transition_to_fixed_argo() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "Argo 固定 Tunnel 切换"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _transition_to_fixed_argo_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _transition_to_fixed_argo_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 change_cfip() {
@@ -14004,11 +13991,11 @@ apply_proxy_config_transaction() {
     else
         PROXY_TX_INITIAL_SERVICE_ACTIVE=0
     fi
-    _apply_proxy_config_transaction_locked "$@"
-    transaction_status=$?
+    _apply_proxy_config_transaction_locked "$@" || transaction_status=$?
     trap - INT TERM EXIT
     restore_proxy_transaction_traps
-    release_proxy_transaction_lock
+    finish_transaction_release "$transaction_status" release_proxy_transaction_lock || \
+        transaction_status=$?
     reset_proxy_transaction_state
     return "$transaction_status"
 }
@@ -15557,15 +15544,13 @@ _add_extra_protocol_transaction_locked() {
 }
 
 add_extra_protocol_transaction() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "额外协议添加"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _add_extra_protocol_transaction_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _add_extra_protocol_transaction_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 _remove_extra_protocol_transaction_locked() {
@@ -15686,15 +15671,13 @@ _remove_extra_protocol_transaction_locked() {
 }
 
 remove_extra_protocol_transaction() {
-    local status
+    local status=0
 
     acquire_proxy_transaction_lock_checked "${conf_dir}" "额外协议删除"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    _remove_extra_protocol_transaction_locked "$@"
-    status=$?
-    release_proxy_transaction_lock
-    return "$status"
+    _remove_extra_protocol_transaction_locked "$@" || status=$?
+    finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
 mutate_socks5_inbound_add() {
