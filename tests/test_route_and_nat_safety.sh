@@ -34,6 +34,11 @@ if grep -Eq '代理出站(添加|删除)失败，route\.json 与 outbounds\.json
     fail 'proxy transaction caller still claims restoration for fatal status 2'
 fi
 
+transaction_lock_block=$(sed -n \
+    '/^transaction_root_path() {/,/^port_is_listening() {/p' "$script" | sed '$d')
+[[ -n "$transaction_lock_block" ]] || fail 'stable transaction lock block could not be extracted'
+source /dev/stdin <<< "$transaction_lock_block"
+
 proxy_block=$(sed -n '/^singbox_check_config_dir() {/,/^add_service_route() {/p' "$script" | sed '$d')
 [[ -n "$proxy_block" ]] || fail 'proxy transaction helper block could not be extracted'
 source /dev/stdin <<< "$proxy_block"
@@ -60,6 +65,7 @@ green() { :; }
 yellow() { :; }
 
 tmp_root=$(mktemp -d)
+SING_BOX_TRANSACTION_ROOT="${tmp_root}/transaction-root"
 test_shell_pid=$BASHPID
 cleanup_test_tmp() {
     [ "$BASHPID" != "$test_shell_pid" ] || rm -rf "$tmp_root"

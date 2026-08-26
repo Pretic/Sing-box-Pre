@@ -219,7 +219,7 @@ managed_service_target_fingerprint TARGET
 write_guarded_managed_service_definition_locked TARGET MODE KIND RENDERER [ARGS...]
 ```
 
-Fingerprint an existing target as `present:<device>:<inode>:<size>:<sha256>` and absence as `absent`. Under `with_stable_transaction_lock mutation`, capture the initial fingerprint only after canonical validation, render and validate the temporary definition, invoke the test hook, recalculate immediately before `mv`, and return rc=2 if the fingerprint changed. On every failure remove only the writer-owned temporary file. The outer public writer keeps the existing function name and propagates rc 0/1/2.
+Fingerprint an existing target as `present:<device>:<inode>:<size>:<mode>:<uid>:<gid>:<nlink>:<sha256>` and absence as `absent`, with the complete stat identity checked both before and after hashing. Under `with_stable_transaction_lock mutation`, capture F0, validate an existing canonical target, capture F1 and require F0=F1, then render and validate the temporary definition, invoke the test hook, and capture F2 immediately before `mv`; any fingerprint uncertainty or change returns rc=2. A normal writer failure returns rc=1 only when its owned temporary file is removed successfully; cleanup failure returns rc=2. F2 checking and `mv` must remain adjacent with no hook or executable logic inserted. POSIX shell has no atomic conditional rename, so the tiny F2-to-`mv` window is a documented residual rather than something this batch can eliminate. The outer public writer keeps the existing function name and propagates rc 0/1/2.
 
 - [ ] **Step 4: Run writer and lifecycle regressions**
 

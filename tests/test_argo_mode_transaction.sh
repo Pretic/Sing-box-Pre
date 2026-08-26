@@ -17,6 +17,7 @@ extract_function() {
 }
 
 for function_name in \
+    finish_transaction_release \
     is_valid_ipv4_address is_valid_ipv6_address is_valid_endpoint_hostname \
     parse_cfip_endpoint format_vless_endpoint rebuild_argo_client_address_set_file \
     get_current_argo_preferred_endpoint create_argo_transition_snapshot \
@@ -58,10 +59,23 @@ detect_usable_init_system() { printf 'systemd\n'; }
 detect_argo_tunnel_mode() {
     if grep -Fq quick-service "$service_file"; then printf 'quick\n'; else printf 'remote\n'; fi
 }
+ARGO_WRITER_STATUS=0
 write_argo_systemd_service() {
+    if [ "$ARGO_WRITER_STATUS" -eq 2 ]; then
+        printf 'foreign-%s-writer-race\n' "$1" > "${2}/etc/systemd/system/argo.service"
+        return 2
+    fi
+    if [ "$ARGO_WRITER_STATUS" -eq 1 ]; then
+        printf 'failed-%s-writer-attempt\n' "$1" > "${2}/etc/systemd/system/argo.service"
+        return 1
+    fi
     printf '%s-service\n' "$1" > "${2}/etc/systemd/system/argo.service"
 }
 write_argo_openrc_service() { fail 'unexpected OpenRC writer'; }
+write_fixed_argo_credentials() {
+    [ "$1" = token ] || return 1
+    printf 'TUNNEL_TOKEN=%s\n' "$2" > "${3}/etc/sing-box/argo.env"
+}
 systemctl() { printf 'systemctl %s\n' "$*" >> "$transition_log"; }
 restart_argo() { printf '%s\n' restart >> "$transition_log"; }
 get_quick_tunnel() { ArgoDomain=quick.trycloudflare.com; printf '%s\n' quick-domain >> "$transition_log"; }
@@ -231,6 +245,152 @@ done
 PROXY_LOCK_STATUS=0
 : > "$transition_log"
 
+reset_fixed_writer_fixture() {
+    command rm -rf -- "${work_dir}"/.argo-transition.*
+    printf '%s\n' fixed-service > "$service_file"
+    printf '%s\n' TUNNEL_TOKEN=old-token > "${work_dir}/argo.env"
+    printf '%s\n' old-tunnel > "${work_dir}/tunnel.yml"
+    command rm -f -- "${work_dir}/tunnel.json"
+    ARGO_DOMAIN=fixed.example.com
+    ARGO_AUTH=old-token
+    ARGO_FIXED_READY=1
+    ArgoDomain=fixed.example.com
+    subscription_https_enabled=1
+    : > "$transition_log"
+}
+
+reset_quick_writer_fixture() {
+    command rm -rf -- "${work_dir}"/.argo-transition.*
+    printf '%s\n' quick-service > "$service_file"
+    command rm -f -- "${work_dir}/argo.env" "${work_dir}/tunnel.yml" "${work_dir}/tunnel.json"
+    ARGO_DOMAIN=''
+    ARGO_AUTH=''
+    ARGO_FIXED_READY=0
+    ArgoDomain=quick.trycloudflare.com
+    subscription_https_enabled=0
+    : > "$transition_log"
+}
+
+# A writer-side rc=2 means the service target or mutation lock became
+# uncertain. The outer mode transaction must not overwrite that foreign target
+# through its ordinary snapshot rollback or touch the service manager.
+reset_fixed_writer_fixture
+ARGO_WRITER_STATUS=2
+quick_writer_log="${tmp_dir}/quick-writer-conflict.log"
+set +e
+transition_to_quick_argo >"$quick_writer_log" 2>&1
+quick_writer_status=$?
+set -e
+[[ "$quick_writer_status" -eq 2 ]] || \
+    fail "quick writer conflict returned ${quick_writer_status} instead of rc=2"
+[[ "$(command cat "$service_file")" == foreign-quick-writer-race ]] || \
+    fail 'quick writer conflict foreign service was overwritten by rollback'
+if grep -Eq '^(systemctl |restart$|quick-domain$|publish-domain$)' "$transition_log"; then
+    fail 'quick writer conflict continued into reload, restart, or publication'
+fi
+mapfile -t writer_snapshots < <(
+    find "$work_dir" -maxdepth 1 -type d -name '.argo-transition.*' -print
+)
+[[ "${#writer_snapshots[@]}" -eq 1 ]] || \
+    fail 'quick writer conflict did not retain exactly one recovery snapshot'
+grep -Fqx fixed-service "${writer_snapshots[0]}/service" || \
+    fail 'quick writer conflict snapshot lost the previous service'
+grep -Fqx TUNNEL_TOKEN=old-token "${writer_snapshots[0]}/argo.env" || \
+    fail 'quick writer conflict snapshot lost the previous credential'
+quick_writer_output="$(command cat "$quick_writer_log")"
+[[ "$quick_writer_output" == *"${writer_snapshots[0]}"* ]] || \
+    fail 'quick writer conflict did not report its retained snapshot'
+[[ "$ARGO_DOMAIN" == fixed.example.com && "$ARGO_AUTH" == old-token && \
+   "$ARGO_FIXED_READY" -eq 1 && "$ArgoDomain" == fixed.example.com ]] || \
+    fail 'quick writer conflict did not restore in-memory Argo state'
+grep -Fqx TUNNEL_TOKEN=old-token "${work_dir}/argo.env" || \
+    fail 'quick writer conflict changed the live token credential'
+grep -Fqx old-tunnel "${work_dir}/tunnel.yml" || \
+    fail 'quick writer conflict changed the live tunnel credential'
+command rm -rf -- "${writer_snapshots[0]}"
+
+reset_quick_writer_fixture
+fixed_writer_log="${tmp_dir}/fixed-writer-conflict.log"
+set +e
+transition_to_fixed_argo fixed2.example.com token new-token >"$fixed_writer_log" 2>&1
+fixed_writer_status=$?
+set -e
+[[ "$fixed_writer_status" -eq 2 ]] || \
+    fail "fixed writer conflict returned ${fixed_writer_status} instead of rc=2"
+[[ "$(command cat "$service_file")" == foreign-token-writer-race ]] || \
+    fail 'fixed writer conflict foreign service was overwritten by rollback'
+if grep -Eq '^(systemctl |restart$|quick-domain$|publish-domain$)' "$transition_log"; then
+    fail 'fixed writer conflict continued into reload, restart, or publication'
+fi
+mapfile -t writer_snapshots < <(
+    find "$work_dir" -maxdepth 1 -type d -name '.argo-transition.*' -print
+)
+[[ "${#writer_snapshots[@]}" -eq 1 ]] || \
+    fail 'fixed writer conflict did not retain exactly one recovery snapshot'
+grep -Fqx quick-service "${writer_snapshots[0]}/service" || \
+    fail 'fixed writer conflict snapshot lost the previous service'
+[[ -f "${writer_snapshots[0]}/argo.env.absent" ]] || \
+    fail 'fixed writer conflict snapshot lost the previous credential absence'
+fixed_writer_output="$(command cat "$fixed_writer_log")"
+[[ "$fixed_writer_output" == *"${writer_snapshots[0]}"* ]] || \
+    fail 'fixed writer conflict did not report its retained snapshot'
+[[ -z "$ARGO_DOMAIN" && -z "$ARGO_AUTH" && "$ARGO_FIXED_READY" -eq 0 && \
+   "$ArgoDomain" == quick.trycloudflare.com ]] || \
+    fail 'fixed writer conflict did not restore in-memory Argo state'
+grep -Fqx TUNNEL_TOKEN=new-token "${work_dir}/argo.env" || \
+    fail 'fixed writer conflict did not retain its post-write live credential'
+command rm -rf -- "${writer_snapshots[0]}"
+
+# Ordinary writer rc=1 retains the historic safe rollback behavior. Unlike an
+# uncertain rc=2, it restores service/credentials/in-memory state, restarts the
+# old mode, and removes the recovery snapshot.
+ARGO_WRITER_STATUS=1
+reset_fixed_writer_fixture
+set +e
+transition_to_quick_argo >/dev/null 2>&1
+quick_writer_rc1_status=$?
+set -e
+[[ "$quick_writer_rc1_status" -eq 1 ]] || \
+    fail "quick writer rc=1 became ${quick_writer_rc1_status}"
+grep -Fqx fixed-service "$service_file" || \
+    fail 'quick writer rc=1 did not restore the old service'
+grep -Fqx TUNNEL_TOKEN=old-token "${work_dir}/argo.env" || \
+    fail 'quick writer rc=1 did not restore the old token credential'
+grep -Fqx old-tunnel "${work_dir}/tunnel.yml" || \
+    fail 'quick writer rc=1 did not restore the old tunnel credential'
+[[ "$ARGO_DOMAIN" == fixed.example.com && "$ARGO_AUTH" == old-token && \
+   "$ARGO_FIXED_READY" -eq 1 && "$ArgoDomain" == fixed.example.com ]] || \
+    fail 'quick writer rc=1 did not restore in-memory Argo state'
+if find "$work_dir" -maxdepth 1 -type d -name '.argo-transition.*' -print -quit | grep -q .; then
+    fail 'quick writer rc=1 retained a recovery snapshot after rollback'
+fi
+grep -Fqx restart "$transition_log" || \
+    fail 'quick writer rc=1 did not restart the restored service'
+
+reset_quick_writer_fixture
+set +e
+transition_to_fixed_argo fixed2.example.com token new-token >/dev/null 2>&1
+fixed_writer_rc1_status=$?
+set -e
+[[ "$fixed_writer_rc1_status" -eq 1 ]] || \
+    fail "fixed writer rc=1 became ${fixed_writer_rc1_status}"
+grep -Fqx quick-service "$service_file" || \
+    fail 'fixed writer rc=1 did not restore the old service'
+[[ ! -e "${work_dir}/argo.env" && ! -e "${work_dir}/tunnel.yml" && \
+   ! -e "${work_dir}/tunnel.json" ]] || \
+    fail 'fixed writer rc=1 did not restore old credential absence'
+[[ -z "$ARGO_DOMAIN" && -z "$ARGO_AUTH" && "$ARGO_FIXED_READY" -eq 0 && \
+   "$ArgoDomain" == quick.trycloudflare.com ]] || \
+    fail 'fixed writer rc=1 did not restore in-memory Argo state'
+if find "$work_dir" -maxdepth 1 -type d -name '.argo-transition.*' -print -quit | grep -q .; then
+    fail 'fixed writer rc=1 retained a recovery snapshot after rollback'
+fi
+grep -Fqx restart "$transition_log" || \
+    fail 'fixed writer rc=1 did not restart the restored service'
+
+ARGO_WRITER_STATUS=0
+reset_fixed_writer_fixture
+
 # A failed locked publisher owns its own atomic rollback. The surrounding Argo
 # service rollback must not republish or restore an older base generation.
 cat > "$client_dir" <<'EOF'
@@ -392,9 +552,6 @@ subscription_https_enabled=0
 before_service="$(command cat "$service_file")"
 before_client="$(command cat "$client_dir")"
 publish_status=1
-write_fixed_argo_credentials() {
-    printf 'TUNNEL_TOKEN=%s\n' "$2" > "${3}/etc/sing-box/argo.env"
-}
 if transition_to_fixed_argo fixed2.example.com token new-token >/dev/null 2>&1; then
     fail 'quick-to-fixed transition succeeded after publish failure'
 fi

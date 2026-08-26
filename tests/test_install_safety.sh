@@ -96,6 +96,30 @@ for function_name in \
     sync_combined_subscription \
     update_sub \
     manage_packages \
+    transaction_root_path \
+    transaction_expected_dir_mode \
+    transaction_expected_file_mode \
+    transaction_expected_gid \
+    validate_transaction_path_components \
+    validate_transaction_directory \
+    ensure_transaction_directory \
+    validate_transaction_regular_file \
+    ensure_transaction_regular_file \
+    write_transaction_schema_file \
+    ensure_stable_transaction_root \
+    stable_transaction_lock_path \
+    stable_transaction_lock_rank \
+    stable_transaction_lock_is_held \
+    stable_transaction_highest_rank \
+    stable_transaction_lock_hook \
+    legacy_transaction_lock_hook \
+    acquire_stable_transaction_lock \
+    release_stable_transaction_lock \
+    validate_safe_legacy_lock \
+    acquire_safe_legacy_lock \
+    release_safe_legacy_lock \
+    acquire_transaction_lock_with_legacy \
+    release_transaction_lock_with_legacy \
     acquire_firewall_lock \
     release_firewall_lock \
     select_firewall_backend \
@@ -137,6 +161,7 @@ for function_name in \
     load_function "$function_name"
 done
 
+SING_BOX_TRANSACTION_ROOT="${tmp_dir}/transaction-root"
 flock() { return 0; }
 
 for _ in $(seq 1 20); do

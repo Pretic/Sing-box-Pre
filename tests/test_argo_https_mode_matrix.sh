@@ -17,8 +17,21 @@ extract_function() {
 }
 
 for function_name in \
+    command_exists transaction_root_path transaction_expected_dir_mode \
+    transaction_expected_file_mode transaction_expected_gid \
+    validate_transaction_path_components validate_transaction_directory \
+    ensure_transaction_directory validate_transaction_regular_file \
+    ensure_transaction_regular_file write_transaction_schema_file \
+    ensure_stable_transaction_root stable_transaction_lock_path \
+    stable_transaction_lock_rank stable_transaction_lock_is_held \
+    stable_transaction_highest_rank stable_transaction_lock_hook \
+    reset_stable_transaction_lock_state acquire_stable_transaction_lock \
+    release_stable_transaction_lock with_stable_transaction_lock \
+    finish_transaction_release \
     atomic_write_secret_file render_argo_systemd_service \
-    managed_service_definition_is_canonical write_guarded_managed_service_definition \
+    managed_service_definition_is_canonical managed_service_target_fingerprint \
+    managed_service_writer_hook write_guarded_managed_service_definition_locked \
+    write_guarded_managed_service_definition \
     write_argo_systemd_service \
     use_quick_argo_fallback is_valid_ipv4_address is_valid_ipv6_address \
     is_valid_endpoint_hostname parse_cfip_endpoint format_vless_endpoint \
@@ -40,6 +53,7 @@ client_dir="${work_dir}/url.txt"
 subscription_state_file="${work_dir}/subscription.conf"
 NGINX_SUBSCRIPTION_CONF="${root}/etc/nginx/conf.d/sing-box.conf"
 ARGO_TRANSITION_ROOT="$root"
+SING_BOX_TRANSACTION_ROOT="${tmp_dir}/transaction-root"
 ARGO_PORT=18001
 CFIP=default-edge.example.com
 CFPORT=443

@@ -1021,14 +1021,40 @@ managed_service_definition_is_canonical() {
     return "$status"
 }
 
-write_guarded_managed_service_definition() {
+managed_service_target_fingerprint() {
+    local target_file="${1:-}"
+    local before_identity after_identity digest_output digest
+
+    [ -n "$target_file" ] || return 1
+    if [ ! -e "$target_file" ] && [ ! -L "$target_file" ]; then
+        printf 'absent\n'
+        return 0
+    fi
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    before_identity=$(stat -c '%d:%i:%s:%a:%u:%g:%h' -- "$target_file" 2>/dev/null) || return 2
+    digest_output=$(LC_ALL=C sha256sum "$target_file" 2>/dev/null) || return 2
+    digest="${digest_output%%[[:space:]]*}"
+    [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || return 2
+    after_identity=$(stat -c '%d:%i:%s:%a:%u:%g:%h' -- "$target_file" 2>/dev/null) || return 2
+    [ "$before_identity" = "$after_identity" ] || return 2
+    printf 'present:%s:%s\n' "$before_identity" "$digest"
+}
+
+managed_service_writer_hook() {
+    :
+}
+
+write_guarded_managed_service_definition_locked() {
     local target_file="${1:-}"
     local final_mode="${2:-}"
     local definition_kind="${3:-}"
     local renderer="${4:-}"
     local target_dir target_name tmp_file
+    local initial_fingerprint validation_fingerprint final_fingerprint fingerprint_status=0
+    local canonical_status=0
     shift 4 || return 1
 
+    stable_transaction_lock_is_held mutation || return 2
     [ -n "$target_file" ] && [ -n "$renderer" ] || return 1
     case "$final_mode" in 644|700) ;; *) return 1 ;; esac
     case "$definition_kind" in
@@ -1037,26 +1063,64 @@ write_guarded_managed_service_definition() {
     esac
     declare -F "$renderer" >/dev/null || return 1
 
-    if [ -e "$target_file" ] || [ -L "$target_file" ]; then
-        [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
-        managed_service_definition_is_canonical "$target_file" "$definition_kind" || return 1
+    initial_fingerprint=$(managed_service_target_fingerprint "$target_file") || fingerprint_status=$?
+    case "$fingerprint_status" in
+        0) ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+    if [ "$initial_fingerprint" != absent ]; then
+        managed_service_definition_is_canonical "$target_file" "$definition_kind" || \
+            canonical_status=$?
     fi
+    validation_fingerprint=$(managed_service_target_fingerprint "$target_file") || return 2
+    [ "$validation_fingerprint" = "$initial_fingerprint" ] || return 2
+    [ "$canonical_status" -eq 0 ] || return 1
 
     target_dir=$(dirname "$target_file") || return 1
     target_name=$(basename "$target_file") || return 1
     mkdir -p "$target_dir" || return 1
     tmp_file=$(mktemp "${target_dir}/.managed-service.${target_name}.XXXXXX") || return 1
-    chmod 600 "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" || {
+        rm -f -- "$tmp_file" || return 2
+        return 1
+    }
     if ! "$renderer" "$@" > "$tmp_file"; then
-        rm -f -- "$tmp_file"
+        rm -f -- "$tmp_file" || return 2
         return 1
     fi
     if ! managed_service_definition_is_canonical "$tmp_file" "$definition_kind"; then
-        rm -f -- "$tmp_file"
+        rm -f -- "$tmp_file" || return 2
         return 1
     fi
-    chmod "$final_mode" "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
-    mv -f -- "$tmp_file" "$target_file" || { rm -f -- "$tmp_file"; return 1; }
+    chmod "$final_mode" "$tmp_file" || {
+        rm -f -- "$tmp_file" || return 2
+        return 1
+    }
+    if ! managed_service_writer_hook before-final-cas "$target_file" "$tmp_file" \
+        "$initial_fingerprint"; then
+        rm -f -- "$tmp_file" || true
+        return 2
+    fi
+    # Keep the F2 check and mv adjacent: never insert a hook or other executable
+    # logic here. POSIX shell has no atomic conditional rename, so the tiny
+    # F2-to-mv window is unavoidable.
+    final_fingerprint=$(managed_service_target_fingerprint "$target_file") || {
+        rm -f -- "$tmp_file" || true
+        return 2
+    }
+    if [ "$final_fingerprint" != "$initial_fingerprint" ]; then
+        rm -f -- "$tmp_file" || true
+        return 2
+    fi
+    mv -f -- "$tmp_file" "$target_file" || {
+        rm -f -- "$tmp_file" || return 2
+        return 1
+    }
+}
+
+write_guarded_managed_service_definition() {
+    with_stable_transaction_lock mutation write_guarded_managed_service_definition_locked "$@"
 }
 
 write_singbox_systemd_service() {
@@ -5429,11 +5493,15 @@ EOF
 
 # debian/ubuntu/centos 守护进程
 main_systemd_services() {
-    write_singbox_systemd_service || return 1
-
     local argo_mode=""
     local tunnel_id=""
     local fixed_argo_requested=0
+    local writer_status=0
+
+    write_singbox_systemd_service || {
+        writer_status=$?
+        return "$writer_status"
+    }
     ARGO_FIXED_READY=0
     if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
         fixed_argo_requested=1
@@ -5473,7 +5541,10 @@ EOF
         fi
         argo_mode=quick
     fi
-    write_argo_systemd_service "$argo_mode" || return 1
+    write_argo_systemd_service "$argo_mode" || {
+        writer_status=$?
+        return "$writer_status"
+    }
     if [ -f /etc/centos-release ]; then
         yum install -y chrony || return 1
         systemctl start chronyd || return 1
@@ -5486,11 +5557,15 @@ EOF
 
 # 适配alpine 守护进程
 alpine_openrc_services() {
-    write_singbox_openrc_service || return 1
-
     local argo_mode=""
     local tunnel_id=""
     local fixed_argo_requested=0
+    local writer_status=0
+
+    write_singbox_openrc_service || {
+        writer_status=$?
+        return "$writer_status"
+    }
     ARGO_FIXED_READY=0
     if [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ]; then
         fixed_argo_requested=1
@@ -5530,7 +5605,10 @@ EOF
         fi
         argo_mode=quick
     fi
-    write_argo_openrc_service "$argo_mode" || return 1
+    write_argo_openrc_service "$argo_mode" || {
+        writer_status=$?
+        return "$writer_status"
+    }
 }
 
 # 生成节点和订阅链接
@@ -9210,14 +9288,18 @@ run_install_flow() {
 
         if [ "$init_system" = systemd ]; then
             main_systemd_services || {
+                stage_status=$?
                 red "systemd 服务定义安装失败，安装中止。"
                 yellow "保留已登记的防火墙规则供重试或卸载清理。"
+                [ "$stage_status" -eq 2 ] && return 2
                 return 1
             }
         elif [ "$init_system" = openrc ]; then
             alpine_openrc_services || {
+                stage_status=$?
                 red "OpenRC 服务定义安装失败，安装中止。"
                 yellow "保留已登记的防火墙规则供重试或卸载清理。"
+                [ "$stage_status" -eq 2 ] && return 2
                 return 1
             }
         else
@@ -11633,16 +11715,23 @@ activate_argo_service_mode() {
     local mode="${1:-}"
     local init_system="${2:-}"
     local install_root="${3:-${ARGO_TRANSITION_ROOT:-}}"
+    local writer_status=0
 
     [[ "$mode" == quick || "$mode" == local || "$mode" == token ]] || return 1
     case "$init_system" in
         systemd)
-            write_argo_systemd_service "$mode" "$install_root" || return 1
+            write_argo_systemd_service "$mode" "$install_root" || {
+                writer_status=$?
+                return "$writer_status"
+            }
             systemctl daemon-reload >/dev/null 2>&1 || return 1
             systemctl enable argo >/dev/null 2>&1 || return 1
             ;;
         openrc)
-            write_argo_openrc_service "$mode" "$install_root" || return 1
+            write_argo_openrc_service "$mode" "$install_root" || {
+                writer_status=$?
+                return "$writer_status"
+            }
             chmod +x "${install_root}/etc/init.d/argo" || return 1
             rc-update add argo default >/dev/null 2>&1 || return 1
             ;;
@@ -11656,7 +11745,7 @@ _transition_to_quick_argo_locked() {
     local old_argo_domain="${ARGO_DOMAIN:-}" old_argo_auth="${ARGO_AUTH:-}"
     local old_fixed_ready="${ARGO_FIXED_READY:-0}" old_runtime_domain="${ArgoDomain:-}"
     local rollback_ok=1 https_disable_rc=0 https_disable_committed=0 committed_warning=0
-    local subscription_status=0 subscription_published=0
+    local activation_status=0 subscription_status=0 subscription_published=0
     local subscription_rollback_file='' subscription_old_generation='' subscription_new_generation=''
 
     init_system=$(detect_usable_init_system) || return 1
@@ -11670,7 +11759,16 @@ _transition_to_quick_argo_locked() {
     snapshot_dir=$(create_argo_transition_snapshot "$init_system") || return 1
 
     use_quick_argo_fallback
-    if activate_argo_service_mode quick "$init_system" && get_quick_tunnel; then
+    activate_argo_service_mode quick "$init_system" || activation_status=$?
+    if [ "$activation_status" -eq 2 ]; then
+        ARGO_DOMAIN="$old_argo_domain"
+        ARGO_AUTH="$old_argo_auth"
+        ARGO_FIXED_READY="$old_fixed_ready"
+        ArgoDomain="$old_runtime_domain"
+        red "Argo 服务定义或事务锁状态不确定；为避免覆盖外部修改，未执行自动回滚；恢复快照已保留：${snapshot_dir}"
+        return 2
+    fi
+    if [ "$activation_status" -eq 0 ] && get_quick_tunnel; then
         change_argo_transition_subscription quick "$ArgoDomain" \
             "$preferred_host" "$preferred_port" 1 || subscription_status=$?
         if [ "$subscription_status" -eq 0 ]; then
@@ -11752,7 +11850,7 @@ _transition_to_fixed_argo_locked() {
     local init_system old_mode snapshot_dir preferred_host preferred_port tunnel_id
     local old_argo_domain="${ARGO_DOMAIN:-}" old_argo_auth="${ARGO_AUTH:-}"
     local old_fixed_ready="${ARGO_FIXED_READY:-0}" old_runtime_domain="${ArgoDomain:-}"
-    local rollback_ok=1 subscription_status=0 subscription_rollback_file=''
+    local rollback_ok=1 activation_status=0 subscription_status=0 subscription_rollback_file=''
 
     [ -n "$new_domain" ] && [ -n "$auth_value" ] || return 1
     [[ "$auth_type" == json || "$auth_type" == token ]] || return 1
@@ -11801,27 +11899,38 @@ EOF
         rm -f "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml" || rollback_ok=0
     fi
 
-    if [ "$rollback_ok" -eq 1 ] && \
-       activate_argo_service_mode "$([ "$auth_type" = json ] && printf local || printf token)" "$init_system"; then
-        change_argo_transition_subscription fixed "$new_domain" \
-            "$preferred_host" "$preferred_port" 1 || subscription_status=$?
-        subscription_rollback_file="${ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE:-}"
-        if [ "$subscription_status" -eq 0 ]; then
-            if [ -n "$subscription_rollback_file" ] && \
-               ! rm -f -- "$subscription_rollback_file"; then
-                yellow "Argo 固定 Tunnel 已成功切换，但订阅回滚凭据未能清理：${subscription_rollback_file}"
-                return 3
-            fi
-            ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE=''
-            ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=''
-            ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
-            if ! rm -rf -- "$snapshot_dir"; then
-                yellow "Argo 固定 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
-                return 3
-            fi
-            return 0
+    if [ "$rollback_ok" -eq 1 ]; then
+        activate_argo_service_mode "$([ "$auth_type" = json ] && printf local || printf token)" \
+            "$init_system" || activation_status=$?
+        if [ "$activation_status" -eq 2 ]; then
+            ARGO_DOMAIN="$old_argo_domain"
+            ARGO_AUTH="$old_argo_auth"
+            ARGO_FIXED_READY="$old_fixed_ready"
+            ArgoDomain="$old_runtime_domain"
+            red "Argo 服务定义或事务锁状态不确定；为避免覆盖外部修改，未执行自动回滚；恢复快照已保留：${snapshot_dir}"
+            return 2
         fi
-        [ "$subscription_status" -eq 1 ] || rollback_ok=0
+        if [ "$activation_status" -eq 0 ]; then
+            change_argo_transition_subscription fixed "$new_domain" \
+                "$preferred_host" "$preferred_port" 1 || subscription_status=$?
+            subscription_rollback_file="${ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE:-}"
+            if [ "$subscription_status" -eq 0 ]; then
+                if [ -n "$subscription_rollback_file" ] && \
+                   ! rm -f -- "$subscription_rollback_file"; then
+                    yellow "Argo 固定 Tunnel 已成功切换，但订阅回滚凭据未能清理：${subscription_rollback_file}"
+                    return 3
+                fi
+                ARGO_TRANSITION_SUBSCRIPTION_ROLLBACK_FILE=''
+                ARGO_TRANSITION_SUBSCRIPTION_OLD_GENERATION=''
+                ARGO_TRANSITION_SUBSCRIPTION_NEW_GENERATION=''
+                if ! rm -rf -- "$snapshot_dir"; then
+                    yellow "Argo 固定 Tunnel 已成功切换，但旧快照未能清理，请手动删除：${snapshot_dir}"
+                    return 3
+                fi
+                return 0
+            fi
+            [ "$subscription_status" -eq 1 ] || rollback_ok=0
+        fi
     fi
 
     restore_argo_transition_snapshot "$snapshot_dir" "$init_system" || rollback_ok=0

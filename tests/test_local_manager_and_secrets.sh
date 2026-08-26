@@ -52,12 +52,36 @@ assert_mode() {
 }
 
 for function_name in \
+    command_exists \
+    transaction_root_path \
+    transaction_expected_dir_mode \
+    transaction_expected_file_mode \
+    transaction_expected_gid \
+    validate_transaction_path_components \
+    validate_transaction_directory \
+    ensure_transaction_directory \
+    validate_transaction_regular_file \
+    ensure_transaction_regular_file \
+    write_transaction_schema_file \
+    ensure_stable_transaction_root \
+    stable_transaction_lock_path \
+    stable_transaction_lock_rank \
+    stable_transaction_lock_is_held \
+    stable_transaction_highest_rank \
+    stable_transaction_lock_hook \
+    reset_stable_transaction_lock_state \
+    acquire_stable_transaction_lock \
+    release_stable_transaction_lock \
+    with_stable_transaction_lock \
     atomic_write_secret_file \
     harden_runtime_secret_permissions \
     write_fixed_argo_credentials \
     render_argo_systemd_service \
     render_argo_openrc_service \
     managed_service_definition_is_canonical \
+    managed_service_target_fingerprint \
+    managed_service_writer_hook \
+    write_guarded_managed_service_definition_locked \
     write_guarded_managed_service_definition \
     write_argo_systemd_service \
     write_argo_openrc_service \
@@ -72,6 +96,8 @@ for function_name in \
     refresh_quick_argo; do
     load_function "$function_name"
 done
+
+SING_BOX_TRANSACTION_ROOT="${tmp_dir}/transaction-root"
 
 grep -Eq '^umask[[:space:]]+077([[:space:]]|$)' "$script" || \
     fail 'sing-box.sh does not establish umask 077 before secret generation'
