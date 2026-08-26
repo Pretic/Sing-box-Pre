@@ -6873,7 +6873,7 @@ apply_node_change_transaction() {
     shift 4 || return 1
     local transaction_dir='' recovery_dir='' staged_client='' original_client=''
     local transaction_status=0 failure_status=0
-    local failure_reason='' rollback_ok=1 cleanup_status=0 publish_status=0
+    local failure_reason='' rollback_ok=1 publish_status=0
     local service_was_active=0 argo_was_active=0 argo_restart_attempted=0
     local conflict_status=0 open_status=0 lock_status=0 old_firewall_rule=''
     local old_protocol='' old_port='' transport='' new_port='' new_transport=''
@@ -6969,6 +6969,16 @@ apply_node_change_transaction() {
         chmod 600 "${recovery_dir}/transaction.conf" 2>/dev/null || true
     }
 
+    _finish_node_change_transaction() {
+        local operation_status="${1:-2}"
+
+        if finish_transaction_release "$operation_status" release_proxy_transaction_lock; then
+            lock_status=0
+        else
+            lock_status=$?
+        fi
+    }
+
     _node_change_interrupt_handler() {
         local event="${1:-EXIT}"
         local original_status="${2:-2}"
@@ -6997,7 +7007,8 @@ apply_node_change_transaction() {
         fi
         [ "$final_status" -ne 0 ] || final_status=2
         _retain_node_change_recovery "${event}:${final_status}"
-        release_proxy_transaction_lock
+        _finish_node_change_transaction "$final_status"
+        final_status="$lock_status"
         _restore_node_change_traps
         red "配置事务被 ${event} 中断；恢复材料已保留：${recovery_dir}" >&2
         exit "$final_status"
@@ -7029,13 +7040,13 @@ apply_node_change_transaction() {
     esac
 
     transaction_dir=$(umask 077; mktemp -d "${work_dir}/.node-change.XXXXXX") || {
-        release_proxy_transaction_lock
-        return 1
+        _finish_node_change_transaction 1
+        return "$lock_status"
     }
     chmod 700 "$transaction_dir" || {
         rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-        release_proxy_transaction_lock
-        return 1
+        _finish_node_change_transaction 1
+        return "$lock_status"
     }
 
     if [ -n "$new_firewall_rule" ]; then
@@ -7043,22 +7054,22 @@ apply_node_change_transaction() {
             remove_owned_firewall_ports_if_unused configured_inbound_port_conflict_exists; do
             if ! declare -F "$index" >/dev/null; then
                 rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-                release_proxy_transaction_lock
+                _finish_node_change_transaction 2
                 red "防火墙事务接口不完整，端口修改已安全中止。"
-                return 2
+                return "$lock_status"
             fi
         done
         new_port="${new_firewall_rule%/*}"
         new_transport="${new_firewall_rule#*/}"
         validate_port_value "$new_port" port || {
             rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-            release_proxy_transaction_lock
-            return 1
+            _finish_node_change_transaction 1
+            return "$lock_status"
         }
         case "$new_transport" in tcp|udp) ;; *)
             rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-            release_proxy_transaction_lock
-            return 1
+            _finish_node_change_transaction 1
+            return "$lock_status"
         esac
 
         case "$old_firewall_spec" in
@@ -7066,16 +7077,16 @@ apply_node_change_transaction() {
                 old_protocol="${old_firewall_spec#auto:}"
                 old_port=$(get_uniform_inbound_port "${conf_dir}/inbounds.json" "$old_protocol") || {
                     rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-                    release_proxy_transaction_lock
-                    return 1
+                    _finish_node_change_transaction 1
+                    return "$lock_status"
                 }
                 case "$old_protocol" in
                     reality) transport=tcp ;;
                     hysteria2|tuic) transport=udp ;;
                     *)
                         rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-                        release_proxy_transaction_lock
-                        return 1
+                        _finish_node_change_transaction 1
+                        return "$lock_status"
                         ;;
                 esac
                 old_firewall_rule="${old_port}/${transport}"
@@ -7086,8 +7097,8 @@ apply_node_change_transaction() {
 
         if [ "$old_firewall_rule" = "$new_firewall_rule" ]; then
             rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-            release_proxy_transaction_lock
-            return 0
+            _finish_node_change_transaction 0
+            return "$lock_status"
         fi
 
         configured_inbound_port_conflict_exists "${conf_dir}/inbounds.json" "$new_port" "$new_transport"
@@ -7095,16 +7106,16 @@ apply_node_change_transaction() {
         case "$conflict_status" in
             0)
                 rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-                release_proxy_transaction_lock
+                _finish_node_change_transaction 1
                 red "目标端口已被现有入站占用。"
-                return 1
+                return "$lock_status"
                 ;;
             1) ;;
             *)
                 rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-                release_proxy_transaction_lock
+                _finish_node_change_transaction 2
                 red "无法安全确认目标端口是否冲突。"
-                return 2
+                return "$lock_status"
                 ;;
         esac
     fi
@@ -7122,8 +7133,8 @@ apply_node_change_transaction() {
     for index in "${!snapshot_paths[@]}"; do
         if ! node_change_snapshot_path "${snapshot_paths[$index]}" "$transaction_dir" "${snapshot_keys[$index]}"; then
             rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-            release_proxy_transaction_lock
-            return 1
+            _finish_node_change_transaction 1
+            return "$lock_status"
         fi
     done
     {
@@ -7133,13 +7144,13 @@ apply_node_change_transaction() {
         printf 'restart_required=%s\n' "$restart_required"
     } > "${transaction_dir}/transaction.conf" || {
         rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-        release_proxy_transaction_lock
-        return 1
+        _finish_node_change_transaction 1
+        return "$lock_status"
     }
     chmod 600 "${transaction_dir}/transaction.conf" || {
         rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-        release_proxy_transaction_lock
-        return 1
+        _finish_node_change_transaction 1
+        return "$lock_status"
     }
     staged_client="${transaction_dir}/staged-client"
     original_client="${transaction_dir}/original-client"
@@ -7147,8 +7158,8 @@ apply_node_change_transaction() {
         cp -p -- "$client_dir" "$staged_client" && chmod 600 "$staged_client" && \
         cp -p -- "$staged_client" "$original_client" && chmod 600 "$original_client" || {
         rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
-        release_proxy_transaction_lock
-        return 1
+        _finish_node_change_transaction 1
+        return "$lock_status"
     }
     NODE_CHANGE_STAGE='staged'
 
@@ -7179,15 +7190,15 @@ apply_node_change_transaction() {
                 ;;
             1)
                 rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                _finish_node_change_transaction 1
                 _restore_node_change_traps
-                release_proxy_transaction_lock
-                return 1
+                return "$lock_status"
                 ;;
             *)
                 rm -rf -- "$transaction_dir" >/dev/null 2>&1 || true
+                _finish_node_change_transaction 2
                 _restore_node_change_traps
-                release_proxy_transaction_lock
-                return 2
+                return "$lock_status"
                 ;;
         esac
     fi
@@ -7204,18 +7215,20 @@ apply_node_change_transaction() {
     if [ "$NODE_CHANGE_NOOP" -eq 1 ]; then
         NODE_CHANGE_STAGE='no-op'
         if ! rm -rf -- "$transaction_dir"; then
-            _restore_node_change_traps
-            release_proxy_transaction_lock
             if [ "$failure_status" -eq 0 ]; then
                 yellow "配置已是目标状态，但安全临时目录未能清理：${transaction_dir}"
-                return 3
+                transaction_status=3
+            else
+                yellow "配置未变更，但安全临时目录未能清理：${transaction_dir}"
+                transaction_status="$failure_status"
             fi
-            yellow "配置未变更，但安全临时目录未能清理：${transaction_dir}"
-            return "$failure_status"
+            _finish_node_change_transaction "$transaction_status"
+            _restore_node_change_traps
+            return "$lock_status"
         fi
+        _finish_node_change_transaction "$failure_status"
         _restore_node_change_traps
-        release_proxy_transaction_lock
-        return "$failure_status"
+        return "$lock_status"
     fi
     if [ "$failure_status" -eq 0 ] && ! validate_singbox_config; then
         failure_status=1
@@ -7313,10 +7326,10 @@ apply_node_change_transaction() {
 
         if [ "$rollback_ok" -eq 1 ] && [ "$failure_status" -eq 1 ]; then
             if rm -rf -- "$transaction_dir"; then
+                _finish_node_change_transaction 1
                 _restore_node_change_traps
-                release_proxy_transaction_lock
                 red "${failure_reason}，已完整恢复原状态。"
-                return 1
+                return "$lock_status"
             fi
             rollback_ok=0
         fi
@@ -7329,28 +7342,25 @@ apply_node_change_transaction() {
         } >> "${recovery_dir}/transaction.conf" 2>/dev/null || true
         chmod 700 "$recovery_dir" 2>/dev/null || true
         chmod 600 "${recovery_dir}/transaction.conf" 2>/dev/null || true
+        _finish_node_change_transaction 2
         _restore_node_change_traps
-        release_proxy_transaction_lock
         red "${failure_reason}且自动回滚不完整；恢复材料已保留：${recovery_dir}"
-        return 2
+        return "$lock_status"
     fi
 
     if ! rm -rf -- "$transaction_dir"; then
-        cleanup_status=1
         transaction_status=3
         yellow "配置已成功提交，但安全临时目录未能清理：${transaction_dir}"
     fi
     if [ -n "$old_firewall_rule" ]; then
         if ! remove_owned_firewall_ports_if_unused "${conf_dir}/inbounds.json" "$old_firewall_rule"; then
-            cleanup_status=1
             transaction_status=3
             yellow "新端口已成功提交，但旧防火墙记录未能安全清理。"
         fi
     fi
+    _finish_node_change_transaction "$transaction_status"
     _restore_node_change_traps
-    release_proxy_transaction_lock
-    [ "$cleanup_status" -eq 0 ] || return 3
-    return "$transaction_status"
+    return "$lock_status"
 }
 
 rewrite_public_client_port() {
@@ -13817,7 +13827,7 @@ durable_transaction_trap_handler() {
     if declare -F stop_warp_candidate_proxy >/dev/null 2>&1; then
         stop_warp_candidate_proxy >/dev/null 2>&1 || true
     fi
-    release_proxy_transaction_lock
+    finish_transaction_release "$final_status" release_proxy_transaction_lock || final_status=$?
     restore_durable_transaction_traps
     reset_durable_transaction_state
     exit "$final_status"
@@ -13893,7 +13903,7 @@ proxy_transaction_trap_handler() {
             fi
             ;;
     esac
-    release_proxy_transaction_lock
+    finish_transaction_release "$final_status" release_proxy_transaction_lock || final_status=$?
     reset_proxy_transaction_state
     restore_proxy_transaction_traps
     [ "$event" = EXIT ] || red "代理配置事务被 ${event} 中断。"

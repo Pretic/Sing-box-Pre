@@ -23,6 +23,7 @@ extract_function() {
 # split snapshot/rollback work out of the four entrypoints without requiring
 # this harness to source the script's executable entrypoint.
 required_functions=(
+    finish_transaction_release
     render_nginx_subscription_location
     render_nginx_subscription_server
     get_nginx_subscription_port

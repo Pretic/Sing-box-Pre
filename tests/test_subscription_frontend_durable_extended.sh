@@ -19,6 +19,7 @@ extract_function() {
 }
 
 required_functions=(
+    finish_transaction_release
     render_nginx_subscription_location
     render_nginx_subscription_server
     get_nginx_subscription_port
@@ -258,6 +259,7 @@ YAML
     green() { :; }
     yellow() { :; }
     red() { :; }
+    release_proxy_transaction_lock() { return 0; }
     durable_transaction_hook() {
         [ -n "$DURABLE_SIGNAL_STAGE" ] && [ "$1" = "$DURABLE_SIGNAL_STAGE" ] || return 0
         kill -s "$DURABLE_SIGNAL_NAME" "$BASHPID"

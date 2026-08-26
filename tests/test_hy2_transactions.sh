@@ -12,6 +12,10 @@ fail() {
     exit 1
 }
 
+finish_source=$(sed -n '/^finish_transaction_release() {/,/^}/p' "$script")
+[[ -n "$finish_source" ]] || fail 'transaction release helper could not be extracted'
+source /dev/stdin <<< "$finish_source"
+
 nat_block=$(sed -n '/^configure_hy2_nat_family() {/,/^render_vless_reality_inbound() {/p' "$script" | sed '$d')
 [[ -n "$nat_block" ]] || fail 'HY2 NAT helper block could not be extracted'
 source /dev/stdin <<< "$nat_block"

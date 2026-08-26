@@ -16,6 +16,7 @@ load_function() {
 }
 
 for function_name in \
+    finish_transaction_release \
     apply_jq_config validate_uuid_value is_valid_ipv4_address is_valid_ipv6_address \
     node_change_snapshot_path node_change_restore_path \
     acquire_node_subscription_lock release_node_subscription_lock \

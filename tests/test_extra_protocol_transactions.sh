@@ -17,6 +17,7 @@ extract_function() {
 }
 
 for function_name in \
+    finish_transaction_release \
     get_listener_address \
     format_url_host \
     read_extra_protocol_ports \
@@ -214,6 +215,8 @@ acquire_proxy_transaction_lock() {
     [ -z "$LOCK_SET_REMOVE_PORT" ] || CURRENT_EXTRA_PORT="$LOCK_SET_REMOVE_PORT"
 }
 release_proxy_transaction_lock() { printf 'unlock\n' >> "$call_log"; }
+acquire_transaction_lock_with_legacy() { return 0; }
+release_transaction_lock_with_legacy() { return 0; }
 durable_transaction_hook() {
     [ "$DURABLE_HOOK_LOG" -ne 1 ] || printf 'durable:%s\n' "$1" >> "$call_log"
     [ -z "$DURABLE_HOOK_FAIL_STAGE" ] || [ "$1" != "$DURABLE_HOOK_FAIL_STAGE" ]

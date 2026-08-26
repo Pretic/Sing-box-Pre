@@ -74,6 +74,7 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 for function_name in \
+    finish_transaction_release \
     restore_subscription_port_snapshot \
     rollback_subscription_port_transaction \
     rollback_subscription_port_signal_transaction \

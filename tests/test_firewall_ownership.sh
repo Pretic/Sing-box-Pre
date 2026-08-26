@@ -57,6 +57,7 @@ assert_not_contains() {
 }
 
 for name in \
+    finish_transaction_release \
     validate_port_value \
     atomic_write_secret_file \
     transaction_root_path \

@@ -12,6 +12,10 @@ fail() {
     exit 1
 }
 
+finish_source="$(sed -n '/^finish_transaction_release() {/,/^}/p' "$script")"
+[[ -n "$finish_source" ]] || fail 'finish_transaction_release is not implemented'
+source <(printf '%s\n' "$finish_source")
+
 function_source="$(sed -n '/^disable_cf_https_subscription() {/,/^}/p' "$script")"
 [[ -n "$function_source" ]] || fail 'disable_cf_https_subscription is not implemented'
 source <(printf '%s\n' "$function_source")

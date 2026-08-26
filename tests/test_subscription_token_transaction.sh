@@ -12,6 +12,10 @@ fail() {
     exit 1
 }
 
+finish_source="$(sed -n '/^finish_transaction_release() {/,/^}/p' "$script")"
+[[ -n "$finish_source" ]] || fail 'finish_transaction_release is not implemented'
+source <(printf '%s\n' "$finish_source")
+
 function_source="$(sed -n '/^rotate_subscription_token() {/,/^}/p' "$script")"
 [[ -n "$function_source" ]] || fail 'rotate_subscription_token is not implemented'
 source <(printf '%s\n' "$function_source")

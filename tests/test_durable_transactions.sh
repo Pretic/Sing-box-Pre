@@ -12,6 +12,7 @@ extract_function() {
 }
 
 for function_name in \
+    finish_transaction_release \
     reset_durable_transaction_state \
     assert_no_pending_durable_transaction \
     write_durable_transaction_registry \

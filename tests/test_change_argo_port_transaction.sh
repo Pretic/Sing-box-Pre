@@ -16,6 +16,7 @@ load_function() {
 }
 
 for function_name in \
+    finish_transaction_release \
     validate_port_value resolve_service_ports persist_install_settings apply_jq_config \
     get_uniform_inbound_port \
     node_change_snapshot_path node_change_restore_path \
