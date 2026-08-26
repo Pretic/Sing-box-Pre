@@ -85,7 +85,7 @@ ${SING_BOX_TRANSACTION_ROOT:-/var/lib/sing-box-transactions}/
   recoveries/          # mode 0700
 ```
 
-When `SING_BOX_TRANSACTION_GROUP` is non-empty, resolve it with `getent group` or a numeric gid, use directory mode `0750`, file mode `0640`, and reject an unresolved group. Every existing object must be owned by the effective uid, have the expected gid/mode after safe repair, be the expected type, and not be a symlink; regular files must have link count one. Create `schema-version` through a same-directory temporary file and a no-replace hard link so an existing path is never overwritten. Create lock files only with append/open semantics; never truncate, rename, or delete them.
+When `SING_BOX_TRANSACTION_GROUP` is non-empty, resolve it with `getent group` or a numeric gid, use directory mode `0750`, file mode `0640`, and reject an unresolved group. Every existing object must be owned by the effective uid, have the expected gid/mode after safe repair, be the expected type, and not be a symlink; regular files must have link count one. Create `schema-version` through a same-directory temporary file and a no-replace hard link so an existing path is never overwritten. Create each missing lock file through the same no-replace temporary-file/hard-link pattern; after publication, acquire it only by opening the permanent path, and never truncate, rename, or delete it.
 
 - [x] **Step 4: Run focused tests and static checks**
 
