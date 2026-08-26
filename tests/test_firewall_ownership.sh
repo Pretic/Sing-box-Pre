@@ -59,6 +59,33 @@ assert_not_contains() {
 for name in \
     validate_port_value \
     atomic_write_secret_file \
+    transaction_root_path \
+    transaction_expected_dir_mode \
+    transaction_expected_file_mode \
+    transaction_expected_gid \
+    validate_transaction_path_components \
+    validate_transaction_directory \
+    ensure_transaction_directory \
+    validate_transaction_regular_file \
+    ensure_transaction_regular_file \
+    write_transaction_schema_file \
+    ensure_stable_transaction_root \
+    stable_transaction_lock_path \
+    stable_transaction_lock_rank \
+    stable_transaction_lock_is_held \
+    stable_transaction_highest_rank \
+    stable_transaction_lock_hook \
+    legacy_transaction_lock_hook \
+    reset_stable_transaction_lock_state \
+    acquire_stable_transaction_lock \
+    release_stable_transaction_lock \
+    with_stable_transaction_lock \
+    validate_safe_legacy_lock \
+    acquire_safe_legacy_lock \
+    release_safe_legacy_lock \
+    acquire_transaction_lock_with_legacy \
+    release_transaction_lock_with_legacy \
+    with_transaction_lock_with_legacy \
     acquire_firewall_lock \
     release_firewall_lock \
     select_firewall_backend \
@@ -145,6 +172,7 @@ done
 validate_installed_singbox_config_strict() { return 0; }
 
 work_dir="${tmp_root}/work"
+SING_BOX_TRANSACTION_ROOT="${tmp_root}/transactions"
 server_name=sing-box
 conf_dir="${work_dir}/conf"
 FIREWALL_STATE_FILE="${work_dir}/firewall.state"
@@ -188,6 +216,8 @@ MOCK_RC_IP6TABLES=0
 reset_fixture() {
     rm -rf -- "$work_dir"
     mkdir -p -- "$work_dir" "$conf_dir"
+    : > "${work_dir}/.firewall.lock"
+    chmod 600 "${work_dir}/.firewall.lock"
     : > "$CALL_LOG"
     : > "$UFW_LIVE"
     : > "$FIREWALLD_RUNTIME"
@@ -460,6 +490,81 @@ mock_iptables() {
 
 iptables() { mock_iptables 4 "$@"; }
 ip6tables() { mock_iptables 6 "$@"; }
+
+# Public firewall wrappers preserve the lock protocol's rc 0/1/2 contract and
+# never report success when releasing the ownership lock fails.
+MOCK_FIREWALL_ACQUIRE_STATUS=0
+MOCK_FIREWALL_RELEASE_STATUS=0
+MOCK_FIREWALL_LOCKED_STATUS=0
+MOCK_FIREWALL_LOCKED_CALLS=0
+MOCK_FIREWALL_RELEASE_CALLS=0
+acquire_firewall_lock() { return "$MOCK_FIREWALL_ACQUIRE_STATUS"; }
+release_firewall_lock() {
+    MOCK_FIREWALL_RELEASE_CALLS=$((MOCK_FIREWALL_RELEASE_CALLS + 1))
+    return "$MOCK_FIREWALL_RELEASE_STATUS"
+}
+mock_firewall_locked_callback() {
+    MOCK_FIREWALL_LOCKED_CALLS=$((MOCK_FIREWALL_LOCKED_CALLS + 1))
+    return "$MOCK_FIREWALL_LOCKED_STATUS"
+}
+_allow_port_locked() { mock_firewall_locked_callback; }
+_remove_owned_firewall_port_locked() { mock_firewall_locked_callback; }
+_remove_owned_firewall_records_locked() { mock_firewall_locked_callback; }
+_remove_owned_firewall_ports_locked() { mock_firewall_locked_callback; }
+_remove_owned_firewall_ports_if_unused_locked() { mock_firewall_locked_callback; }
+
+invoke_firewall_wrapper_contract() {
+    case "$1" in
+        allow_port) allow_port test ;;
+        remove_owned_firewall_port) remove_owned_firewall_port test ;;
+        remove_owned_firewall_records_exact) remove_owned_firewall_records_exact test ;;
+        remove_owned_firewall_ports) remove_owned_firewall_ports test ;;
+        remove_owned_firewall_ports_if_unused) remove_owned_firewall_ports_if_unused config test ;;
+        *) return 99 ;;
+    esac
+}
+
+for wrapper in \
+    allow_port \
+    remove_owned_firewall_port \
+    remove_owned_firewall_records_exact \
+    remove_owned_firewall_ports \
+    remove_owned_firewall_ports_if_unused; do
+    MOCK_FIREWALL_ACQUIRE_STATUS=2
+    MOCK_FIREWALL_RELEASE_STATUS=0
+    MOCK_FIREWALL_LOCKED_STATUS=0
+    MOCK_FIREWALL_LOCKED_CALLS=0
+    MOCK_FIREWALL_RELEASE_CALLS=0
+    assert_status 2 invoke_firewall_wrapper_contract "$wrapper"
+    [ "$MOCK_FIREWALL_LOCKED_CALLS" -eq 0 ] || \
+        fail "${wrapper} ran its mutation after lock acquisition rc=2"
+    [ "$MOCK_FIREWALL_RELEASE_CALLS" -eq 0 ] || \
+        fail "${wrapper} released a lock that was not acquired"
+
+    MOCK_FIREWALL_ACQUIRE_STATUS=0
+    MOCK_FIREWALL_RELEASE_STATUS=2
+    MOCK_FIREWALL_LOCKED_STATUS=0
+    MOCK_FIREWALL_LOCKED_CALLS=0
+    MOCK_FIREWALL_RELEASE_CALLS=0
+    assert_status 2 invoke_firewall_wrapper_contract "$wrapper"
+    [ "$MOCK_FIREWALL_LOCKED_CALLS" -eq 1 ] || \
+        fail "${wrapper} did not run exactly one locked mutation"
+    [ "$MOCK_FIREWALL_RELEASE_CALLS" -eq 1 ] || \
+        fail "${wrapper} did not report exactly one release attempt"
+done
+
+for name in \
+    acquire_firewall_lock \
+    release_firewall_lock \
+    _allow_port_locked \
+    _remove_owned_firewall_port_locked \
+    _remove_owned_firewall_records_locked \
+    _remove_owned_firewall_ports_locked \
+    _remove_owned_firewall_ports_if_unused_locked; do
+    load_function "$name"
+done
+unset MOCK_FIREWALL_ACQUIRE_STATUS MOCK_FIREWALL_RELEASE_STATUS
+unset MOCK_FIREWALL_LOCKED_STATUS MOCK_FIREWALL_LOCKED_CALLS MOCK_FIREWALL_RELEASE_CALLS
 
 # Active UFW owns the decision when firewalld is installed but inactive and
 # raw compatibility tools also exist.
@@ -1127,6 +1232,8 @@ client_dir="${tmp_root}/url.txt"
 transaction_inbounds="${tmp_root}/transaction-inbounds.json"
 reset_transaction_fixture() {
     command rm -f -- "${conf_dir}/.durable-transaction.pending"
+    : > "${conf_dir}/.proxy-transaction.lock"
+    chmod 600 "${conf_dir}/.proxy-transaction.lock"
     find "$tmp_root" -maxdepth 2 -type d -name '.durable-transaction.*' -exec rm -rf -- {} + 2>/dev/null || true
     cat > "$transaction_inbounds" <<'JSON'
 {"inbounds":[

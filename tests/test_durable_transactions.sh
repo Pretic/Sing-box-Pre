@@ -153,7 +153,38 @@ run_signal_case committed 3 0 1
 kill_dir="${tmp_dir}/kill-recovery"
 mkdir -p "$kill_dir"
 conf_dir="$kill_dir"
+SING_BOX_TRANSACTION_ROOT="${tmp_dir}/transactions"
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+for function_name in \
+    transaction_root_path \
+    transaction_expected_dir_mode \
+    transaction_expected_file_mode \
+    transaction_expected_gid \
+    validate_transaction_path_components \
+    validate_transaction_directory \
+    ensure_transaction_directory \
+    validate_transaction_regular_file \
+    ensure_transaction_regular_file \
+    write_transaction_schema_file \
+    ensure_stable_transaction_root \
+    stable_transaction_lock_path \
+    stable_transaction_lock_rank \
+    stable_transaction_lock_is_held \
+    stable_transaction_highest_rank \
+    stable_transaction_lock_hook \
+    legacy_transaction_lock_hook \
+    reset_stable_transaction_lock_state \
+    acquire_stable_transaction_lock \
+    release_stable_transaction_lock \
+    with_stable_transaction_lock \
+    validate_safe_legacy_lock \
+    acquire_safe_legacy_lock \
+    release_safe_legacy_lock \
+    acquire_transaction_lock_with_legacy \
+    release_transaction_lock_with_legacy \
+    with_transaction_lock_with_legacy; do
+    source <(extract_function "$function_name")
+done
 source <(extract_function acquire_proxy_transaction_lock)
 source <(extract_function release_proxy_transaction_lock)
 kill_status=0
@@ -240,52 +271,25 @@ elif [ "$?" -ne 2 ]; then
     exit 1
 fi
 
-# The fallback main lock has its own mkdir-to-owner initialization window.  A
-# process killed there must not leave every future configuration operation
-# permanently timing out.
+# Upgraded transactions require util-linux flock.  The old mkdir-lock reaper
+# remains testable below for recovery of legacy artifacts, but normal lock
+# acquisition must fail closed instead of silently downgrading guarantees.
 fallback_root="${tmp_dir}/fallback-main-lock"
 mkdir -p "$fallback_root"
-fallback_lock="${fallback_root}/.proxy-transaction.lock.d"
-fallback_pause="${fallback_root}/main-lock-created-paused"
-command_exists() { return 1; }
-proxy_transaction_reaper_hook() {
-    if [ "$1" = main-lock-created ]; then
-        : > "$fallback_pause"
-        while :; do :; done
-    fi
+command_exists() {
+    [ "$1" != flock ] && command -v "$1" >/dev/null 2>&1
 }
-( PROXY_TX_LOCK_TIMEOUT_SECONDS=3 PROXY_TX_LOCK_STALE_SECONDS=1 \
-    acquire_proxy_transaction_lock "$fallback_root" ) & fallback_owner=$!
-for _ in $(seq 1 100); do
-    [ -e "$fallback_pause" ] && break
-    sleep 0.01
-done
-[[ -e "$fallback_pause" ]] || {
-    echo 'FAIL: fallback lock did not reach the mkdir-to-owner KILL boundary' >&2
-    exit 1
-}
-kill -KILL "$fallback_owner"
 fallback_status=0
-wait "$fallback_owner" || fallback_status=$?
-[[ "$fallback_status" -eq 137 ]] || {
-    echo "FAIL: fallback owner KILL fixture returned ${fallback_status}, expected 137" >&2
+acquire_proxy_transaction_lock "$fallback_root" || fallback_status=$?
+[[ "$fallback_status" -eq 1 ]] || {
+    echo "FAIL: missing flock returned ${fallback_status}, expected 1" >&2
     exit 1
 }
-[[ -d "$fallback_lock" && ! -e "$fallback_lock/owner" ]] || {
-    echo 'FAIL: fallback KILL fixture did not leave the expected ownerless main lock' >&2
+[[ ! -e "${fallback_root}/.proxy-transaction.lock.d" ]] || {
+    echo 'FAIL: upgraded acquisition created a legacy mkdir lock' >&2
     exit 1
 }
-proxy_transaction_reaper_hook() { :; }
-PROXY_TX_LOCK_TIMEOUT_SECONDS=4 PROXY_TX_LOCK_STALE_SECONDS=1 \
-    acquire_proxy_transaction_lock "$fallback_root" || {
-        echo 'FAIL: ownerless fallback main lock was not recovered' >&2
-        exit 1
-    }
-release_proxy_transaction_lock
-[[ ! -e "$fallback_lock" && ! -e "${fallback_lock}.reaper" ]] || {
-    echo 'FAIL: fallback main-lock recovery left lock artifacts behind' >&2
-    exit 1
-}
+command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 reaper_root="${tmp_dir}/reaper"
 mkdir -p "$reaper_root"

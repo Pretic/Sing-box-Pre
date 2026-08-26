@@ -26,6 +26,34 @@ load_function() {
 }
 
 for function_name in \
+    command_exists \
+    transaction_root_path \
+    transaction_expected_dir_mode \
+    transaction_expected_file_mode \
+    transaction_expected_gid \
+    validate_transaction_path_components \
+    validate_transaction_directory \
+    ensure_transaction_directory \
+    validate_transaction_regular_file \
+    ensure_transaction_regular_file \
+    write_transaction_schema_file \
+    ensure_stable_transaction_root \
+    stable_transaction_lock_path \
+    stable_transaction_lock_rank \
+    stable_transaction_lock_is_held \
+    stable_transaction_highest_rank \
+    stable_transaction_lock_hook \
+    legacy_transaction_lock_hook \
+    reset_stable_transaction_lock_state \
+    acquire_stable_transaction_lock \
+    release_stable_transaction_lock \
+    with_stable_transaction_lock \
+    validate_safe_legacy_lock \
+    acquire_safe_legacy_lock \
+    release_safe_legacy_lock \
+    acquire_transaction_lock_with_legacy \
+    release_transaction_lock_with_legacy \
+    with_transaction_lock_with_legacy \
     with_subscription_lock \
     encode_subscription_source \
     read_strict_subscription_generation_file \
@@ -53,10 +81,13 @@ for function_name in \
 done
 
 work_dir="${tmp_root}/sing-box"
+SING_BOX_TRANSACTION_ROOT="${tmp_root}/transactions"
 client_dir="${work_dir}/url.txt"
 combined_client_dir="${work_dir}/all-url.txt"
 CFY_SOURCE_GENERATION_FILE="${work_dir}/cfy-source.generation"
 mkdir -p "$work_dir"
+: > "${work_dir}/.subscription.lock"
+chmod 600 "${work_dir}/.subscription.lock"
 
 printf '%s\n' \
     'vless://base-a' \

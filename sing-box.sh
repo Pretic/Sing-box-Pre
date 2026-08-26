@@ -155,6 +155,532 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Shared, versioned control-plane transaction namespace.  Lock files are
+# permanent inode anchors: callers may flock them, but must never truncate,
+# rename, or unlink them.  SING_BOX_TRANSACTION_ROOT exists for tests/chroots;
+# production uses the root-owned default below.
+transaction_root_path() {
+    local root="${SING_BOX_TRANSACTION_ROOT:-/var/lib/sing-box-transactions}"
+
+    [ -n "$root" ] && [ "$root" != / ] && [[ "$root" = /* ]] || return 1
+    [[ "$root" != *$'\n'* && "$root" != *$'\r'* ]] || return 1
+    case "$root" in
+        *//*|*/./*|*/../*|*/.|*/..) return 1 ;;
+    esac
+    root="${root%/}"
+    [ -n "$root" ] && [ "$root" != / ] || return 1
+    printf '%s\n' "$root"
+}
+
+transaction_expected_dir_mode() {
+    if [ -n "${SING_BOX_TRANSACTION_GROUP:-}" ]; then
+        printf '750\n'
+    else
+        printf '700\n'
+    fi
+}
+
+transaction_expected_file_mode() {
+    if [ -n "${SING_BOX_TRANSACTION_GROUP:-}" ]; then
+        printf '640\n'
+    else
+        printf '600\n'
+    fi
+}
+
+transaction_expected_gid() {
+    local requested_group="${SING_BOX_TRANSACTION_GROUP:-}" group_entry gid
+
+    if [ -z "$requested_group" ]; then
+        id -g
+        return
+    fi
+    [[ "$requested_group" != *$'\n'* && "$requested_group" != *$'\r'* ]] || return 1
+    if command -v getent >/dev/null 2>&1; then
+        group_entry=$(getent group "$requested_group" 2>/dev/null) || return 1
+        gid=$(printf '%s\n' "$group_entry" | awk -F: 'NR == 1 { print $3 }') || return 1
+    elif [[ "$requested_group" =~ ^[0-9]+$ ]]; then
+        gid="$requested_group"
+        if [ "$gid" != "$(id -g)" ] && \
+           ! awk -F: -v wanted="$gid" '$3 == wanted { found=1 } END { exit !found }' /etc/group 2>/dev/null; then
+            return 1
+        fi
+    else
+        gid=$(awk -F: -v wanted="$requested_group" \
+            '$1 == wanted { print $3; found=1; exit } END { exit !found }' \
+            /etc/group 2>/dev/null) || return 1
+    fi
+    [[ "$gid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$gid"
+}
+
+validate_transaction_path_components() {
+    local path="${1:-}" component current=''
+    local -a components=()
+
+    [ -n "$path" ] && [ "$path" != / ] && [[ "$path" = /* ]] || return 1
+    [[ "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 1
+    case "$path" in
+        *//*|*/./*|*/../*|*/.|*/..) return 1 ;;
+    esac
+    IFS='/' read -r -a components <<< "${path#/}"
+    for component in "${components[@]}"; do
+        [ -n "$component" ] || return 1
+        current="${current}/${component}"
+        if [ -e "$current" ] || [ -L "$current" ]; then
+            [ -d "$current" ] && [ ! -L "$current" ] || return 1
+        else
+            break
+        fi
+    done
+}
+
+validate_transaction_directory() {
+    local path="${1:-}" expected_mode="${2:-}" expected_gid="${3:-}"
+    local actual_uid actual_gid actual_mode
+
+    [ -d "$path" ] && [ ! -L "$path" ] || return 1
+    actual_uid=$(stat -c '%u' -- "$path" 2>/dev/null) || return 1
+    actual_gid=$(stat -c '%g' -- "$path" 2>/dev/null) || return 1
+    actual_mode=$(stat -c '%a' -- "$path" 2>/dev/null) || return 1
+    [ "$actual_uid" = "$(id -u)" ] && [ "$actual_gid" = "$expected_gid" ] && \
+        [ "$actual_mode" = "$expected_mode" ]
+}
+
+ensure_transaction_directory() {
+    local path="${1:-}" expected_mode="${2:-}" expected_gid="${3:-}"
+    local actual_uid
+
+    [ -n "$path" ] && [[ "$expected_mode" =~ ^7[05]0$ ]] && \
+        [[ "$expected_gid" =~ ^[0-9]+$ ]] || return 1
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        [ -d "$path" ] && [ ! -L "$path" ] || return 2
+    elif ! (umask 077 && mkdir -- "$path"); then
+        [ -d "$path" ] && [ ! -L "$path" ] || return 1
+    fi
+    actual_uid=$(stat -c '%u' -- "$path" 2>/dev/null) || return 2
+    [ "$actual_uid" = "$(id -u)" ] || return 2
+    chgrp "$expected_gid" -- "$path" 2>/dev/null || return 1
+    chmod "$expected_mode" -- "$path" || return 1
+    validate_transaction_directory "$path" "$expected_mode" "$expected_gid" || return 2
+}
+
+validate_transaction_regular_file() {
+    local path="${1:-}" expected_mode="${2:-}" expected_gid="${3:-}"
+    local actual_uid actual_gid actual_mode link_count
+
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    actual_uid=$(stat -c '%u' -- "$path" 2>/dev/null) || return 1
+    actual_gid=$(stat -c '%g' -- "$path" 2>/dev/null) || return 1
+    actual_mode=$(stat -c '%a' -- "$path" 2>/dev/null) || return 1
+    link_count=$(stat -c '%h' -- "$path" 2>/dev/null) || return 1
+    [ "$actual_uid" = "$(id -u)" ] && [ "$actual_gid" = "$expected_gid" ] && \
+        [ "$actual_mode" = "$expected_mode" ] && [ "$link_count" = 1 ]
+}
+
+ensure_transaction_regular_file() {
+    local path="${1:-}" expected_mode="${2:-}" expected_gid="${3:-}"
+    local file_dir file_name tmp_file actual_uid link_count
+
+    [ -n "$path" ] && [[ "$expected_mode" =~ ^6[04]0$ ]] && \
+        [[ "$expected_gid" =~ ^[0-9]+$ ]] || return 1
+    file_dir=$(dirname "$path") || return 1
+    file_name=$(basename "$path") || return 1
+    [ -d "$file_dir" ] && [ ! -L "$file_dir" ] || return 2
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        tmp_file=$(mktemp "${file_dir}/.transaction-${file_name}.XXXXXX") || return 1
+        if ! chgrp "$expected_gid" -- "$tmp_file" 2>/dev/null || \
+           ! chmod "$expected_mode" -- "$tmp_file" || \
+           ! ln -- "$tmp_file" "$path" 2>/dev/null; then
+            rm -f -- "$tmp_file"
+            [ -e "$path" ] || [ -L "$path" ] || return 1
+        else
+            rm -f -- "$tmp_file" || return 1
+        fi
+    fi
+    [ -f "$path" ] && [ ! -L "$path" ] || return 2
+    actual_uid=$(stat -c '%u' -- "$path" 2>/dev/null) || return 2
+    link_count=$(stat -c '%h' -- "$path" 2>/dev/null) || return 2
+    [ "$actual_uid" = "$(id -u)" ] && [ "$link_count" = 1 ] || return 2
+    chgrp "$expected_gid" -- "$path" 2>/dev/null || return 1
+    chmod "$expected_mode" -- "$path" || return 1
+    validate_transaction_regular_file "$path" "$expected_mode" "$expected_gid" || return 2
+}
+
+write_transaction_schema_file() {
+    local schema_file="${1:-}" expected_mode="${2:-}" expected_gid="${3:-}"
+    local schema_dir schema_name tmp_file schema_value schema_size
+
+    [ -n "$schema_file" ] || return 1
+    schema_dir=$(dirname "$schema_file") || return 1
+    schema_name=$(basename "$schema_file") || return 1
+    if [ ! -e "$schema_file" ] && [ ! -L "$schema_file" ]; then
+        tmp_file=$(mktemp "${schema_dir}/.transaction-${schema_name}.XXXXXX") || return 1
+        if ! printf '1\n' > "$tmp_file" || \
+           ! chgrp "$expected_gid" -- "$tmp_file" 2>/dev/null || \
+           ! chmod "$expected_mode" -- "$tmp_file" || \
+           ! ln -- "$tmp_file" "$schema_file" 2>/dev/null; then
+            rm -f -- "$tmp_file"
+            [ -e "$schema_file" ] || [ -L "$schema_file" ] || return 1
+        else
+            rm -f -- "$tmp_file" || return 1
+        fi
+    fi
+    ensure_transaction_regular_file "$schema_file" "$expected_mode" "$expected_gid" || return $?
+    schema_size=$(LC_ALL=C wc -c < "$schema_file" 2>/dev/null | tr -d '[:space:]') || return 2
+    IFS= read -r schema_value < "$schema_file" || return 2
+    [ "$schema_size" = 2 ] && [ "$schema_value" = 1 ] || return 2
+}
+
+ensure_stable_transaction_root() {
+    local root dir_mode file_mode expected_gid lock_kind lock_path
+
+    root=$(transaction_root_path) || return 2
+    validate_transaction_path_components "$root" || return 2
+    dir_mode=$(transaction_expected_dir_mode) || return 2
+    file_mode=$(transaction_expected_file_mode) || return 2
+    expected_gid=$(transaction_expected_gid) || return 2
+
+    ensure_transaction_directory "$root" "$dir_mode" "$expected_gid" || return $?
+    ensure_transaction_directory "$root/pending" "$dir_mode" "$expected_gid" || return $?
+    ensure_transaction_directory "$root/recoveries" "$dir_mode" "$expected_gid" || return $?
+    write_transaction_schema_file "$root/schema-version" "$file_mode" "$expected_gid" || return $?
+    for lock_kind in mutation subscription firewall; do
+        lock_path="$root/${lock_kind}.lock"
+        ensure_transaction_regular_file "$lock_path" "$file_mode" "$expected_gid" || return $?
+        [ ! -s "$lock_path" ] || return 2
+    done
+}
+
+stable_transaction_lock_path() {
+    local kind="${1:-}" root
+
+    case "$kind" in mutation|subscription|firewall) ;; *) return 1 ;; esac
+    root=$(transaction_root_path) || return 1
+    printf '%s/%s.lock\n' "$root" "$kind"
+}
+
+stable_transaction_lock_rank() {
+    case "${1:-}" in
+        mutation) printf '1\n' ;;
+        subscription) printf '2\n' ;;
+        firewall) printf '3\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+stable_transaction_lock_is_held() {
+    case "${1:-}" in
+        mutation) [ "${STABLE_TX_MUTATION_DEPTH:-0}" -gt 0 ] 2>/dev/null ;;
+        subscription) [ "${STABLE_TX_SUBSCRIPTION_DEPTH:-0}" -gt 0 ] 2>/dev/null ;;
+        firewall) [ "${STABLE_TX_FIREWALL_DEPTH:-0}" -gt 0 ] 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+stable_transaction_highest_rank() {
+    if stable_transaction_lock_is_held firewall; then
+        printf '3\n'
+    elif stable_transaction_lock_is_held subscription; then
+        printf '2\n'
+    elif stable_transaction_lock_is_held mutation; then
+        printf '1\n'
+    else
+        printf '0\n'
+    fi
+}
+
+stable_transaction_lock_hook() {
+    :
+}
+
+legacy_transaction_lock_hook() {
+    :
+}
+
+reset_stable_transaction_lock_state() {
+    local depth fd saved_path
+
+    [ "$(stable_transaction_highest_rank)" -eq 0 ] || return 2
+    for depth in \
+        "${STABLE_TX_MUTATION_DEPTH:-0}" \
+        "${STABLE_TX_SUBSCRIPTION_DEPTH:-0}" \
+        "${STABLE_TX_FIREWALL_DEPTH:-0}" \
+        "${LEGACY_TX_MUTATION_DEPTH:-0}" \
+        "${LEGACY_TX_SUBSCRIPTION_DEPTH:-0}" \
+        "${LEGACY_TX_FIREWALL_DEPTH:-0}"; do
+        [ "$depth" = 0 ] || return 2
+    done
+    for fd in \
+        "${STABLE_TX_MUTATION_FD:-}" \
+        "${STABLE_TX_SUBSCRIPTION_FD:-}" \
+        "${STABLE_TX_FIREWALL_FD:-}" \
+        "${LEGACY_TX_MUTATION_FD:-}" \
+        "${LEGACY_TX_SUBSCRIPTION_FD:-}" \
+        "${LEGACY_TX_FIREWALL_FD:-}"; do
+        [ -z "$fd" ] || return 2
+    done
+    for saved_path in \
+        "${LEGACY_TX_MUTATION_PATH:-}" \
+        "${LEGACY_TX_SUBSCRIPTION_PATH:-}" \
+        "${LEGACY_TX_FIREWALL_PATH:-}"; do
+        [ -z "$saved_path" ] || return 2
+    done
+    STABLE_TX_MUTATION_DEPTH=0
+    STABLE_TX_MUTATION_FD=''
+    STABLE_TX_SUBSCRIPTION_DEPTH=0
+    STABLE_TX_SUBSCRIPTION_FD=''
+    STABLE_TX_FIREWALL_DEPTH=0
+    STABLE_TX_FIREWALL_FD=''
+    LEGACY_TX_MUTATION_DEPTH=0
+    LEGACY_TX_MUTATION_FD=''
+    LEGACY_TX_MUTATION_PATH=''
+    LEGACY_TX_SUBSCRIPTION_DEPTH=0
+    LEGACY_TX_SUBSCRIPTION_FD=''
+    LEGACY_TX_SUBSCRIPTION_PATH=''
+    LEGACY_TX_FIREWALL_DEPTH=0
+    LEGACY_TX_FIREWALL_FD=''
+    LEGACY_TX_FIREWALL_PATH=''
+}
+
+acquire_stable_transaction_lock() {
+    local kind="${1:-}" timeout_seconds="${2:-${STABLE_TRANSACTION_LOCK_TIMEOUT_SECONDS:-30}}"
+    local rank highest_rank depth_var fd_var depth lock_path lock_fd
+    local path_identity fd_identity file_mode expected_gid
+
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+    rank=$(stable_transaction_lock_rank "$kind") || return 1
+    case "$kind" in
+        mutation) depth_var=STABLE_TX_MUTATION_DEPTH; fd_var=STABLE_TX_MUTATION_FD ;;
+        subscription) depth_var=STABLE_TX_SUBSCRIPTION_DEPTH; fd_var=STABLE_TX_SUBSCRIPTION_FD ;;
+        firewall) depth_var=STABLE_TX_FIREWALL_DEPTH; fd_var=STABLE_TX_FIREWALL_FD ;;
+        *) return 1 ;;
+    esac
+    depth="${!depth_var:-0}"
+    [[ "$depth" =~ ^[0-9]+$ ]] || return 2
+    if [ "$depth" -gt 0 ]; then
+        printf -v "$depth_var" '%s' "$((depth + 1))"
+        return 0
+    fi
+
+    highest_rank=$(stable_transaction_highest_rank) || return 2
+    [ "$highest_rank" -le "$rank" ] || return 2
+    command_exists flock || return 1
+    ensure_stable_transaction_root || return $?
+    lock_path=$(stable_transaction_lock_path "$kind") || return 2
+    file_mode=$(transaction_expected_file_mode) || return 2
+    expected_gid=$(transaction_expected_gid) || return 2
+    path_identity=$(stat -c '%d:%i' -- "$lock_path" 2>/dev/null) || return 2
+    exec {lock_fd}>>"$lock_path" || return 1
+    fd_identity=$(stat -Lc '%d:%i' -- "/proc/${BASHPID}/fd/${lock_fd}" 2>/dev/null) || {
+        exec {lock_fd}>&-
+        return 2
+    }
+    if [ "$fd_identity" != "$path_identity" ]; then
+        exec {lock_fd}>&-
+        return 2
+    fi
+    if ! flock -x -w "$timeout_seconds" "$lock_fd"; then
+        exec {lock_fd}>&-
+        return 1
+    fi
+    if ! validate_transaction_regular_file "$lock_path" "$file_mode" "$expected_gid" || \
+       [ "$(stat -c '%d:%i' -- "$lock_path" 2>/dev/null)" != "$path_identity" ]; then
+        exec {lock_fd}>&-
+        return 2
+    fi
+    printf -v "$fd_var" '%s' "$lock_fd"
+    printf -v "$depth_var" '1'
+    if ! stable_transaction_lock_hook acquired "$kind" "$lock_path"; then
+        release_stable_transaction_lock "$kind" >/dev/null 2>&1 || true
+        return 2
+    fi
+}
+
+release_stable_transaction_lock() {
+    local kind="${1:-}" rank highest_rank depth_var fd_var depth lock_fd
+
+    rank=$(stable_transaction_lock_rank "$kind") || return 1
+    case "$kind" in
+        mutation) depth_var=STABLE_TX_MUTATION_DEPTH; fd_var=STABLE_TX_MUTATION_FD ;;
+        subscription) depth_var=STABLE_TX_SUBSCRIPTION_DEPTH; fd_var=STABLE_TX_SUBSCRIPTION_FD ;;
+        firewall) depth_var=STABLE_TX_FIREWALL_DEPTH; fd_var=STABLE_TX_FIREWALL_FD ;;
+        *) return 1 ;;
+    esac
+    depth="${!depth_var:-0}"
+    [[ "$depth" =~ ^[1-9][0-9]*$ ]] || return 2
+    highest_rank=$(stable_transaction_highest_rank) || return 2
+    [ "$highest_rank" -le "$rank" ] || return 2
+    if [ "$depth" -gt 1 ]; then
+        printf -v "$depth_var" '%s' "$((depth - 1))"
+        return 0
+    fi
+    lock_fd="${!fd_var:-}"
+    [[ "$lock_fd" =~ ^[0-9]+$ ]] || return 2
+    flock -u "$lock_fd" >/dev/null 2>&1 || true
+    exec {lock_fd}>&-
+    printf -v "$fd_var" ''
+    printf -v "$depth_var" '0'
+    stable_transaction_lock_hook released "$kind" '' || return 2
+}
+
+with_stable_transaction_lock() {
+    local kind="${1:-}" callback="${2:-}" callback_status=0 release_status=0
+    shift 2 || return 1
+
+    declare -F "$callback" >/dev/null 2>&1 || return 1
+    acquire_stable_transaction_lock "$kind" || return $?
+    "$callback" "$@" || callback_status=$?
+    release_stable_transaction_lock "$kind" || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
+    return "$callback_status"
+}
+
+validate_safe_legacy_lock() {
+    local lock_path="${1:-}" expected_gid file_mode actual_uid actual_gid actual_mode
+    local link_count lock_dir
+
+    [ -n "$lock_path" ] && [[ "$lock_path" = /* ]] || return 1
+    [[ "$lock_path" != *$'\n'* && "$lock_path" != *$'\r'* ]] || return 1
+    lock_dir=$(dirname "$lock_path") || return 1
+    validate_transaction_path_components "$lock_dir" || return 1
+    [ -f "$lock_path" ] && [ ! -L "$lock_path" ] || return 1
+    actual_uid=$(stat -c '%u' -- "$lock_path" 2>/dev/null) || return 1
+    actual_gid=$(stat -c '%g' -- "$lock_path" 2>/dev/null) || return 1
+    actual_mode=$(stat -c '%a' -- "$lock_path" 2>/dev/null) || return 1
+    link_count=$(stat -c '%h' -- "$lock_path" 2>/dev/null) || return 1
+    expected_gid=$(transaction_expected_gid) || return 1
+    file_mode=$(transaction_expected_file_mode) || return 1
+    [ "$actual_uid" = "$(id -u)" ] && [ "$link_count" = 1 ] || return 1
+    if [ "$actual_mode" = 600 ]; then
+        return 0
+    fi
+    [ "$actual_mode" = "$file_mode" ] && [ "$actual_gid" = "$expected_gid" ]
+}
+
+acquire_safe_legacy_lock() {
+    local kind="${1:-}" lock_path="${2:-}" timeout_seconds="${3:-${STABLE_TRANSACTION_LOCK_TIMEOUT_SECONDS:-30}}"
+    local depth_var fd_var path_var depth saved_path lock_fd path_identity fd_identity
+
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+    case "$kind" in
+        mutation) depth_var=LEGACY_TX_MUTATION_DEPTH; fd_var=LEGACY_TX_MUTATION_FD; path_var=LEGACY_TX_MUTATION_PATH ;;
+        subscription) depth_var=LEGACY_TX_SUBSCRIPTION_DEPTH; fd_var=LEGACY_TX_SUBSCRIPTION_FD; path_var=LEGACY_TX_SUBSCRIPTION_PATH ;;
+        firewall) depth_var=LEGACY_TX_FIREWALL_DEPTH; fd_var=LEGACY_TX_FIREWALL_FD; path_var=LEGACY_TX_FIREWALL_PATH ;;
+        *) return 1 ;;
+    esac
+    depth="${!depth_var:-0}"
+    saved_path="${!path_var:-}"
+    [[ "$depth" =~ ^[0-9]+$ ]] || return 2
+    if [ "$depth" -gt 0 ]; then
+        [ "$saved_path" = "$lock_path" ] || return 2
+        printf -v "$depth_var" '%s' "$((depth + 1))"
+        return 0
+    fi
+    [[ "$lock_path" != *$'\n'* && "$lock_path" != *$'\r'* ]] || return 2
+    if [ -z "$lock_path" ] || { [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; }; then
+        printf -v "$path_var" '%s' "$lock_path"
+        printf -v "$fd_var" ''
+        printf -v "$depth_var" '1'
+        if ! legacy_transaction_lock_hook skipped "$kind" "$lock_path"; then
+            printf -v "$path_var" ''
+            printf -v "$fd_var" ''
+            printf -v "$depth_var" '0'
+            return 2
+        fi
+        return 0
+    fi
+    command_exists flock || return 1
+    validate_safe_legacy_lock "$lock_path" || return 2
+    path_identity=$(stat -c '%d:%i' -- "$lock_path" 2>/dev/null) || return 2
+    exec {lock_fd}<"$lock_path" || return 2
+    fd_identity=$(stat -Lc '%d:%i' -- "/proc/${BASHPID}/fd/${lock_fd}" 2>/dev/null) || {
+        exec {lock_fd}>&-
+        return 2
+    }
+    if [ "$fd_identity" != "$path_identity" ]; then
+        exec {lock_fd}>&-
+        return 2
+    fi
+    if ! flock -x -w "$timeout_seconds" "$lock_fd"; then
+        exec {lock_fd}>&-
+        return 1
+    fi
+    if ! validate_safe_legacy_lock "$lock_path" || \
+       [ "$(stat -c '%d:%i' -- "$lock_path" 2>/dev/null)" != "$path_identity" ]; then
+        exec {lock_fd}>&-
+        return 2
+    fi
+    printf -v "$path_var" '%s' "$lock_path"
+    printf -v "$fd_var" '%s' "$lock_fd"
+    printf -v "$depth_var" '1'
+    if ! legacy_transaction_lock_hook acquired "$kind" "$lock_path"; then
+        release_safe_legacy_lock "$kind" >/dev/null 2>&1 || true
+        return 2
+    fi
+}
+
+release_safe_legacy_lock() {
+    local kind="${1:-}" depth_var fd_var path_var depth lock_fd
+
+    case "$kind" in
+        mutation) depth_var=LEGACY_TX_MUTATION_DEPTH; fd_var=LEGACY_TX_MUTATION_FD; path_var=LEGACY_TX_MUTATION_PATH ;;
+        subscription) depth_var=LEGACY_TX_SUBSCRIPTION_DEPTH; fd_var=LEGACY_TX_SUBSCRIPTION_FD; path_var=LEGACY_TX_SUBSCRIPTION_PATH ;;
+        firewall) depth_var=LEGACY_TX_FIREWALL_DEPTH; fd_var=LEGACY_TX_FIREWALL_FD; path_var=LEGACY_TX_FIREWALL_PATH ;;
+        *) return 1 ;;
+    esac
+    depth="${!depth_var:-0}"
+    [[ "$depth" =~ ^[1-9][0-9]*$ ]] || return 2
+    if [ "$depth" -gt 1 ]; then
+        printf -v "$depth_var" '%s' "$((depth - 1))"
+        return 0
+    fi
+    lock_fd="${!fd_var:-}"
+    if [ -n "$lock_fd" ]; then
+        [[ "$lock_fd" =~ ^[0-9]+$ ]] || return 2
+        flock -u "$lock_fd" >/dev/null 2>&1 || true
+        exec {lock_fd}>&-
+    fi
+    printf -v "$fd_var" ''
+    printf -v "$path_var" ''
+    printf -v "$depth_var" '0'
+    legacy_transaction_lock_hook released "$kind" '' || return 2
+}
+
+acquire_transaction_lock_with_legacy() {
+    local kind="${1:-}" legacy_path="${2:-}" timeout_seconds="${3:-${STABLE_TRANSACTION_LOCK_TIMEOUT_SECONDS:-30}}"
+    local status
+
+    acquire_stable_transaction_lock "$kind" "$timeout_seconds" || return $?
+    acquire_safe_legacy_lock "$kind" "$legacy_path" "$timeout_seconds"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        release_stable_transaction_lock "$kind" >/dev/null 2>&1 || true
+        return "$status"
+    fi
+}
+
+release_transaction_lock_with_legacy() {
+    local kind="${1:-}" legacy_status=0 stable_status=0
+
+    release_safe_legacy_lock "$kind" || legacy_status=$?
+    release_stable_transaction_lock "$kind" || stable_status=$?
+    [ "$legacy_status" -eq 0 ] && [ "$stable_status" -eq 0 ] || return 2
+}
+
+with_transaction_lock_with_legacy() {
+    local kind="${1:-}" legacy_path="${2:-}" callback="${3:-}"
+    local callback_status=0 release_status=0
+    shift 3 || return 1
+
+    declare -F "$callback" >/dev/null 2>&1 || return 1
+    acquire_transaction_lock_with_legacy "$kind" "$legacy_path" || return $?
+    "$callback" "$@" || callback_status=$?
+    release_transaction_lock_with_legacy "$kind" || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
+    return "$callback_status"
+}
+
 port_is_listening() {
     local port="${1:-}"
     local proto="${2:-}"
@@ -2386,24 +2912,17 @@ remove_remote_tunnel_subscription_via_api() {
 # 中、确认由自己创建的精确规则；HY2 NAT 继续使用独立状态文件。
 acquire_firewall_lock() {
     local lock_file="${FIREWALL_LOCK_FILE:-${work_dir}/.firewall.lock}"
+    local timeout_seconds="${FIREWALL_LOCK_TIMEOUT_SECONDS:-30}"
 
     command_exists flock || { red "缺少 flock，拒绝在无锁状态修改防火墙。"; return 1; }
-    mkdir -p -- "$(dirname "$lock_file")" || return 1
-    if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
-        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
-    fi
-    exec {FIREWALL_LOCK_FD}>"$lock_file" || return 1
-    if ! chmod 600 "$lock_file" || ! flock -x "$FIREWALL_LOCK_FD"; then
-        exec {FIREWALL_LOCK_FD}>&-
-        unset FIREWALL_LOCK_FD
-        return 1
-    fi
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+    acquire_transaction_lock_with_legacy firewall "$lock_file" "$timeout_seconds" || return $?
+    FIREWALL_LOCK_FD="${STABLE_TX_FIREWALL_FD:-}"
 }
 
 release_firewall_lock() {
-    [ -n "${FIREWALL_LOCK_FD:-}" ] || return 0
-    flock -u "$FIREWALL_LOCK_FD" >/dev/null 2>&1 || true
-    exec {FIREWALL_LOCK_FD}>&-
+    stable_transaction_lock_is_held firewall || return 0
+    release_transaction_lock_with_legacy firewall || return $?
     unset FIREWALL_LOCK_FD
 }
 
@@ -3176,11 +3695,12 @@ _allow_port_locked() {
 }
 
 allow_port() {
-    local status
-    acquire_firewall_lock || return 1
-    _allow_port_locked "$@"
-    status=$?
-    release_firewall_lock
+    local status=0 release_status=0
+
+    acquire_firewall_lock || return $?
+    _allow_port_locked "$@" || status=$?
+    release_firewall_lock || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
     return "$status"
 }
 
@@ -3317,21 +3837,23 @@ _remove_owned_firewall_port_locked() {
 }
 
 remove_owned_firewall_port() {
-    local status
-    acquire_firewall_lock || return 1
-    _remove_owned_firewall_port_locked "$@"
-    status=$?
-    release_firewall_lock
+    local status=0 release_status=0
+
+    acquire_firewall_lock || return $?
+    _remove_owned_firewall_port_locked "$@" || status=$?
+    release_firewall_lock || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
     return "$status"
 }
 
 remove_owned_firewall_records_exact() {
-    local status
+    local status=0 release_status=0
+
     [ "$#" -gt 0 ] || return 0
-    acquire_firewall_lock || return 1
-    _remove_owned_firewall_records_locked exact "$@"
-    status=$?
-    release_firewall_lock
+    acquire_firewall_lock || return $?
+    _remove_owned_firewall_records_locked exact "$@" || status=$?
+    release_firewall_lock || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
     return "$status"
 }
 
@@ -3365,13 +3887,13 @@ _remove_owned_firewall_ports_locked() {
 }
 
 remove_owned_firewall_ports() {
-    local status
+    local status=0 release_status=0
 
     [ "$#" -gt 0 ] || return 0
-    acquire_firewall_lock || return 1
-    _remove_owned_firewall_ports_locked "$@"
-    status=$?
-    release_firewall_lock
+    acquire_firewall_lock || return $?
+    _remove_owned_firewall_ports_locked "$@" || status=$?
+    release_firewall_lock || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
     return "$status"
 }
 
@@ -3680,13 +4202,13 @@ _remove_owned_firewall_ports_if_unused_locked() {
 }
 
 remove_owned_firewall_ports_if_unused() {
-    local status
+    local status=0 release_status=0
 
     [ "$#" -gt 1 ] || return 1
-    acquire_firewall_lock || return 1
-    _remove_owned_firewall_ports_if_unused_locked "$@"
-    status=$?
-    release_firewall_lock
+    acquire_firewall_lock || return $?
+    _remove_owned_firewall_ports_if_unused_locked "$@" || status=$?
+    release_firewall_lock || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
     return "$status"
 }
 
@@ -8013,7 +8535,7 @@ perform_singbox_uninstall() {
 
     _restore_uninstall_firewall_state() {
         local snapshot_state="${transaction_dir}/workdir/firewall.state"
-        local record backend family live_status restore_status=0
+        local record backend family live_status restore_status=0 release_status=0
         local FIREWALL_STATE_FILE="$snapshot_state"
         local -a restore_records=() raw_families=()
 
@@ -8026,7 +8548,7 @@ perform_singbox_uninstall() {
             declare -F release_firewall_lock >/dev/null 2>&1 || return 1
         read_firewall_state || return 1
         restore_records=("${FIREWALL_STATE_RECORDS[@]}")
-        acquire_firewall_lock || return 1
+        acquire_firewall_lock || return $?
         for record in "${restore_records[@]}"; do
             backend="${record%%|*}"
             if [ "$backend" = iptables ]; then
@@ -8050,7 +8572,8 @@ perform_singbox_uninstall() {
         if [ "$restore_status" -eq 0 ] && [ "${#raw_families[@]}" -gt 0 ]; then
             persist_raw_firewall_rules "${raw_families[@]}" || restore_status=1
         fi
-        release_firewall_lock
+        release_firewall_lock || release_status=$?
+        [ "$release_status" -eq 0 ] || return 2
         return "$restore_status"
     }
 
@@ -12961,81 +13484,27 @@ reap_stale_proxy_transaction_lock() {
 acquire_proxy_transaction_lock() {
     local transaction_conf_dir="${1:-}"
     local timeout_seconds="${PROXY_TX_LOCK_TIMEOUT_SECONDS:-30}"
-    local lock_owner='' started_at reaper_status=0
+    local lock_owner='' lock_status=0
 
-    [ -d "$transaction_conf_dir" ] && [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+    [ -d "$transaction_conf_dir" ] && [ ! -L "$transaction_conf_dir" ] && \
+        [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
     PROXY_TX_LOCK_KIND=''
-    PROXY_TX_LOCK_PATH=''
+    PROXY_TX_LOCK_PATH="${transaction_conf_dir}/.proxy-transaction.lock"
     PROXY_TX_LOCK_FD=''
 
-    if command_exists flock; then
-        PROXY_TX_LOCK_PATH="${transaction_conf_dir}/.proxy-transaction.lock"
-        (
-            umask 077
-            : >> "$PROXY_TX_LOCK_PATH"
-        ) || return 1
-        chmod 600 "$PROXY_TX_LOCK_PATH" || return 1
-        exec {PROXY_TX_LOCK_FD}>"$PROXY_TX_LOCK_PATH" || return 1
-        if ! flock -w "$timeout_seconds" "$PROXY_TX_LOCK_FD"; then
-            exec {PROXY_TX_LOCK_FD}>&-
-            PROXY_TX_LOCK_FD=''
-            return 1
+    acquire_transaction_lock_with_legacy mutation "$PROXY_TX_LOCK_PATH" "$timeout_seconds" || \
+        lock_status=$?
+    [ "$lock_status" -eq 0 ] || return "$lock_status"
+    PROXY_TX_LOCK_KIND='stable'
+    PROXY_TX_LOCK_FD="${STABLE_TX_MUTATION_FD:-}"
+    if declare -F assert_no_pending_durable_transaction >/dev/null 2>&1; then
+        assert_no_pending_durable_transaction "$transaction_conf_dir"
+        lock_owner=$?
+        if [ "$lock_owner" -ne 0 ]; then
+            release_proxy_transaction_lock >/dev/null 2>&1 || true
+            return "$lock_owner"
         fi
-        PROXY_TX_LOCK_KIND='flock'
-        if declare -F assert_no_pending_durable_transaction >/dev/null 2>&1; then
-            assert_no_pending_durable_transaction "$transaction_conf_dir"
-            lock_owner=$?
-            if [ "$lock_owner" -ne 0 ]; then
-                release_proxy_transaction_lock
-                return "$lock_owner"
-            fi
-        fi
-        return 0
     fi
-
-    PROXY_TX_LOCK_PATH="${transaction_conf_dir}/.proxy-transaction.lock.d"
-    started_at=$SECONDS
-    while :; do
-        if (umask 077 && mkdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null); then
-            chmod 700 "$PROXY_TX_LOCK_PATH" || {
-                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
-                return 1
-            }
-            if declare -F proxy_transaction_reaper_hook >/dev/null 2>&1; then
-                proxy_transaction_reaper_hook main-lock-created
-            fi
-            printf '%s\n' "$BASHPID" > "$PROXY_TX_LOCK_PATH/owner" || {
-                rm -f -- "$PROXY_TX_LOCK_PATH/owner"
-                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
-                return 1
-            }
-            chmod 600 "$PROXY_TX_LOCK_PATH/owner" || {
-                rm -f -- "$PROXY_TX_LOCK_PATH/owner"
-                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
-                return 1
-            }
-            PROXY_TX_LOCK_KIND='mkdir'
-            if declare -F assert_no_pending_durable_transaction >/dev/null 2>&1; then
-                assert_no_pending_durable_transaction "$transaction_conf_dir"
-                lock_owner=$?
-                if [ "$lock_owner" -ne 0 ]; then
-                    release_proxy_transaction_lock
-                    return "$lock_owner"
-                fi
-            fi
-            return 0
-        fi
-
-        reaper_status=0
-        reap_stale_proxy_transaction_lock "$PROXY_TX_LOCK_PATH" || reaper_status=$?
-        case "$reaper_status" in
-            0) continue ;;
-            1) ;;
-            *) return 2 ;;
-        esac
-        [ "$((SECONDS - started_at))" -lt "$timeout_seconds" ] || return 1
-        sleep 0.1
-    done
 }
 
 acquire_proxy_transaction_lock_checked() {
@@ -13065,21 +13534,15 @@ acquire_proxy_transaction_lock_checked() {
 }
 
 release_proxy_transaction_lock() {
-    case "${PROXY_TX_LOCK_KIND:-}" in
-        flock)
-            flock -u "$PROXY_TX_LOCK_FD" 2>/dev/null || true
-            exec {PROXY_TX_LOCK_FD}>&-
-            ;;
-        mkdir)
-            if [ -d "${PROXY_TX_LOCK_PATH:-}" ] && [ ! -L "$PROXY_TX_LOCK_PATH" ]; then
-                rm -f -- "$PROXY_TX_LOCK_PATH/owner" 2>/dev/null || true
-                rmdir -- "$PROXY_TX_LOCK_PATH" 2>/dev/null || true
-            fi
-            ;;
-    esac
+    local release_status=0
+
+    if [ "${PROXY_TX_LOCK_KIND:-}" = stable ]; then
+        release_transaction_lock_with_legacy mutation || release_status=$?
+    fi
     PROXY_TX_LOCK_KIND=''
     PROXY_TX_LOCK_PATH=''
     PROXY_TX_LOCK_FD=''
+    [ "$release_status" -eq 0 ] || return 2
 }
 
 # Durable evidence for public-port, subscription and extra-protocol
@@ -14324,8 +14787,7 @@ remove_url_by_tag() {
 with_subscription_lock() {
     local lock_file="${SUBSCRIPTION_LOCK_FILE:-${work_dir}/.subscription.lock}"
     local timeout_seconds="${SUBSCRIPTION_LOCK_TIMEOUT_SECONDS:-30}"
-    local lock_dir lock_status=0
-    local subscription_lock_fd
+    local lock_status=0 release_status=0
 
     if [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ]; then
         "$@"
@@ -14333,23 +14795,12 @@ with_subscription_lock() {
     fi
     [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
     command -v flock >/dev/null 2>&1 || return 1
-    lock_dir=$(dirname "$lock_file") || return 1
-    mkdir -p "$lock_dir" || return 1
-    if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
-        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
-    fi
-    (umask 077 && : >> "$lock_file") || return 1
-    chmod 600 "$lock_file" || return 1
-    exec {subscription_lock_fd}>>"$lock_file" || return 1
-    if ! flock -x -w "$timeout_seconds" "$subscription_lock_fd"; then
-        exec {subscription_lock_fd}>&-
-        return 1
-    fi
+    acquire_transaction_lock_with_legacy subscription "$lock_file" "$timeout_seconds" || return $?
 
     local SUBSCRIPTION_LOCK_HELD=1
     "$@" || lock_status=$?
-    flock -u "$subscription_lock_fd" 2>/dev/null || true
-    exec {subscription_lock_fd}>&-
+    release_transaction_lock_with_legacy subscription || release_status=$?
+    [ "$release_status" -eq 0 ] || return 2
     return "$lock_status"
 }
 
