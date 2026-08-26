@@ -71,6 +71,7 @@ direct_backend_functions=(
     detect_argo_tunnel_mode
     apply_nginx_subscription_config
     manage_service
+    query_nginx_service_state
     nginx_service_is_active
     stop_nginx_checked
     resolve_argo_service_definition
@@ -102,8 +103,8 @@ for function_name in _stop_subscription_service_locked manage_argo; do
     source <(printf '%s\n' "$function_source")
 done
 stop_subscription_source="$(extract_function _stop_subscription_service_locked)"
-grep -Fq 'nginx_service_is_active' <<< "$stop_subscription_source" || \
-    fail 'subscription stop does not delegate active-backend status checks'
+grep -Fq 'query_nginx_service_state' <<< "$stop_subscription_source" || \
+    fail 'subscription stop does not delegate tri-state active-backend status checks'
 grep -Fq 'stop_nginx_checked' <<< "$stop_subscription_source" || \
     fail 'subscription stop does not delegate active-backend stop'
 manage_argo_source="$(extract_function manage_argo)"
@@ -161,7 +162,7 @@ start_pre() { . /etc/sing-box/argo.env; }
 command_args="tunnel --no-autoupdate run"
 EOF
 BACKEND_LOG="${backend_root}/backend.log"
-NGINX_MOCK_ACTIVE=1
+NGINX_MOCK_RAW=0
 command_exists() { return 0; }
 command() {
     if [[ "${1:-}" == -v && "${2:-}" == nginx ]]; then
@@ -173,16 +174,16 @@ command() {
 systemctl() {
     printf 'systemctl %s\n' "$*" >> "$BACKEND_LOG"
     case "$*" in
-        'is-active --quiet nginx') [ "$NGINX_MOCK_ACTIVE" -eq 1 ]; return $? ;;
-        'stop nginx') NGINX_MOCK_ACTIVE=0 ;;
+        'is-active --quiet nginx') return "$NGINX_MOCK_RAW" ;;
+        'stop nginx') NGINX_MOCK_RAW=3 ;;
     esac
     return 0
 }
 rc-service() {
     printf 'rc-service %s\n' "$*" >> "$BACKEND_LOG"
     case "$*" in
-        'nginx status') [ "$NGINX_MOCK_ACTIVE" -eq 1 ]; return $? ;;
-        'nginx stop') NGINX_MOCK_ACTIVE=0 ;;
+        'nginx status') return "$NGINX_MOCK_RAW" ;;
+        'nginx stop') NGINX_MOCK_RAW=3 ;;
     esac
     return 0
 }
@@ -195,7 +196,7 @@ exercise_selected_backend() {
 
     SELECTED_INIT_SYSTEM="$selected_backend"
     detect_usable_init_system() { printf '%s\n' "$SELECTED_INIT_SYSTEM"; }
-    NGINX_MOCK_ACTIVE=1
+    NGINX_MOCK_RAW=0
     : > "$BACKEND_LOG"
     check_service sing-box "${work_dir}/sing-box" >/dev/null
     manage_service sing-box restart >/dev/null
@@ -206,7 +207,7 @@ exercise_selected_backend() {
     argo_service_is_active
     restart_argo_checked >/dev/null
     stop_argo_checked
-    NGINX_MOCK_ACTIVE=1
+    NGINX_MOCK_RAW=0
     _stop_subscription_service_locked >/dev/null
 
     if [ "$selected_backend" = systemd ]; then
@@ -232,6 +233,82 @@ exercise_selected_backend() {
 
 exercise_selected_backend systemd
 exercise_selected_backend openrc
+
+# Nginx stop is tri-state: only raw 0 is active and raw 3 is explicitly
+# inactive. Raw 1/4 (including a dead system bus) are query errors and must not
+# be reported as an already-stopped success.
+NGINX_QUERY_RAW=0
+NGINX_STOP_RAW=3
+NGINX_STOP_STATUS=0
+NGINX_STOP_CALLS=0
+systemctl() {
+    case "$*" in
+        'is-active --quiet nginx') return "$NGINX_QUERY_RAW" ;;
+        'stop nginx')
+            NGINX_STOP_CALLS=$((NGINX_STOP_CALLS + 1))
+            NGINX_QUERY_RAW=$NGINX_STOP_RAW
+            return "$NGINX_STOP_STATUS"
+            ;;
+    esac
+    return 0
+}
+rc-service() {
+    case "$*" in
+        'nginx status') return "$NGINX_QUERY_RAW" ;;
+        'nginx stop')
+            NGINX_STOP_CALLS=$((NGINX_STOP_CALLS + 1))
+            NGINX_QUERY_RAW=$NGINX_STOP_RAW
+            return "$NGINX_STOP_STATUS"
+            ;;
+    esac
+    return 0
+}
+for selected_backend in systemd openrc; do
+    SELECTED_INIT_SYSTEM="$selected_backend"
+    detect_usable_init_system() { printf '%s\n' "$SELECTED_INIT_SYSTEM"; }
+
+    NGINX_QUERY_RAW=0
+    assert_equal active "$(query_nginx_service_state)" \
+        "${selected_backend} raw0 Nginx state"
+    NGINX_QUERY_RAW=3
+    assert_equal inactive "$(query_nginx_service_state)" \
+        "${selected_backend} raw3 Nginx state"
+    for query_error in 1 4; do
+        NGINX_QUERY_RAW=$query_error
+        assert_equal error "$(query_nginx_service_state)" \
+            "${selected_backend} raw${query_error} Nginx state"
+        NGINX_STOP_CALLS=0
+        if _stop_subscription_service_locked >/dev/null; then
+            fail "${selected_backend} raw${query_error} query error was reported as stopped"
+        fi
+        [[ "$NGINX_STOP_CALLS" -eq 0 ]] || \
+            fail "${selected_backend} raw${query_error} query error attempted a stop"
+    done
+
+    NGINX_QUERY_RAW=3
+    NGINX_STOP_CALLS=0
+    _stop_subscription_service_locked >/dev/null || \
+        fail "${selected_backend} explicit inactive state was not idempotent"
+    [[ "$NGINX_STOP_CALLS" -eq 0 ]] || \
+        fail "${selected_backend} explicit inactive state attempted a stop"
+
+    NGINX_QUERY_RAW=0
+    NGINX_STOP_RAW=3
+    NGINX_STOP_STATUS=0
+    NGINX_STOP_CALLS=0
+    _stop_subscription_service_locked >/dev/null || \
+        fail "${selected_backend} active-to-inactive stop failed"
+    [[ "$NGINX_STOP_CALLS" -eq 1 ]] || \
+        fail "${selected_backend} active Nginx was not stopped exactly once"
+
+    NGINX_QUERY_RAW=0
+    NGINX_STOP_RAW=1
+    NGINX_STOP_STATUS=0
+    NGINX_STOP_CALLS=0
+    if _stop_subscription_service_locked >/dev/null; then
+        fail "${selected_backend} post-stop query error was reported as success"
+    fi
+done
 
 load_function perform_singbox_uninstall
 

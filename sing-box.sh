@@ -588,15 +588,21 @@ persist_partial_install_resume_state() {
     [[ "${private_key:-}" =~ ^[A-Za-z0-9_-]{40,64}$ ]] || return 1
     [[ "${public_key:-}" =~ ^[A-Za-z0-9_-]{40,64}$ ]] || return 1
     [[ "${ARGO_FIXED_READY:-0}" =~ ^[01]$ ]] || return 1
+    if [ "${ARGO_FIXED_READY:-0}" = 1 ]; then
+        is_argo_hostname "${ARGO_DOMAIN:-}" || return 1
+    else
+        [ -z "${ARGO_DOMAIN:-}" ] || return 1
+    fi
     [ -n "$state_file" ] && [ ! -L "$state_file" ] || return 1
 
     {
-        printf 'RESUME_VERSION=1\n'
+        printf 'RESUME_VERSION=2\n'
         printf 'UUID=%s\n' "$uuid"
         printf 'PASSWORD=%s\n' "$password"
         printf 'PRIVATE_KEY=%s\n' "$private_key"
         printf 'PUBLIC_KEY=%s\n' "$public_key"
         printf 'ARGO_FIXED_READY=%s\n' "${ARGO_FIXED_READY:-0}"
+        printf 'ARGO_DOMAIN=%s\n' "${ARGO_DOMAIN:-}"
     } | atomic_write_secret_file "$state_file" || return 1
     chmod 600 "$state_file"
 }
@@ -605,8 +611,9 @@ load_partial_install_resume_state() {
     local state_file key value mode
     local resume_version='' resume_uuid='' resume_password=''
     local resume_private_key='' resume_public_key='' resume_argo_fixed=''
+    local resume_argo_domain=''
     local version_count=0 uuid_count=0 password_count=0 private_count=0
-    local public_count=0 argo_count=0
+    local public_count=0 argo_count=0 domain_count=0
 
     state_file=$(partial_install_state_path) || return 1
     [ -f "$state_file" ] && [ ! -L "$state_file" ] && [ -r "$state_file" ] || return 1
@@ -621,6 +628,7 @@ load_partial_install_resume_state() {
             PRIVATE_KEY) resume_private_key="$value"; private_count=$((private_count + 1)) ;;
             PUBLIC_KEY) resume_public_key="$value"; public_count=$((public_count + 1)) ;;
             ARGO_FIXED_READY) resume_argo_fixed="$value"; argo_count=$((argo_count + 1)) ;;
+            ARGO_DOMAIN) resume_argo_domain="$value"; domain_count=$((domain_count + 1)) ;;
             *) return 1 ;;
         esac
     done < "$state_file"
@@ -628,18 +636,33 @@ load_partial_install_resume_state() {
     [ "$version_count" -eq 1 ] && [ "$uuid_count" -eq 1 ] && \
         [ "$password_count" -eq 1 ] && [ "$private_count" -eq 1 ] && \
         [ "$public_count" -eq 1 ] && [ "$argo_count" -eq 1 ] || return 1
-    [ "$resume_version" = 1 ] || return 1
     [[ "$resume_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] || return 1
     [[ "$resume_password" =~ ^[A-Za-z0-9]{24}$ ]] || return 1
     [[ "$resume_private_key" =~ ^[A-Za-z0-9_-]{40,64}$ ]] || return 1
     [[ "$resume_public_key" =~ ^[A-Za-z0-9_-]{40,64}$ ]] || return 1
     [[ "$resume_argo_fixed" =~ ^[01]$ ]] || return 1
+    case "$resume_version" in
+        1)
+            [ "$domain_count" -eq 0 ] && [ "$resume_argo_fixed" = 0 ] || return 1
+            resume_argo_domain=''
+            ;;
+        2)
+            [ "$domain_count" -eq 1 ] || return 1
+            if [ "$resume_argo_fixed" = 1 ]; then
+                is_argo_hostname "$resume_argo_domain" || return 1
+            else
+                [ -z "$resume_argo_domain" ] || return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
 
     uuid="$resume_uuid"
     password="$resume_password"
     private_key="$resume_private_key"
     public_key="$resume_public_key"
     ARGO_FIXED_READY="$resume_argo_fixed"
+    ARGO_DOMAIN="$resume_argo_domain"
 }
 
 validate_partial_install_config_credentials() {
@@ -713,6 +736,68 @@ partial_install_service_definition_is_managed() {
     esac
 }
 
+partial_install_argo_service_mode() {
+    local init_system="${1:-}" definition renderer tunnel_mode
+
+    case "$init_system" in
+        systemd)
+            definition="${INSTALL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/argo.service"
+            renderer=render_argo_systemd_service
+            ;;
+        openrc)
+            definition="${INSTALL_OPENRC_INIT_DIR:-/etc/init.d}/argo"
+            renderer=render_argo_openrc_service
+            ;;
+        *) return 1 ;;
+    esac
+    [ -f "$definition" ] && [ ! -L "$definition" ] && [ -r "$definition" ] || return 1
+
+    for tunnel_mode in quick token local; do
+        if cmp -s -- "$definition" <("$renderer" "$tunnel_mode"); then
+            printf '%s\n' "$tunnel_mode"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_partial_install_argo_resume() {
+    local init_system="${1:-}" tunnel_mode tunnel_config hostname
+    local -a tunnel_hostnames=()
+
+    tunnel_mode=$(partial_install_argo_service_mode "$init_system") || return 1
+    case "${ARGO_FIXED_READY:-}" in
+        0)
+            [ -z "${ARGO_DOMAIN:-}" ] && [ "$tunnel_mode" = quick ]
+            ;;
+        1)
+            is_argo_hostname "${ARGO_DOMAIN:-}" || return 1
+            case "$tunnel_mode" in
+                token) return 0 ;;
+                local)
+                    tunnel_config="${work_dir}/tunnel.yml"
+                    [ -f "$tunnel_config" ] && [ ! -L "$tunnel_config" ] && \
+                        [ -r "$tunnel_config" ] || return 1
+                    while IFS= read -r hostname; do
+                        tunnel_hostnames+=("$hostname")
+                    done < <(awk '
+                        match($0, /^[[:space:]]*-[[:space:]]+hostname:[[:space:]]*/) {
+                            hostname = substr($0, RLENGTH + 1)
+                            sub(/[[:space:]]+$/, "", hostname)
+                            print hostname
+                        }
+                    ' "$tunnel_config")
+                    [ "${#tunnel_hostnames[@]}" -eq 1 ] || return 1
+                    is_argo_hostname "${tunnel_hostnames[0]}" || return 1
+                    [ "${tunnel_hostnames[0],,}" = "${ARGO_DOMAIN,,}" ]
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 partial_install_service_is_active() {
     local init_system="${1:-}" service_name="${2:-}"
 
@@ -740,22 +825,83 @@ enable_install_services() {
     esac
 }
 
+partial_install_singbox_runtime_is_ready() {
+    local init_system="${1:-}" rule port proto
+
+    partial_install_service_is_active "$init_system" sing-box || return 1
+    for rule in \
+        "$vless_port/tcp" \
+        "$tuic_port/udp" \
+        "$hy2_port/udp" \
+        "$argo_port/tcp"; do
+        port="${rule%/*}"
+        proto="${rule#*/}"
+        port_is_listening "$port" "$proto" || return 1
+    done
+}
+
+wait_for_partial_install_singbox_ready() {
+    local init_system="${1:-}"
+    local attempts="${PARTIAL_INSTALL_READY_ATTEMPTS:-12}"
+    local interval="${PARTIAL_INSTALL_READY_INTERVAL:-1}"
+    local attempt
+
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        partial_install_singbox_runtime_is_ready "$init_system" && return 0
+        [ "$attempt" -eq "$attempts" ] || sleep "$interval" || return 1
+    done
+    return 1
+}
+
+wait_for_partial_install_argo_stably_active() {
+    local init_system="${1:-}"
+    local attempts="${PARTIAL_INSTALL_READY_ATTEMPTS:-12}"
+    local interval="${PARTIAL_INSTALL_READY_INTERVAL:-1}"
+    local attempt stable_checks=0
+
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        if partial_install_service_is_active "$init_system" argo; then
+            stable_checks=$((stable_checks + 1))
+            [ "$stable_checks" -ge 2 ] && return 0
+        else
+            stable_checks=0
+        fi
+        [ "$attempt" -eq "$attempts" ] || sleep "$interval" || return 1
+    done
+    return 1
+}
+
 start_pending_install_services() {
-    local init_system="${1:-}" service_name runtime_status
+    local init_system="${1:-}" service_name runtime_status service_was_active
 
     case "$init_system" in systemd|openrc) ;; *) return 1 ;; esac
     for service_name in sing-box argo; do
-        if ! partial_install_service_is_active "$init_system" "$service_name"; then
+        service_was_active=0
+        partial_install_service_is_active "$init_system" "$service_name" && service_was_active=1
+        if [ "$service_name" = sing-box ]; then
+            if validate_partial_install_resume_runtime "$init_system"; then
+                runtime_status=0
+            else
+                runtime_status=$?
+            fi
+            [ "$runtime_status" -eq 0 ] || return "$runtime_status"
+            service_was_active=0
+            partial_install_service_is_active "$init_system" sing-box && service_was_active=1
+        fi
+        if [ "$service_was_active" -eq 0 ]; then
             case "$init_system" in
                 systemd) systemctl start "$service_name" >/dev/null 2>&1 || return 1 ;;
                 openrc) rc-service "$service_name" start >/dev/null 2>&1 || return 1 ;;
             esac
         fi
-        partial_install_service_is_active "$init_system" "$service_name" || return 1
         if [ "$service_name" = sing-box ]; then
-            validate_partial_install_resume_runtime "$init_system"
-            runtime_status=$?
-            [ "$runtime_status" -eq 0 ] || return "$runtime_status"
+            wait_for_partial_install_singbox_ready "$init_system" || return 1
+        else
+            wait_for_partial_install_argo_stably_active "$init_system" || return 1
         fi
     done
 }
@@ -807,6 +953,7 @@ prepare_partial_install_resume() {
     state_file=$(partial_install_state_path) || return 2
     [ -e "$state_file" ] || [ -L "$state_file" ] || return 1
     load_partial_install_resume_state || return 2
+    validate_partial_install_argo_resume "$init_system" || return 2
     validate_installed_singbox_config_strict || return 2
     validate_partial_install_config_credentials || return 2
     validate_partial_install_config_ports || return 2
@@ -5777,6 +5924,37 @@ restart_argo()   { manage_service "argo" "restart"; }
 start_nginx()    { manage_service "nginx" "start"; }
 restart_nginx()  { manage_service "nginx" "restart"; }
 
+query_nginx_service_state() {
+    local init_system raw_status
+
+    if ! init_system=$(detect_usable_init_system); then
+        printf 'error\n'
+        return 0
+    fi
+    case "$init_system" in
+        systemd)
+            if systemctl is-active --quiet nginx >/dev/null 2>&1; then
+                raw_status=0
+            else
+                raw_status=$?
+            fi
+            ;;
+        openrc)
+            if rc-service nginx status >/dev/null 2>&1; then
+                raw_status=0
+            else
+                raw_status=$?
+            fi
+            ;;
+        *) raw_status=1 ;;
+    esac
+    case "$raw_status" in
+        0) printf 'active\n' ;;
+        3) printf 'inactive\n' ;;
+        *) printf 'error\n' ;;
+    esac
+}
+
 nginx_service_is_active() {
     local init_system
 
@@ -9831,16 +10009,22 @@ rotate_subscription_token() {
 }
 
 _stop_subscription_service_locked() {
+    local nginx_state
+
     if command_exists nginx; then
         detect_usable_init_system >/dev/null || return 1
-        if nginx_service_is_active; then
-            stop_nginx_checked || return 1
-            if nginx_service_is_active; then
-                return 1
-            fi
-        else
-            red "nginx not running"
-        fi
+        nginx_state=$(query_nginx_service_state) || return 1
+        case "$nginx_state" in
+            inactive)
+                red "nginx not running"
+                ;;
+            active)
+                stop_nginx_checked || return 1
+                nginx_state=$(query_nginx_service_state) || return 1
+                [ "$nginx_state" = inactive ] || return 1
+                ;;
+            error|*) return 1 ;;
+        esac
     else
         yellow "nginx未安装，节点订阅本来就未运行。"
     fi

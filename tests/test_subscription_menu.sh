@@ -518,6 +518,7 @@ for function_name in \
     rollback_subscription_frontend_signal_transaction \
     prepare_subscription_frontend_state_transaction \
     commit_subscription_frontend_state_transaction \
+    query_nginx_service_state \
     _stop_subscription_service_locked \
     _start_subscription_service_locked; do
     function_source="$(extract_function "$function_name")"
