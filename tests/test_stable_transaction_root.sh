@@ -17,6 +17,7 @@ extract_function() {
 }
 
 for function_name in \
+    clear_inherited_transaction_lock_state \
     command_exists \
     transaction_root_path \
     transaction_expected_dir_mode \
@@ -44,7 +45,9 @@ for function_name in \
     release_safe_legacy_lock \
     acquire_transaction_lock_with_legacy \
     release_transaction_lock_with_legacy \
-    with_transaction_lock_with_legacy; do
+    with_transaction_lock_with_legacy \
+    with_subscription_lock \
+    dispatch_cli_action; do
     function_source="$(extract_function "$function_name")"
     [ -n "$function_source" ] || fail "${function_name} is not implemented"
     source <(printf '%s\n' "$function_source")
@@ -223,6 +226,33 @@ release_stable_transaction_lock firewall || fail 'could not release firewall loc
 release_stable_transaction_lock subscription || fail 'could not release subscription lock'
 release_stable_transaction_lock mutation || fail 'could not release mutation lock'
 
+# Same-kind re-entry is allowed only while that kind remains the highest rank.
+# Re-entering mutation after subscription would violate global lock order.
+mutation_path=$(stable_transaction_lock_path mutation)
+subscription_path=$(stable_transaction_lock_path subscription)
+acquire_stable_transaction_lock mutation 1 || fail 'could not acquire mutation for cross-rank re-entry test'
+acquire_stable_transaction_lock subscription 1 || fail 'could not acquire subscription for cross-rank re-entry test'
+mutation_depth_before=${STABLE_TX_MUTATION_DEPTH:-}
+mutation_fd_before=${STABLE_TX_MUTATION_FD:-}
+subscription_depth_before=${STABLE_TX_SUBSCRIPTION_DEPTH:-}
+subscription_fd_before=${STABLE_TX_SUBSCRIPTION_FD:-}
+set +e
+acquire_stable_transaction_lock mutation 1
+order_status=$?
+set -e
+[ "$order_status" -eq 2 ] || \
+    fail "mutation re-entry below subscription returned ${order_status}, expected 2"
+[ "${STABLE_TX_MUTATION_DEPTH:-}" = "$mutation_depth_before" ] && \
+    [ "${STABLE_TX_MUTATION_FD:-}" = "$mutation_fd_before" ] || \
+    fail 'rejected mutation re-entry changed mutation state'
+[ "${STABLE_TX_SUBSCRIPTION_DEPTH:-}" = "$subscription_depth_before" ] && \
+    [ "${STABLE_TX_SUBSCRIPTION_FD:-}" = "$subscription_fd_before" ] || \
+    fail 'rejected mutation re-entry changed subscription state'
+release_stable_transaction_lock subscription || fail 'could not release subscription after rejected re-entry'
+release_stable_transaction_lock mutation || fail 'could not release mutation after rejected re-entry'
+flock -n "$subscription_path" -c true || fail 'rejected re-entry leaked subscription kernel lock'
+flock -n "$mutation_path" -c true || fail 'rejected re-entry leaked mutation kernel lock'
+
 acquire_stable_transaction_lock subscription 1 || fail 'could not acquire standalone subscription lock'
 set +e
 acquire_stable_transaction_lock mutation 1
@@ -292,6 +322,48 @@ stable_transaction_lock_is_held subscription && fail 'locked callback leaked sub
 flock -n "$(stable_transaction_lock_path subscription)" -c true || \
     fail 'locked callback leaked the kernel subscription lock'
 
+# Exported in-process bookkeeping is untrusted at a fresh script boundary. A
+# real CLI dispatch must clear it and contend on the kernel lock, not execute
+# its management callback under a forged held-lock flag.
+grep -Fq 'clear_inherited_transaction_lock_state || exit 2' "$script" || \
+    fail 'top-level Sing-box entry does not clear inherited transaction state'
+polluted_dispatch_ready="${tmp_root}/polluted-dispatch.ready"
+polluted_dispatch_marker="${tmp_root}/polluted-dispatch.callback"
+polluted_subscription_path=$(stable_transaction_lock_path subscription)
+(
+    exec 9>>"$polluted_subscription_path"
+    flock -x 9
+    : > "$polluted_dispatch_ready"
+    sleep 1
+) & polluted_holder_pid=$!
+for _ in {1..100}; do
+    [ -e "$polluted_dispatch_ready" ] && break
+    sleep 0.01
+done
+[ -e "$polluted_dispatch_ready" ] || fail 'polluted dispatch holder did not start'
+set +e
+(
+    export SUBSCRIPTION_LOCK_HELD=1
+    export STABLE_TX_MUTATION_DEPTH=9 STABLE_TX_MUTATION_FD=91
+    export STABLE_TX_SUBSCRIPTION_DEPTH=9 STABLE_TX_SUBSCRIPTION_FD=92
+    export STABLE_TX_FIREWALL_DEPTH=9 STABLE_TX_FIREWALL_FD=93
+    export LEGACY_TX_MUTATION_DEPTH=9 LEGACY_TX_MUTATION_FD=94 LEGACY_TX_MUTATION_PATH=/tmp/forged-mutation
+    export LEGACY_TX_SUBSCRIPTION_DEPTH=9 LEGACY_TX_SUBSCRIPTION_FD=95 LEGACY_TX_SUBSCRIPTION_PATH=/tmp/forged-subscription
+    export LEGACY_TX_FIREWALL_DEPTH=9 LEGACY_TX_FIREWALL_FD=96 LEGACY_TX_FIREWALL_PATH=/tmp/forged-firewall
+    SUBSCRIPTION_LOCK_FILE="${tmp_root}/absent-polluted-legacy.lock"
+    SUBSCRIPTION_LOCK_TIMEOUT_SECONDS=0
+    polluted_dispatch_callback() { : > "$polluted_dispatch_marker"; }
+    check_nodes() { with_subscription_lock polluted_dispatch_callback; }
+    clear_inherited_transaction_lock_state || exit 90
+    dispatch_cli_action -c
+)
+polluted_dispatch_status=$?
+set -e
+wait "$polluted_holder_pid"
+[ "$polluted_dispatch_status" -eq 1 ] || \
+    fail "polluted real dispatch returned ${polluted_dispatch_status}, expected stable contention rc=1"
+[ ! -e "$polluted_dispatch_marker" ] || fail 'polluted real dispatch bypassed the stable lock'
+
 # Safe legacy bridging is stable-first, never creates an absent old path, and
 # holds both locks until reverse-order release.
 legacy_dir="${tmp_root}/legacy"
@@ -351,6 +423,33 @@ set -e
 wait "$legacy_holder_pid"
 [ "$legacy_contention_status" -eq 1 ] || \
     fail "legacy lock contention returned ${legacy_contention_status}, expected 1"
+
+# If the legacy acquire is merely contended but cleanup of the already-held
+# stable lock becomes uncertain, the cleanup failure must dominate as rc=2.
+flock -x "$legacy_subscription" -c 'sleep 2' &
+legacy_holder_pid=$!
+sleep 0.1
+stable_transaction_lock_hook() {
+    [ "${1:-}" != released ]
+}
+set +e
+acquire_transaction_lock_with_legacy subscription "$legacy_subscription" 0
+legacy_cleanup_status=$?
+set -e
+stable_transaction_lock_hook() {
+    :
+}
+wait "$legacy_holder_pid"
+[ "$legacy_cleanup_status" -eq 2 ] || \
+    fail "legacy contention plus stable release failure returned ${legacy_cleanup_status}, expected 2"
+[ "${STABLE_TX_SUBSCRIPTION_DEPTH:-0}" -eq 0 ] && \
+    [ -z "${STABLE_TX_SUBSCRIPTION_FD:-}" ] || \
+    fail 'failed bridge cleanup leaked stable subscription state'
+[ "${LEGACY_TX_SUBSCRIPTION_DEPTH:-0}" -eq 0 ] && \
+    [ -z "${LEGACY_TX_SUBSCRIPTION_FD:-}" ] || \
+    fail 'failed bridge cleanup leaked legacy subscription state'
+flock -n "$(stable_transaction_lock_path subscription)" -c true || \
+    fail 'failed bridge cleanup leaked the stable kernel lock'
 
 legacy_transaction_lock_hook() {
     [ "${1:-}" != skipped ]

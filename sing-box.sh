@@ -8,6 +8,19 @@
 
 export LANG=en_US.UTF-8
 umask 077
+
+clear_inherited_transaction_lock_state() {
+    unset \
+        SUBSCRIPTION_LOCK_HELD \
+        STABLE_TX_MUTATION_DEPTH STABLE_TX_MUTATION_FD \
+        STABLE_TX_SUBSCRIPTION_DEPTH STABLE_TX_SUBSCRIPTION_FD \
+        STABLE_TX_FIREWALL_DEPTH STABLE_TX_FIREWALL_FD \
+        LEGACY_TX_MUTATION_DEPTH LEGACY_TX_MUTATION_FD LEGACY_TX_MUTATION_PATH \
+        LEGACY_TX_SUBSCRIPTION_DEPTH LEGACY_TX_SUBSCRIPTION_FD LEGACY_TX_SUBSCRIPTION_PATH \
+        LEGACY_TX_FIREWALL_DEPTH LEGACY_TX_FIREWALL_FD LEGACY_TX_FIREWALL_PATH
+}
+
+clear_inherited_transaction_lock_state || exit 2
 # 定义颜色
 re="\033[0m"
 red="\033[1;91m"
@@ -458,13 +471,13 @@ acquire_stable_transaction_lock() {
     esac
     depth="${!depth_var:-0}"
     [[ "$depth" =~ ^[0-9]+$ ]] || return 2
+    highest_rank=$(stable_transaction_highest_rank) || return 2
+    [ "$highest_rank" -le "$rank" ] || return 2
     if [ "$depth" -gt 0 ]; then
         printf -v "$depth_var" '%s' "$((depth + 1))"
         return 0
     fi
 
-    highest_rank=$(stable_transaction_highest_rank) || return 2
-    [ "$highest_rank" -le "$rank" ] || return 2
     command_exists flock || return 1
     ensure_stable_transaction_root || return $?
     lock_path=$(stable_transaction_lock_path "$kind") || return 2
@@ -649,13 +662,14 @@ release_safe_legacy_lock() {
 
 acquire_transaction_lock_with_legacy() {
     local kind="${1:-}" legacy_path="${2:-}" timeout_seconds="${3:-${STABLE_TRANSACTION_LOCK_TIMEOUT_SECONDS:-30}}"
-    local status
+    local status stable_release_status=0
 
     acquire_stable_transaction_lock "$kind" "$timeout_seconds" || return $?
     acquire_safe_legacy_lock "$kind" "$legacy_path" "$timeout_seconds"
     status=$?
     if [ "$status" -ne 0 ]; then
-        release_stable_transaction_lock "$kind" >/dev/null 2>&1 || true
+        release_stable_transaction_lock "$kind" >/dev/null 2>&1 || stable_release_status=$?
+        [ "$stable_release_status" -eq 0 ] || return 2
         return "$status"
     fi
 }

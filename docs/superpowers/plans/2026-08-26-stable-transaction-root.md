@@ -150,7 +150,7 @@ acquire_safe_legacy_lock KIND PATH [TIMEOUT]
 release_safe_legacy_lock KIND
 ```
 
-Use one permanent fd and one depth counter per kind. Reject acquiring rank 1 while rank 2/3 is held, or rank 2 while rank 3 is held, with rc=2. A repeated same-kind acquisition is re-entrant. Use `flock -x -w`; rc=1 means bounded contention, rc=2 means unsafe/corrupt/order violation. Release in reverse order and keep permanent files untouched.
+Use one permanent fd and one depth counter per kind. Reject acquiring rank 1 while rank 2/3 is held, or rank 2 while rank 3 is held, with rc=2. A repeated same-kind acquisition is re-entrant only while that kind remains the highest held rank; re-entering a lower rank after a higher one is held is still an rc=2 order violation, and cleanup uncertainty while unwinding a failed legacy acquire also dominates as rc=2. Use `flock -x -w`; rc=1 means bounded contention, rc=2 means unsafe/corrupt/order violation. Release in reverse order and keep permanent files untouched.
 
 The bridge rules are:
 
