@@ -9057,6 +9057,69 @@ migrate_legacy_manager_shortcuts() {
     rm -f "$wrapper_backup"
 }
 
+# Older installations sometimes added an `sb` alias that launches the core
+# binary directly. Bash aliases take precedence over PATH, so that one legacy
+# line prevents the local manager wrapper from ever being reached. Match only
+# the known historical target and leave custom aliases untouched.
+is_legacy_sb_binary_alias_line() {
+    local line="${1:-}"
+    local normalized
+
+    line="${line%%#*}"
+    normalized=$(printf '%s' "$line" | tr -d '[:space:]')
+    case "$normalized" in
+        'aliassb=/usr/local/bin/sing-box'|\
+        "aliassb='/usr/local/bin/sing-box'"|\
+        'aliassb="/usr/local/bin/sing-box"') return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+remove_legacy_sb_binary_aliases() {
+    local install_root="${1:-}"
+    local root_home="${install_root}/root"
+    local startup_file tmp_file line
+    local changed
+
+    for startup_file in \
+        "${root_home}/.bashrc" \
+        "${root_home}/.bash_profile" \
+        "${root_home}/.bash_aliases" \
+        "${root_home}/.profile"; do
+        [ -e "$startup_file" ] || continue
+        if [ -L "$startup_file" ] || [ ! -f "$startup_file" ]; then
+            yellow "跳过非普通 shell 配置文件：${startup_file}\n"
+            return 1
+        fi
+
+        tmp_file=$(mktemp "$(dirname "$startup_file")/.sb-alias.XXXXXX") || return 1
+        if ! cp -p "$startup_file" "$tmp_file" || ! : > "$tmp_file"; then
+            rm -f "$tmp_file"
+            return 1
+        fi
+        changed=0
+        while IFS= read -r line || [ -n "$line" ]; do
+            if is_legacy_sb_binary_alias_line "$line"; then
+                changed=1
+                continue
+            fi
+            if ! printf '%s\n' "$line" >> "$tmp_file"; then
+                rm -f "$tmp_file"
+                return 1
+            fi
+        done < "$startup_file"
+
+        if [ "$changed" -eq 1 ]; then
+            if ! mv -f "$tmp_file" "$startup_file"; then
+                rm -f "$tmp_file"
+                return 1
+            fi
+        else
+            rm -f "$tmp_file"
+        fi
+    done
+}
+
 # 创建快捷指令
 create_shortcut() {
     local shortcut_root="${1:-${SHORTCUT_ROOT:-}}"
@@ -9087,6 +9150,9 @@ create_shortcut() {
     ln -sfn "$wrapper_target" "$local_sb" || return 1
     ln -sfn "$wrapper_target" "$usr_sb" || return 1
     ln -sfn "$singbox_target" "$singbox_link" || return 1
+    if ! remove_legacy_sb_binary_aliases "$shortcut_root"; then
+        yellow "未能安全清理旧版 sb 核心程序别名，请检查 root 的 shell 配置。\n"
+    fi
     if [ -x "$manager_file" ] && [ -x "$wrapper_file" ] && \
        [ "$(readlink "$local_sb" 2>/dev/null)" = "$wrapper_target" ] && \
        [ "$(readlink "$usr_sb" 2>/dev/null)" = "$wrapper_target" ] && \
@@ -9169,6 +9235,9 @@ update_shortcut() {
     local manager_existed=0 previous_existed=0 rollback_ok=1
 
     mkdir -p "$manager_dir" || return 1
+    if ! remove_legacy_sb_binary_aliases "$install_root"; then
+        yellow "未能安全清理旧版 sb 核心程序别名，请检查 root 的 shell 配置。\n"
+    fi
     if [ -e "$manager_file" ]; then
         manager_existed=1
         manager_backup=$(mktemp "${manager_dir}/.sing-box.sh.update-rollback.XXXXXX") || return 1

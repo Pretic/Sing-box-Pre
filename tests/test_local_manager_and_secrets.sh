@@ -88,6 +88,8 @@ for function_name in \
     write_local_manager_wrapper \
     is_legacy_raw_manager_wrapper \
     migrate_legacy_manager_shortcuts \
+    is_legacy_sb_binary_alias_line \
+    remove_legacy_sb_binary_aliases \
     create_shortcut \
     update_local_manager \
     update_shortcut \
@@ -113,7 +115,17 @@ shortcut_root="${tmp_dir}/shortcut"
 manager_source="${tmp_dir}/manager-source.sh"
 offline_bin="${tmp_dir}/offline-bin"
 offline_curl_log="${tmp_dir}/offline-curl.log"
-mkdir -p "${shortcut_root}/etc/sing-box" "$offline_bin"
+mkdir -p "${shortcut_root}/etc/sing-box" "${shortcut_root}/root" "$offline_bin"
+printf '%s\n' \
+    'alias sb=/usr/local/bin/sing-box' \
+    'alias sing-box=/usr/local/bin/sing-box' \
+    "alias ll='ls -l'" \
+    > "${shortcut_root}/root/.bashrc"
+printf '%s\n' \
+    "alias sb='/usr/local/bin/sing-box'" \
+    'alias sb="/usr/local/bin/sing-box" # historical shortcut' \
+    'alias sb=/opt/custom/sb-manager' \
+    > "${shortcut_root}/root/.profile"
 printf '%s\n' '#!/bin/bash' 'printf "fixture manager:%s\\n" "$*"' > "$manager_source"
 printf '%s\n' '#!/bin/bash' 'exit 0' > "${shortcut_root}/etc/sing-box/sing-box"
 chmod 700 "${shortcut_root}/etc/sing-box/sing-box"
@@ -147,6 +159,18 @@ assert_equal "${shortcut_root}/etc/sing-box/sb.sh" \
     "$(readlink "${shortcut_root}/usr/bin/sb")" 'usr sb link target'
 assert_equal "${shortcut_root}/etc/sing-box/sing-box" \
     "$(readlink "${shortcut_root}/usr/local/bin/sing-box")" 'sing-box binary link target'
+! grep -Fqx 'alias sb=/usr/local/bin/sing-box' "${shortcut_root}/root/.bashrc" || \
+    fail 'create_shortcut kept the legacy unquoted sb binary alias'
+! grep -Fqx "alias sb='/usr/local/bin/sing-box'" "${shortcut_root}/root/.profile" || \
+    fail 'create_shortcut kept the legacy single-quoted sb binary alias'
+! grep -Fq 'alias sb="/usr/local/bin/sing-box"' "${shortcut_root}/root/.profile" || \
+    fail 'create_shortcut kept the legacy double-quoted sb binary alias'
+grep -Fqx 'alias sing-box=/usr/local/bin/sing-box' "${shortcut_root}/root/.bashrc" || \
+    fail 'create_shortcut removed the independent sing-box binary alias'
+grep -Fqx "alias ll='ls -l'" "${shortcut_root}/root/.bashrc" || \
+    fail 'create_shortcut changed an unrelated shell alias'
+grep -Fqx 'alias sb=/opt/custom/sb-manager' "${shortcut_root}/root/.profile" || \
+    fail 'create_shortcut removed a custom sb manager alias'
 shortcut_output="$(OFFLINE_CURL_LOG="$offline_curl_log" PATH="${offline_bin}:$PATH" \
     "${shortcut_root}/usr/local/bin/sb" --offline-check)" || \
     fail 'locally installed sb did not run offline'
@@ -162,7 +186,11 @@ legacy_root="${tmp_dir}/legacy-update"
 legacy_wrapper="${legacy_root}/etc/sing-box/sb.sh"
 legacy_manager="${legacy_root}/usr/local/lib/sing-box-pre/sing-box.sh"
 mkdir -p "${legacy_root}/etc/sing-box" \
-    "${legacy_root}/usr/local/bin" "${legacy_root}/usr/bin"
+    "${legacy_root}/usr/local/bin" "${legacy_root}/usr/bin" "${legacy_root}/root"
+printf '%s\n' \
+    'alias sb=/usr/local/bin/sing-box # installed by an older release' \
+    'alias sb=/opt/custom/sb-manager' \
+    > "${legacy_root}/root/.bashrc"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'exec bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) "$@"' \
@@ -198,6 +226,10 @@ curl() {
 assert_ok update_shortcut "$legacy_root" 'https://updates.example.test/sing-box.sh'
 grep -Fqx 'https://updates.example.test/sing-box.sh' "$curl_log" || \
     fail 'legacy explicit update did not use the requested manager URL'
+! grep -Fq 'alias sb=/usr/local/bin/sing-box' "${legacy_root}/root/.bashrc" || \
+    fail 'update_shortcut kept the legacy sb binary alias'
+grep -Fqx 'alias sb=/opt/custom/sb-manager' "${legacy_root}/root/.bashrc" || \
+    fail 'update_shortcut removed a custom sb manager alias'
 assert_equal "$legacy_wrapper" "$(readlink "${legacy_root}/usr/local/bin/sb")" \
     'legacy managed sb link target after migration'
 assert_equal '/opt/custom/sb-manager' "$(readlink "${legacy_root}/usr/bin/sb")" \
