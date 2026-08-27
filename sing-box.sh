@@ -13064,6 +13064,49 @@ rotate_warp_identity_once() {
     return 1
 }
 
+warp_rotation_now() {
+    date +%s
+}
+
+rotate_warp_identity_until_new() {
+    local max_batches="${WARP_ROTATION_MAX_BATCHES:-4}"
+    local max_seconds="${WARP_ROTATION_MAX_SECONDS:-600}"
+    local started_at now batch rotate_rc elapsed
+
+    case "$max_batches" in ''|*[!0-9]*) max_batches=4 ;; esac
+    case "$max_seconds" in ''|*[!0-9]*) max_seconds=600 ;; esac
+    [ "$max_batches" -lt 1 ] && max_batches=1
+    [ "$max_batches" -gt 12 ] && max_batches=12
+    [ "$max_seconds" -lt 60 ] && max_seconds=60
+    [ "$max_seconds" -gt 3600 ] && max_seconds=3600
+
+    started_at=$(warp_rotation_now) || return 1
+    for ((batch=1; batch<=max_batches; batch++)); do
+        if [ "$batch" -gt 1 ]; then
+            now=$(warp_rotation_now) || return 1
+            elapsed=$((now - started_at))
+            if [ "$elapsed" -ge "$max_seconds" ]; then
+                red "WARP 身份更换达到 ${max_seconds} 秒时间上限，未获得不同出口。"
+                return 1
+            fi
+        fi
+        yellow "正在执行 WARP 更换批次 ${batch}/${max_batches}（每批最多 5 个候选）..."
+        if rotate_warp_identity_once; then
+            return 0
+        else
+            rotate_rc=$?
+        fi
+        case "$rotate_rc" in
+          1) ;;
+          2) return 2 ;;
+          *) return "$rotate_rc" ;;
+        esac
+        [ "$batch" -lt "$max_batches" ] && sleep 10
+    done
+    red "WARP 身份更换已达到 ${max_batches} 批上限，未获得不同出口。"
+    return 1
+}
+
 auto_select_warp_candidate() {
     local selection="${1:-1234}" active_ip candidate_dir candidate_endpoint attempt candidate_ip activate_rc generate_rc
     local proxy_started probe_ok
@@ -14389,7 +14432,7 @@ native_ipv6_available() {
 
 dispatch_warp_rotation_menu_action() {
     local rotate_rc
-    if rotate_warp_identity_once; then
+    if rotate_warp_identity_until_new; then
         return 0
     else
         rotate_rc=$?

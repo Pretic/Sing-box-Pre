@@ -18,7 +18,7 @@ ROTATE_RESULT=0
 red() { LOG+="red:$*"$'\n'; }
 green() { LOG+="green:$*"$'\n'; }
 yellow() { LOG+="yellow:$*"$'\n'; }
-rotate_warp_identity_once() { return "$ROTATE_RESULT"; }
+rotate_warp_identity_until_new() { return "$ROTATE_RESULT"; }
 
 ROTATE_RESULT=0
 LOG=''
@@ -44,5 +44,7 @@ if dispatch_warp_rotation_menu_action; then rc2=0; else rc2=$?; fi
 menu_block=$(sed -n '/^warp_manage() {/,/^}/p' "$script")
 grep -Fq 'dispatch_warp_rotation_menu_action' <<< "$menu_block" || \
   fail 'WARP menu option does not use the status-aware rotation dispatcher'
+grep -Fq 'rotate_warp_identity_until_new' <<< "$dispatch_block" || \
+  fail 'WARP rotation dispatcher does not use the bounded multi-batch controller'
 
 echo 'WARP menu dispatch tests passed.'
