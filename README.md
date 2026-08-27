@@ -117,6 +117,9 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 
 ## 订阅与 cfy 联动
 
+- cfy 仍是独立项目、独立命令和独立更新周期，Sing-box 不复制或改写其节点生成逻辑。可从主菜单 `11. Cloudflare 节点优选（cfy）` 或 `sb --cfy` 进入；子菜单可运行 cfy、查看最近结果、调用 `cfy --update`，退出后返回 sb。
+- 首次运行且 `/usr/local/bin/cfy` 不存在时，sb 才会自动安装。安装内容固定到已验证的 cfy 提交与 SHA-256，使用带超时的 `curl -fsSL` 下载到目标同目录临时文件，依次通过非空、Bash 语法、功能标识及摘要校验后无覆盖发布；不会执行空脚本或直接使用 `curl | bash`。
+- cfy 下载、安装或运行失败不会重启 sing-box、Argo、Nginx，不会更改端口、基础节点或已有服务配置；cfy 自身仍通过原有事务发布规则保留最近一次成功结果。成功运行后才更新 cfy 优选结果及综合订阅。
 - 对外订阅地址默认使用 IPv4 公网地址生成，避免 VPS 没有 IPv6 时订阅 URL 不可访问；默认等同 `SUB_ADDR_FAMILY=ipv4`。
 - 如需指定订阅地址主机名或 IP，可在安装前设置 `SUB_HOST=你的域名或IP`；如需优先 IPv6，可设置 `SUB_ADDR_FAMILY=ipv6`；如需自动探测可设置 `SUB_ADDR_FAMILY=auto`。
 - `/etc/sing-box/url.txt` 保留基础节点明文，`/etc/sing-box/base-sub.txt` 保留基础节点 Base64 订阅。
@@ -188,6 +191,7 @@ HTTPS 只有在脚本从公网取得的内容与本机 `/etc/sing-box/sub.txt` �
       --update      仅更新 sb 快捷命令，不修改已有节点
   -c, --check       查看节点信息和订阅链接
   -r, --restart     重新获取 Argo 临时隧道并更新到订阅
+      --cfy         进入 Cloudflare 节点优选（cfy）菜单
   -u, --uninstall   无交互卸载 sing-box（保留 nginx）
       --purge-nginx  卸载 sing-box 并同时卸载 nginx
   -h, --help        显示帮助信息

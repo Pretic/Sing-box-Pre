@@ -40,6 +40,7 @@ for function_name in \
     detect_argo_tunnel_mode \
     get_quick_tunnel \
     refresh_quick_argo \
+    manage_cfy \
     dispatch_cli_action \
     dispatch_argo_menu_action \
     manage_argo; do
@@ -365,6 +366,7 @@ update_shortcut() { return 42; }
 auto_uninstall() { return 43; }
 check_nodes() { return 44; }
 refresh_quick_argo() { return 45; }
+manage_cfy() { return 46; }
 
 assert_dispatch_status() {
     local expected="$1"
@@ -383,6 +385,7 @@ for action in --update --upgrade; do assert_dispatch_status 42 "$action"; done
 for action in -u --uninstall --purge-nginx; do assert_dispatch_status 43 "$action"; done
 for action in -c --check; do assert_dispatch_status 44 "$action"; done
 for action in -r --restart; do assert_dispatch_status 45 "$action"; done
+assert_dispatch_status 46 --cfy
 for action in -h --help; do assert_dispatch_status 0 "$action"; done
 assert_dispatch_status 1 --unknown-action
 

@@ -16227,6 +16227,214 @@ manage_protocols() {
     manage_protocols
 }
 
+# 独立 cfy 模块的安全安装与前台调用。cfy 保留自己的代码、命令和更新周期；
+# 此处只提供入口，不复制节点生成逻辑，也不触碰 sing-box 服务配置。
+cfy_executable_path() {
+    printf '%s\n' "${SB_CFY_EXECUTABLE:-/usr/local/bin/cfy}"
+}
+
+cfy_download_url() {
+    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/e4a4778045669afe15bfdda821cdf26c86c2af46/cfy.sh}"
+}
+
+cfy_expected_download_sha256() {
+    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-2b10ad70a28e3f974695dedab2ef582b2950e2bc2252ab6f8291b3b43db11c5a}"
+}
+
+validate_cfy_target_path() {
+    local target="${1:-}"
+
+    [ -n "$target" ] && [[ "$target" == /* ]] && [ "$target" != / ] && \
+        [[ "$target" != */ ]] && [[ "$target" != *'//'* ]] && \
+        [[ "$target" != *$'\n'* && "$target" != *$'\r'* ]] || return 1
+    case "/${target#/}/" in
+        */../*|*/./*) return 1 ;;
+    esac
+}
+
+validate_cfy_script() {
+    local script_file="${1:-}"
+
+    [ -n "$script_file" ] && [ -f "$script_file" ] && [ ! -L "$script_file" ] && \
+        [ -s "$script_file" ] && [ -r "$script_file" ] || return 1
+    bash -n "$script_file" >/dev/null 2>&1 || return 1
+    grep -Fq 'CFY_SOURCE_GENERATION_FILE=' "$script_file" && \
+        grep -Fq 'ensure_stable_transaction_root()' "$script_file" && \
+        grep -Fq 'with_subscription_lock()' "$script_file" && \
+        grep -Fq 'publish_subscriptions_locked()' "$script_file"
+}
+
+validate_cfy_executable() {
+    local executable="${1:-}"
+
+    [ -n "$executable" ] && [ -f "$executable" ] && [ ! -L "$executable" ] && \
+        [ -x "$executable" ]
+}
+
+install_cfy() {
+    local target target_dir download_url expected_sha actual_sha
+    local connect_timeout="${SB_CFY_CONNECT_TIMEOUT:-10}"
+    local max_time="${SB_CFY_MAX_TIME:-30}"
+    local tmp_file=''
+
+    target=$(cfy_executable_path) || return 1
+    download_url=$(cfy_download_url) || return 1
+    expected_sha=$(cfy_expected_download_sha256) || return 1
+
+    validate_cfy_target_path "$target" || {
+        red "cfy 安装路径无效。"
+        return 1
+    }
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        validate_cfy_executable "$target" && return 0
+        red "已存在的 cfy 不是兼容的普通可执行文件，未覆盖：${target}"
+        return 1
+    fi
+
+    target_dir=$(dirname -- "$target") || return 1
+    [ -d "$target_dir" ] && [ ! -L "$target_dir" ] && [ -w "$target_dir" ] || {
+        red "cfy 安装目录不存在或不可安全写入：${target_dir}"
+        return 1
+    }
+    [[ "$download_url" =~ ^https://[^[:space:]]+$ ]] || {
+        red "cfy 下载地址必须是有效的 HTTPS 地址。"
+        return 1
+    }
+    [[ "$expected_sha" =~ ^[0-9A-Fa-f]{64}$ ]] || {
+        red "cfy 下载校验值无效。"
+        return 1
+    }
+    [[ "$connect_timeout" =~ ^[0-9]+$ ]] && [ "$connect_timeout" -ge 1 ] && \
+        [ "$connect_timeout" -le 120 ] && \
+        [[ "$max_time" =~ ^[0-9]+$ ]] && [ "$max_time" -ge "$connect_timeout" ] && \
+        [ "$max_time" -le 600 ] || {
+        red "cfy 下载超时设置无效。"
+        return 1
+    }
+    command -v curl >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 && \
+        command -v mktemp >/dev/null 2>&1 && command -v ln >/dev/null 2>&1 || {
+        red "安全安装 cfy 需要 curl、sha256sum、mktemp 和 ln。"
+        return 1
+    }
+
+    tmp_file=$(mktemp "${target_dir}/.cfy.install.XXXXXX") || return 1
+    if ! curl -fsSL --connect-timeout "$connect_timeout" --max-time "$max_time" \
+        -o "$tmp_file" "$download_url"; then
+        rm -f -- "$tmp_file"
+        red "cfy 下载失败，现有节点和服务未修改。"
+        return 1
+    fi
+    if [ ! -s "$tmp_file" ]; then
+        rm -f -- "$tmp_file"
+        red "cfy 下载内容为空，已取消安装。"
+        return 1
+    fi
+    actual_sha=$(sha256sum -- "$tmp_file" 2>/dev/null) || {
+        rm -f -- "$tmp_file"
+        return 1
+    }
+    actual_sha=${actual_sha%%[[:space:]]*}
+    if [ "${actual_sha,,}" != "${expected_sha,,}" ]; then
+        rm -f -- "$tmp_file"
+        red "cfy 下载校验失败，已取消安装。"
+        return 1
+    fi
+    if ! validate_cfy_script "$tmp_file" || ! chmod 755 "$tmp_file"; then
+        rm -f -- "$tmp_file"
+        red "cfy 内容或权限校验失败，已取消安装。"
+        return 1
+    fi
+
+    # 同目录硬链接加 -T，目标即使在下载后竞态变成目录或目录符号链接，
+    # 也只会失败而不会跟随目录发布，且仍保留 no-clobber 语义。
+    if ! ln -T -- "$tmp_file" "$target" 2>/dev/null; then
+        rm -f -- "$tmp_file"
+        red "cfy 安装目标已变化，未覆盖任何文件，请重试。"
+        return 1
+    fi
+    if ! rm -f -- "$tmp_file"; then
+        red "cfy 已安装，但临时文件清理失败：${tmp_file}"
+        return 2
+    fi
+    validate_cfy_executable "$target" || {
+        red "cfy 安装后校验失败，请手动检查：${target}"
+        return 2
+    }
+    green "cfy 已安全安装到 ${target}。"
+}
+
+run_cfy_existing() {
+    local executable
+
+    executable=$(cfy_executable_path) || return 1
+    validate_cfy_target_path "$executable" || {
+        red "cfy 可执行文件路径无效。"
+        return 1
+    }
+    validate_cfy_executable "$executable" || {
+        red "未找到兼容的 cfy，请先选择菜单项 1 运行 cfy 节点优选并完成安装。"
+        return 1
+    }
+    "$executable" "$@"
+}
+
+run_cfy() {
+    local executable
+
+    executable=$(cfy_executable_path) || return 1
+    validate_cfy_target_path "$executable" || {
+        red "cfy 可执行文件路径无效。"
+        return 1
+    }
+    if [ ! -e "$executable" ] && [ ! -L "$executable" ]; then
+        yellow "尚未安装 cfy，正在进行安全下载安装..."
+        install_cfy || return $?
+    fi
+    run_cfy_existing
+}
+
+manage_cfy() {
+    local cfy_choice status
+    # shellcheck disable=SC2034 # reading() 通过变量名动态写入该暂停占位符。
+    local cfy_pause
+
+    while true; do
+        clear; echo ""
+        green "=== Cloudflare 节点优选（cfy） ===\n"
+        green "1. 运行 cfy 节点优选"
+        green "2. 查看最近一次优选结果（cfy -c）"
+        green "3. 更新 cfy（cfy --update）"
+        purple "4. 返回 sb 主菜单"
+        echo "==============="
+        if ! reading "请输入选择: " cfy_choice; then
+            return 0
+        fi
+        echo ""
+        case "$cfy_choice" in
+            1)
+                if run_cfy; then status=0; else status=$?; fi
+                [ "$status" -eq 0 ] || yellow "cfy 已退出（状态 ${status}），sing-box 服务和已有节点未修改。"
+                ;;
+            2)
+                if run_cfy_existing -c; then status=0; else status=$?; fi
+                [ "$status" -eq 0 ] || yellow "无法查看 cfy 结果（状态 ${status}）。"
+                ;;
+            3)
+                if run_cfy_existing --update; then status=0; else status=$?; fi
+                [ "$status" -eq 0 ] || yellow "cfy 更新失败（状态 ${status}），sing-box 服务不受影响。"
+                ;;
+            4) return 0 ;;
+            *)
+                red "无效的选项，请输入 1-4"
+                continue
+                ;;
+        esac
+        if ! reading "按回车返回 cfy 菜单..." cfy_pause; then
+            return 0
+        fi
+    done
+}
+
 # 可测试的命令行参数分发
 dispatch_cli_action() {
     local action="${1:-}"
@@ -16246,6 +16454,7 @@ dispatch_cli_action() {
             check_nodes
             ;;
         -r|--restart) refresh_quick_argo "$service_file" ;;
+        --cfy) manage_cfy ;;
         -h|--help)
             echo ""
             green "用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)"
@@ -16254,6 +16463,7 @@ dispatch_cli_action() {
             green "      --update      显式更新本地 sb 管理脚本，不修改已有节点"
             green "  -c, --check       查看节点信息和订阅链接"
             green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
+            green "      --cfy         进入 Cloudflare 节点优选（cfy）菜单"
             green "  -u, --uninstall   uninstall sing-box and keep nginx"
             green "      --purge-nginx  uninstall sing-box and remove nginx"
             green "  -h, --help        显示此帮助信息"
@@ -16300,6 +16510,7 @@ menu() {
     green "9. 增加/删除协议"
     echo "==============="
     purple "10. ssh综合工具箱"
+    green "11. Cloudflare 节点优选（cfy）"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="
@@ -16324,7 +16535,7 @@ else
     # 无参数：进入交互式主菜单
     while true; do
             menu
-            reading "请输入选择(0-10): " choice
+            reading "请输入选择(0-11): " choice
             echo ""
             need_pause=true
             case "${choice}" in
@@ -16344,9 +16555,10 @@ else
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
+                11) manage_cfy; need_pause=false ;;
                 0)  exit 0 ;;
                 *)
-                    red "无效的选项，请输入 0-10"
+                    red "无效的选项，请输入 0-11"
                     need_pause=true
                     ;;
             esac
