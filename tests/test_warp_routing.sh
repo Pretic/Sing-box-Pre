@@ -147,6 +147,16 @@ jq -e '.endpoints | any(.tag == "custom-endpoint")' "$conf_dir/endpoints.json" >
     fail 'custom endpoint was not preserved'
 jq -e '.route.rule_set | any(.tag == "streaming")' "$route_file" >/dev/null || \
     fail 'streaming rule set was not added'
+streaming_url='https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-entertainment.srs'
+jq -e --arg url "$streaming_url" \
+    '.route.rule_set | any(.tag == "streaming" and .url == $url)' \
+    "$route_file" >/dev/null || \
+    fail 'streaming rule set does not use the verified full entertainment source'
+if grep -Fq 'geo-lite/geosite/proxymedia.srs' "$script"; then
+    fail 'incomplete proxymedia streaming source is still present'
+fi
+[[ "$(grep -Fc "$streaming_url" "$script")" -eq 2 ]] || \
+    fail 'initial and repair streaming rule declarations are not synchronized'
 jq -e '.route.rule_set | any(.tag == "custom")' "$route_file" >/dev/null || \
     fail 'custom rule set was not preserved'
 jq -e '.route.rules | any(.domain_suffix == ["example.com"])' "$route_file" >/dev/null || \
