@@ -12361,6 +12361,7 @@ generate_unique_warp_identity() {
           (if ($v6 | contains("/")) then $v6 else ($v6 + "/128") end)
         ],
         private_key:$private,
+        domain_resolver:{server:"local",strategy:"prefer_ipv4"},
         peers:[{
           address:"engage.cloudflareclient.com", port:2408,
           public_key:$peer, allowed_ips:["0.0.0.0/0","::/0"],
@@ -12438,12 +12439,20 @@ stop_warp_candidate_proxy() {
         wait "$WARP_PROBE_PID" 2>/dev/null || true
     fi
     [ "$safe_dir" = true ] && rm -rf -- "$WARP_PROBE_DIR"
-    unset WARP_PROBE_PID WARP_PROBE_DIR WARP_PROBE_PROXY WARP_PROBE_PORT
+    unset WARP_PROBE_PID WARP_PROBE_DIR WARP_PROBE_PROXY WARP_PROBE_PORT WARP_PROBE_FAMILY
 }
 
 start_warp_candidate_proxy() {
-    local endpoint_json="$1" singbox_bin port attempt
+    local endpoint_json="$1" family="${2:-4}" singbox_bin port attempt target_strategy
+    case "$family" in
+      4) target_strategy=prefer_ipv4 ;;
+      6) target_strategy=prefer_ipv6 ;;
+      *) return 1 ;;
+    esac
     warp_endpoint_is_valid "$endpoint_json" || return 1
+    endpoint_json=$(jq -c '
+      .domain_resolver = {server:"local",strategy:"prefer_ipv4"}
+    ' <<< "$endpoint_json") || return 1
     stop_warp_candidate_proxy
     mkdir -p "${conf_dir}/warp" && chmod 700 "${conf_dir}/warp"
     WARP_PROBE_DIR=$(mktemp -d "${conf_dir}/warp/.probe.XXXXXX") || return 1
@@ -12456,9 +12465,11 @@ start_warp_candidate_proxy() {
         fi
     done
     [ -n "${WARP_PROBE_PORT:-}" ] || { stop_warp_candidate_proxy; return 1; }
-    jq -n --argjson endpoint "$endpoint_json" --argjson port "$WARP_PROBE_PORT" '
+    jq -n --argjson endpoint "$endpoint_json" --argjson port "$WARP_PROBE_PORT" \
+      --arg strategy "$target_strategy" '
       {
         log:{level:"error"},
+        dns:{servers:[{tag:"local",type:"local"}],strategy:$strategy},
         inbounds:[{type:"mixed",tag:"warp-probe",listen:"127.0.0.1",listen_port:$port}],
         endpoints:[$endpoint],
         route:{final:"wireguard-out"}
@@ -12490,6 +12501,7 @@ start_warp_candidate_proxy() {
     done
     [ "$ready" = true ] || { stop_warp_candidate_proxy; return 1; }
     WARP_PROBE_PROXY="$probe_proxy"
+    WARP_PROBE_FAMILY="$family"
 }
 
 probe_warp_trace() {
@@ -12501,6 +12513,70 @@ probe_warp_trace() {
     WARP_PROBE_COLO=$(awk -F= '/^colo=/{print $2; exit}' <<< "$trace")
     WARP_PROBE_STATE=$(awk -F= '/^warp=/{print $2; exit}' <<< "$trace")
     [ -n "$WARP_PROBE_IP" ] && [[ "$WARP_PROBE_STATE" =~ ^(on|plus)$ ]]
+}
+
+get_warp_preferred_family() {
+    local family_file="${conf_dir}/warp/preferred-family" family=''
+
+    if [ -r "$family_file" ]; then
+        IFS= read -r family < "$family_file" || true
+    fi
+    case "$family" in
+      6) printf '%s\n' 6 ;;
+      *) printf '%s\n' 4 ;;
+    esac
+}
+
+write_warp_preferred_family() {
+    local family="${1:-}" state_dir="${conf_dir}/warp" family_file family_tmp
+
+    case "$family" in 4|6) ;; *) return 1 ;; esac
+    mkdir -p "$state_dir" && chmod 700 "$state_dir" || return 1
+    family_file="${state_dir}/preferred-family"
+    family_tmp=$(mktemp "${state_dir}/.preferred-family.XXXXXX") || return 1
+    if ! printf '%s\n' "$family" > "$family_tmp" || ! chmod 600 "$family_tmp" || \
+       ! mv -f "$family_tmp" "$family_file"; then
+        rm -f -- "$family_tmp"
+        return 1
+    fi
+}
+
+# 为 WARP 分流规则生成一个可重复渲染的 DNS 地址族偏好。
+# IPv6 模式只影响明确指向 wireguard-out 的规则集；IPv4 模式移除该托管规则。
+render_warp_route_family() {
+    local source_file="${1:-}" output_file="${2:-}" family="${3:-}"
+
+    [ -s "$source_file" ] && [ -n "$output_file" ] || return 1
+    case "$family" in 4|6) ;; *) return 1 ;; esac
+    jq --argjson family "$family" '
+      def managed_warp_resolve:
+        (.action? == "resolve") and
+        (.strategy? == "prefer_ipv6") and
+        (.network? == ["tcp", "udp"]) and
+        (((keys | sort) == ["action", "network", "rule_set", "strategy"]) or
+         ((keys | sort) == ["action", "network", "strategy"]));
+      def warp_route:
+        (.action? == "route") and (.outbound? == "wireguard-out");
+      .route = (if (.route | type) == "object" then .route else {} end) |
+      (.route.rules | if type == "array" then . else [] end) as $rules |
+      ([$rules[] | select(managed_warp_resolve | not)]) as $clean |
+      ([$clean[] | select(.action? == "sniff")]) as $sniff |
+      ([$clean[] | select(.action? != "sniff")]) as $rest |
+      (reduce ($rest[] | select(warp_route and ((.rule_set? | type) == "array")) | .rule_set[]) as $tag
+        ([]; if index($tag) then . else . + [$tag] end)) as $warp_tags |
+      ($rest | map(warp_route) | index(true)) as $first_warp |
+      if $family == 6 and ($warp_tags | length) > 0 and $first_warp != null then
+        .route.rules =
+          ($sniff + $rest[0:$first_warp] +
+           [{rule_set:$warp_tags,network:["tcp","udp"],action:"resolve",strategy:"prefer_ipv6"}] +
+           $rest[$first_warp:])
+      elif $family == 6 and (.route.final? == "wireguard-out") then
+        .route.rules =
+          ($sniff + [{network:["tcp","udp"],action:"resolve",strategy:"prefer_ipv6"}] + $rest)
+      else
+        .route.rules = ($sniff + $rest)
+      end
+    ' "$source_file" > "$output_file"
 }
 
 check_unlock_netflix() {
@@ -12876,20 +12952,25 @@ run_selected_unlock_checks() {
 }
 
 write_warp_status_cache() {
-    local selection="${1:-}" summary="${2:-}" cache="${conf_dir}/warp/status.json"
+    local selection="${1:-}" summary="${2:-}" family="${3:-${WARP_PROBE_FAMILY:-}}"
+    local cache="${conf_dir}/warp/status.json"
+    [ -n "$family" ] || family=$(get_warp_preferred_family)
     mkdir -p "${conf_dir}/warp" && chmod 700 "${conf_dir}/warp"
     jq -n --argjson checked "$(date +%s)" --arg ip "${WARP_PROBE_IP:-}" \
       --arg loc "${WARP_PROBE_LOC:-}" --arg colo "${WARP_PROBE_COLO:-}" \
-      --arg warp "${WARP_PROBE_STATE:-}" --arg selection "$selection" --arg summary "$summary" \
-      '{checked_at:$checked,ip:$ip,loc:$loc,colo:$colo,warp:$warp,selection:$selection,summary:$summary}' \
+      --arg warp "${WARP_PROBE_STATE:-}" --arg family "$family" \
+      --arg selection "$selection" --arg summary "$summary" \
+      '{checked_at:$checked,ip:$ip,loc:$loc,colo:$colo,warp:$warp,family:$family,selection:$selection,summary:$summary}' \
       > "${cache}.tmp" && chmod 600 "${cache}.tmp" && mv -f "${cache}.tmp" "$cache"
 }
 
 probe_active_warp() {
-    local endpoint
+    local family="${1:-}" endpoint
+    [ -n "$family" ] || family=$(get_warp_preferred_family)
+    case "$family" in 4|6) ;; *) return 1 ;; esac
     endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
     warp_endpoint_is_valid "$endpoint" || return 1
-    start_warp_candidate_proxy "$endpoint" || return 1
+    start_warp_candidate_proxy "$endpoint" "$family" || return 1
     probe_warp_trace "$WARP_PROBE_PROXY"
     local rc=$?
     stop_warp_candidate_proxy
@@ -12902,13 +12983,19 @@ remove_warp_activation_backup() {
 
 activate_warp_candidate() {
     local candidate_dir="$1" state_dir="${conf_dir}/warp" endpoint_file="${conf_dir}/endpoints.json"
-    local expected_ip="${2:-}" strict_selection="${3:-}" endpoint_json backup_dir endpoint_tmp
+    local expected_ip="${2:-}" strict_selection="${3:-}" family="${4:-4}"
+    local route_file="${conf_dir}/route.json" family_file="${state_dir}/preferred-family"
+    local endpoint_json backup_dir endpoint_tmp route_tmp family_tmp
     local cleanup_incomplete=false
+    case "$family" in 4|6) ;; *) return 1 ;; esac
     endpoint_json=$(extract_warp_endpoint "${candidate_dir}/endpoint.json" 2>/dev/null || true)
     warp_endpoint_is_valid "$endpoint_json" || return 1
+    [ -s "$route_file" ] && jq empty "$route_file" >/dev/null 2>&1 || return 1
+    mkdir -p "$state_dir" && chmod 700 "$state_dir" || return 1
     backup_dir=$(mktemp -d "${conf_dir}/.warp-activate.XXXXXX") || return 1
     chmod 700 "$backup_dir"
-    cp -p "$endpoint_file" "$backup_dir/endpoints.json" || {
+    cp -p "$endpoint_file" "$backup_dir/endpoints.json" && \
+      cp -p "$route_file" "$backup_dir/route.json" || {
         remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
         return 1
     }
@@ -12926,21 +13013,43 @@ activate_warp_candidate() {
         }
         : > "$backup_dir/had-endpoint"
     fi
+    if [ -s "$family_file" ]; then
+        cp -p "$family_file" "$backup_dir/preferred-family" || {
+            remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
+            return 1
+        }
+        : > "$backup_dir/had-family"
+    fi
     endpoint_tmp=$(mktemp "${conf_dir}/.endpoints.activate.XXXXXX") || {
         remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
         return 1
     }
-    if ! jq --argjson endpoint "$endpoint_json" '.endpoints=([.endpoints[]?|select(.tag!="wireguard-out")]+[$endpoint])' \
-      "$endpoint_file" > "$endpoint_tmp" || ! install -m 600 "${candidate_dir}/account.json" "$state_dir/account.json" || \
-      ! install -m 600 "${candidate_dir}/endpoint.json" "$state_dir/endpoint.json" || ! chmod 600 "$endpoint_tmp" || \
-      ! mv -f "$endpoint_tmp" "$endpoint_file" || ! validate_singbox_config || ! restart_singbox_checked || \
-      ! singbox_service_is_stably_active || \
-      ! verify_activated_warp "$expected_ip" "$strict_selection"; then
-        local rollback_ok=true
+    route_tmp=$(mktemp "${conf_dir}/.route.activate.XXXXXX") || {
         rm -f -- "$endpoint_tmp"
+        remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
+        return 1
+    }
+    family_tmp=$(mktemp "${state_dir}/.preferred-family.XXXXXX") || {
+        rm -f -- "$endpoint_tmp" "$route_tmp"
+        remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
+        return 1
+    }
+    if ! jq --argjson endpoint "$endpoint_json" '.endpoints=([.endpoints[]?|select(.tag!="wireguard-out")]+[$endpoint])' \
+      "$endpoint_file" > "$endpoint_tmp" || ! render_warp_route_family "$route_file" "$route_tmp" "$family" || \
+      ! printf '%s\n' "$family" > "$family_tmp" || ! chmod 600 "$endpoint_tmp" "$family_tmp" || \
+      ! chmod 644 "$route_tmp" || ! install -m 600 "${candidate_dir}/account.json" "$state_dir/account.json" || \
+      ! install -m 600 "${candidate_dir}/endpoint.json" "$state_dir/endpoint.json" || ! chmod 600 "$endpoint_tmp" || \
+      ! mv -f "$endpoint_tmp" "$endpoint_file" || ! mv -f "$route_tmp" "$route_file" || \
+      ! mv -f "$family_tmp" "$family_file" || ! validate_singbox_config || ! restart_singbox_checked || \
+      ! singbox_service_is_stably_active || \
+      ! verify_activated_warp "$expected_ip" "$strict_selection" "$family"; then
+        local rollback_ok=true
+        rm -f -- "$endpoint_tmp" "$route_tmp" "$family_tmp"
         install -m 600 "$backup_dir/endpoints.json" "$endpoint_file" || rollback_ok=false
+        install -m 644 "$backup_dir/route.json" "$route_file" || rollback_ok=false
         if [ -e "$backup_dir/had-account" ]; then install -m 600 "$backup_dir/account.json" "$state_dir/account.json" || rollback_ok=false; else rm -f -- "$state_dir/account.json" || rollback_ok=false; fi
         if [ -e "$backup_dir/had-endpoint" ]; then install -m 600 "$backup_dir/endpoint.json" "$state_dir/endpoint.json" || rollback_ok=false; else rm -f -- "$state_dir/endpoint.json" || rollback_ok=false; fi
+        if [ -e "$backup_dir/had-family" ]; then install -m 600 "$backup_dir/preferred-family" "$family_file" || rollback_ok=false; else rm -f -- "$family_file" || rollback_ok=false; fi
         restart_singbox_checked >/dev/null 2>&1 || rollback_ok=false
         singbox_service_is_stably_active || rollback_ok=false
         if [ "$rollback_ok" = true ]; then
@@ -12951,7 +13060,8 @@ activate_warp_candidate() {
         red "保留恢复目录: ${backup_dir}"
         return 2
     fi
-    write_warp_status_cache || yellow "WARP 状态缓存写入失败，不影响已提交的新身份。"
+    write_warp_status_cache "$strict_selection" "${WARP_UNLOCK_SUMMARY:-}" "$family" || \
+      yellow "WARP 状态缓存写入失败，不影响已提交的新身份。"
     if [ -e "$backup_dir/had-account" ]; then
         if ! delete_warp_registration "$backup_dir/account.json"; then
             cleanup_incomplete=true
@@ -12972,12 +13082,24 @@ activate_warp_candidate() {
 }
 
 verify_activated_warp() {
-    local expected_ip="${1:-}" selection="${2:-}" endpoint
-    probe_active_warp || return 1
-    [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ] || return 1
+    local expected_ip="${1:-}" selection="${2:-}" family="${3:-4}" endpoint
+    probe_active_warp "$family" || return 1
+    case "$family" in
+      4)
+        [[ "$WARP_PROBE_IP" != *:* ]] || return 1
+        [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ] || return 1
+        ;;
+      6)
+        # Cloudflare may use a different public IPv6 address for the next
+        # connection made by the same WARP identity. Verify the working address
+        # family instead of comparing two temporary trace addresses verbatim.
+        [[ "$WARP_PROBE_IP" == *:* ]] || return 1
+        ;;
+      *) return 1 ;;
+    esac
     [ -z "$selection" ] && return 0
     endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json")
-    start_warp_candidate_proxy "$endpoint" || return 1
+    start_warp_candidate_proxy "$endpoint" "$family" || return 1
     local rc
     if run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then rc=0; else rc=$?; fi
     stop_warp_candidate_proxy
@@ -12986,10 +13108,15 @@ verify_activated_warp() {
 
 singbox_service_is_stably_active() {
     local attempt pid_before pid_after init_system
+    local max_attempts="${SINGBOX_STABLE_MAX_ATTEMPTS:-15}"
+
+    case "$max_attempts" in ''|*[!0-9]*) max_attempts=15 ;; esac
+    [ "$max_attempts" -lt 4 ] && max_attempts=4
+    [ "$max_attempts" -gt 60 ] && max_attempts=60
 
     init_system=$(detect_usable_init_system) || return 1
     if [ "$init_system" = systemd ]; then
-        for attempt in 1 2 3 4; do
+        for ((attempt=1; attempt<=max_attempts; attempt++)); do
             if systemctl is-active --quiet sing-box; then
                 pid_before=$(systemctl show -p MainPID --value sing-box 2>/dev/null)
                 sleep 1
@@ -13002,7 +13129,7 @@ singbox_service_is_stably_active() {
         done
         return 1
     elif [ "$init_system" = openrc ]; then
-        for attempt in 1 2 3 4; do
+        for ((attempt=1; attempt<=max_attempts; attempt++)); do
             rc-service sing-box status >/dev/null 2>&1 && { sleep 1; rc-service sing-box status >/dev/null 2>&1 && return 0; }
             sleep 1
         done
@@ -13028,18 +13155,23 @@ remove_warp_candidate_dir() {
 }
 
 rotate_warp_identity_once() {
-    local old_ip candidate_dir candidate_endpoint new_ip activate_rc generate_rc attempt
-    local proxy_started probe_ok
+    local old_ipv4='' old_ipv6='' candidate_dir candidate_endpoint new_ip activate_rc generate_rc attempt
+    local candidate_ipv4='' candidate_ipv6='' selected_family=4 proxy_started probe_ok
     local failed_candidates=0 same_ip_candidates=0
     local WARP_MAX_CANDIDATES=5
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
         red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
     }
-    if ! probe_active_warp; then
+    if probe_active_warp 4 && [[ "$WARP_PROBE_IP" != *:* ]]; then
+        old_ipv4="$WARP_PROBE_IP"
+    fi
+    if probe_active_warp 6 && [[ "$WARP_PROBE_IP" == *:* ]]; then
+        old_ipv6="$WARP_PROBE_IP"
+    fi
+    if [ -z "$old_ipv4" ] && [ -z "$old_ipv6" ]; then
         red "无法取得当前 WARP 出口 IP，已停止更换。"
         return 1
     fi
-    old_ip="$WARP_PROBE_IP"
     for ((attempt=1; attempt<=WARP_MAX_CANDIDATES; attempt++)); do
         candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
         chmod 700 "$candidate_dir"
@@ -13062,9 +13194,38 @@ rotate_warp_identity_once() {
         candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
         proxy_started=false
         probe_ok=false
-        if start_warp_candidate_proxy "$candidate_endpoint"; then
+        candidate_ipv4=''
+        candidate_ipv6=''
+        selected_family=4
+        new_ip=''
+        if start_warp_candidate_proxy "$candidate_endpoint" 4; then
             proxy_started=true
-            probe_warp_trace "$WARP_PROBE_PROXY" && probe_ok=true
+            if probe_warp_trace "$WARP_PROBE_PROXY" && [[ "$WARP_PROBE_IP" != *:* ]]; then
+                candidate_ipv4="$WARP_PROBE_IP"
+                probe_ok=true
+            fi
+            stop_warp_candidate_proxy
+            proxy_started=false
+        fi
+        if [ -n "$candidate_ipv4" ] && [ -n "$old_ipv4" ] && [ "$candidate_ipv4" != "$old_ipv4" ]; then
+            selected_family=4
+            new_ip="$candidate_ipv4"
+        else
+            if start_warp_candidate_proxy "$candidate_endpoint" 6; then
+                proxy_started=true
+                if probe_warp_trace "$WARP_PROBE_PROXY" && [[ "$WARP_PROBE_IP" == *:* ]]; then
+                    candidate_ipv6="$WARP_PROBE_IP"
+                    probe_ok=true
+                fi
+                stop_warp_candidate_proxy
+                proxy_started=false
+            fi
+            if [ -n "$candidate_ipv6" ]; then
+                selected_family=6
+                new_ip="$candidate_ipv6"
+                yellow "Cloudflare 固定了当前 POP 的 IPv4 出口 ${old_ipv4:-不可用}；已注册新 WARP 身份，并将所选分流规则切换为优先使用 IPv6。"
+                yellow "提示：Cloudflare 的公网 IPv6 可能随连接变化，不作为固定身份标识。"
+            fi
         fi
         if [ "$probe_ok" != true ]; then
             [ "$proxy_started" = true ] && stop_warp_candidate_proxy
@@ -13082,10 +13243,9 @@ rotate_warp_identity_once() {
             [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
             continue
         fi
-        new_ip="$WARP_PROBE_IP"; stop_warp_candidate_proxy
-        if [ "$old_ip" = "$new_ip" ]; then
+        if [ -z "$new_ip" ]; then
             same_ip_candidates=$((same_ip_candidates + 1))
-            yellow "候选 ${attempt}/${WARP_MAX_CANDIDATES} 的 Cloudflare WARP 出口仍为 ${new_ip}，继续尝试。"
+            yellow "候选 ${attempt}/${WARP_MAX_CANDIDATES} 的 Cloudflare WARP IPv4/IPv6 出口均未变化，继续尝试。"
             if ! delete_warp_registration "$candidate_dir/account.json"; then
                 red "候选 WARP 云端设备清理失败，已停止更换。"
                 red "候选凭据保留在: ${candidate_dir}"
@@ -13099,14 +13259,18 @@ rotate_warp_identity_once() {
             [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
             continue
         fi
-        if activate_warp_candidate "$candidate_dir" "$new_ip"; then activate_rc=0; else activate_rc=$?; fi
+        if activate_warp_candidate "$candidate_dir" "$new_ip" '' "$selected_family"; then activate_rc=0; else activate_rc=$?; fi
         if [ "$activate_rc" -eq 0 ] || [ "$activate_rc" -eq 3 ]; then
             if ! remove_warp_candidate_dir "$candidate_dir"; then
                 yellow "新 WARP 身份已提交，但候选本地副本清理失败。"
                 red "候选凭据保留在: ${candidate_dir}"
             fi
             [ "$activate_rc" -eq 3 ] && yellow "新 WARP 身份已提交，但旧凭据或临时文件清理未完成。"
-            green "WARP 身份已更换：${old_ip} -> ${new_ip}"
+            if [ "$selected_family" = 6 ]; then
+                green "WARP 身份已更换（所选分流规则优先 IPv6；公网 IPv6 可能随连接变化）"
+            else
+                green "WARP 身份已更换：${old_ipv4} -> ${new_ip}"
+            fi
             return 0
         fi
         if [ "$activate_rc" -eq 2 ]; then
@@ -13177,13 +13341,23 @@ rotate_warp_identity_until_new() {
 }
 
 auto_select_warp_candidate() {
-    local selection="${1:-1234}" active_ip candidate_dir candidate_endpoint attempt candidate_ip activate_rc generate_rc
-    local proxy_started probe_ok
+    local selection="${1:-1234}" active_ipv4='' active_ipv6='' candidate_dir candidate_endpoint
+    local attempt candidate_ip activate_rc generate_rc selected_family=4
+    local candidate_ipv4='' candidate_ipv6='' proxy_started probe_ok
     local WARP_MAX_CANDIDATES=5
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
         red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
     }
-    probe_active_warp && active_ip="$WARP_PROBE_IP" || { red "无法取得当前 WARP 出口 IP，已停止优选。"; return 1; }
+    if probe_active_warp 4 && [[ "$WARP_PROBE_IP" != *:* ]]; then
+        active_ipv4="$WARP_PROBE_IP"
+    fi
+    if probe_active_warp 6 && [[ "$WARP_PROBE_IP" == *:* ]]; then
+        active_ipv6="$WARP_PROBE_IP"
+    fi
+    if [ -z "$active_ipv4" ] && [ -z "$active_ipv6" ]; then
+        red "无法取得当前 WARP 出口 IP，已停止优选。"
+        return 1
+    fi
     for ((attempt=1; attempt<=WARP_MAX_CANDIDATES; attempt++)); do
         yellow "正在测试候选 ${attempt}/${WARP_MAX_CANDIDATES}..."
         candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
@@ -13207,26 +13381,56 @@ auto_select_warp_candidate() {
         candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
         proxy_started=false
         probe_ok=false
-        if start_warp_candidate_proxy "$candidate_endpoint"; then
+        candidate_ipv4=''
+        candidate_ipv6=''
+        candidate_ip=''
+        selected_family=4
+        if start_warp_candidate_proxy "$candidate_endpoint" 4; then
             proxy_started=true
-            probe_warp_trace "$WARP_PROBE_PROXY" && probe_ok=true
+            if probe_warp_trace "$WARP_PROBE_PROXY" && [[ "$WARP_PROBE_IP" != *:* ]]; then
+                candidate_ipv4="$WARP_PROBE_IP"
+                probe_ok=true
+            fi
+        fi
+        if [ -n "$candidate_ipv4" ] && [ -n "$active_ipv4" ] && [ "$candidate_ipv4" != "$active_ipv4" ]; then
+            candidate_ip="$candidate_ipv4"
+            selected_family=4
+        else
+            [ "$proxy_started" = true ] && stop_warp_candidate_proxy
+            proxy_started=false
+            if start_warp_candidate_proxy "$candidate_endpoint" 6; then
+                proxy_started=true
+                if probe_warp_trace "$WARP_PROBE_PROXY" && [[ "$WARP_PROBE_IP" == *:* ]]; then
+                    candidate_ipv6="$WARP_PROBE_IP"
+                    probe_ok=true
+                fi
+                if [ -n "$candidate_ipv6" ]; then
+                    candidate_ip="$candidate_ipv6"
+                    selected_family=6
+                    yellow "Cloudflare 固定了当前 POP 的 IPv4 出口 ${active_ipv4:-不可用}；已注册新 WARP 身份，并将所选分流规则切换为优先使用 IPv6。"
+                    yellow "提示：Cloudflare 的公网 IPv6 可能随连接变化，不作为固定身份标识。"
+                fi
+            fi
         fi
         if [ "$probe_ok" = true ]; then
-            if [ -n "$active_ip" ] && [ "$WARP_PROBE_IP" = "$active_ip" ]; then
-                yellow "候选出口仍为 ${WARP_PROBE_IP}，继续。"
+            if [ -z "$candidate_ip" ]; then
+                yellow "候选 IPv4/IPv6 出口均未变化，继续。"
             elif run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then
                 printf '%s' "$WARP_UNLOCK_SUMMARY"
-                candidate_ip="$WARP_PROBE_IP"
                 stop_warp_candidate_proxy
                 proxy_started=false
-                if activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection"; then activate_rc=0; else activate_rc=$?; fi
+                if activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection" "$selected_family"; then activate_rc=0; else activate_rc=$?; fi
                 if [ "$activate_rc" -eq 0 ] || [ "$activate_rc" -eq 3 ]; then
                     if ! remove_warp_candidate_dir "$candidate_dir"; then
                         yellow "新 WARP 身份已提交，但候选本地副本清理失败。"
                         red "候选凭据保留在: ${candidate_dir}"
                     fi
                     [ "$activate_rc" -eq 3 ] && yellow "新 WARP 身份已提交，但旧凭据或临时文件清理未完成。"
-                    green "已启用新的 WARP 出口 ${candidate_ip}"
+                    if [ "$selected_family" = 6 ]; then
+                        green "已启用新的 WARP 身份（所选分流规则优先 IPv6；公网 IPv6 可能随连接变化）"
+                    else
+                        green "已启用新的 WARP IPv4 出口 ${candidate_ip}"
+                    fi
                     return 0
                 fi
                 if [ "$activate_rc" -eq 2 ]; then
@@ -13256,17 +13460,18 @@ auto_select_warp_candidate() {
 }
 
 show_warp_status_and_unlocks() {
-    local account_file="${conf_dir}/warp/account.json" selection="${1:-1234}"
+    local account_file="${conf_dir}/warp/account.json" selection="${1:-1234}" family
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
         yellow "内置 WARP 尚未初始化。"; return 1
     }
-    if ! probe_active_warp; then red "内置 WARP 运行探测失败。"; return 1; fi
-    start_warp_candidate_proxy "$(extract_warp_endpoint "${conf_dir}/endpoints.json")" || return 1
+    family=$(get_warp_preferred_family)
+    if ! probe_active_warp "$family"; then red "内置 WARP 运行探测失败。"; return 1; fi
+    start_warp_candidate_proxy "$(extract_warp_endpoint "${conf_dir}/endpoints.json")" "$family" || return 1
     run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" || true
     stop_warp_candidate_proxy
-    write_warp_status_cache "$selection" "$WARP_UNLOCK_SUMMARY"
+    write_warp_status_cache "$selection" "$WARP_UNLOCK_SUMMARY" "$family"
     green "设备 ID: $(jq -r '.id // "unknown"' "$account_file" 2>/dev/null)"
-    green "出口 IP: ${WARP_PROBE_IP}  地区: ${WARP_PROBE_LOC:-未知}  机房: ${WARP_PROBE_COLO:-未知}"
+    green "出口 IP: ${WARP_PROBE_IP}（IPv${family}）  地区: ${WARP_PROBE_LOC:-未知}  机房: ${WARP_PROBE_COLO:-未知}"
     green "WARP: ${WARP_PROBE_STATE}"
     printf '%s' "$WARP_UNLOCK_SUMMARY"
 }
@@ -14417,22 +14622,25 @@ apply_warp_route_update() {
     local jq_filter="$1"
     shift
     local current_route_file="${route_file:-${conf_dir}/route.json}"
-    local route_tmp route_backup
+    local route_tmp route_rendered route_backup family
 
     [ -s "$current_route_file" ] && jq empty "$current_route_file" >/dev/null 2>&1 || return 1
     route_tmp=$(mktemp "${conf_dir}/.tmp.route.XXXXXX") || return 1
-    route_backup=$(mktemp "${conf_dir}/.bak.route.XXXXXX") || { rm -f "$route_tmp"; return 1; }
+    route_rendered=$(mktemp "${conf_dir}/.tmp.route-family.XXXXXX") || { rm -f "$route_tmp"; return 1; }
+    route_backup=$(mktemp "${conf_dir}/.bak.route.XXXXXX") || { rm -f "$route_tmp" "$route_rendered"; return 1; }
     cp -p "$current_route_file" "$route_backup" 2>/dev/null || cp "$current_route_file" "$route_backup" || {
-        rm -f "$route_tmp" "$route_backup"
+        rm -f "$route_tmp" "$route_rendered" "$route_backup"
         return 1
     }
+    family=$(get_warp_preferred_family)
 
     if ! jq "$@" "$jq_filter" "$current_route_file" > "$route_tmp" || \
-       ! jq empty "$route_tmp" >/dev/null 2>&1 || \
-       ! mv -f "$route_tmp" "$current_route_file" || \
+       ! render_warp_route_family "$route_tmp" "$route_rendered" "$family" || \
+       ! jq empty "$route_rendered" >/dev/null 2>&1 || \
+       ! chmod 644 "$route_rendered" || ! mv -f "$route_rendered" "$current_route_file" || \
        ! validate_singbox_config; then
         mv -f "$route_backup" "$current_route_file" >/dev/null 2>&1 || true
-        rm -f "$route_tmp"
+        rm -f "$route_tmp" "$route_rendered"
         red "sing-box 路由配置校验失败，已回滚。"
         return 1
     fi
@@ -14444,7 +14652,7 @@ apply_warp_route_update() {
         return 1
     fi
 
-    rm -f "$route_backup"
+    rm -f "$route_tmp" "$route_rendered" "$route_backup"
 }
 
 add_service_route() {
@@ -14521,6 +14729,16 @@ dispatch_warp_rotation_menu_action() {
     return "$rotate_rc"
 }
 
+list_enabled_warp_route_mappings() {
+    local route_file="${1:-}"
+    [ -s "$route_file" ] || return 1
+    jq -r '
+      .route.rules[]? |
+      select(.action? == "route" and (.rule_set? | type) == "array") |
+      "\(.rule_set[]?) -> \(.outbound // "unknown")\(if .ip_version == 6 then " (IPv6)" else "" end)"
+    ' "$route_file" | sort -u
+}
+
 # WARP 分流管理
 warp_manage() {
     check_singbox &>/dev/null
@@ -14546,8 +14764,7 @@ warp_manage() {
         yellow "内置 WARP 出站: 未初始化（首次设置分流时自动注册独立身份）"
     fi
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | "\(.rule_set[]?) -> \(.outbound // "unknown")\(if .ip_version == 6 then " (IPv6)" else "" end)"' \
-        "$route_file" 2>/dev/null | sort -u | while read -r mapping; do
+    list_enabled_warp_route_mappings "$route_file" 2>/dev/null | while read -r mapping; do
         echo -e " - ${skyblue}${mapping}${re}"
     done || echo "  无"
     green "\n已添加的socks/http代理出站:"
@@ -16512,7 +16729,7 @@ manage_cfy() {
 
     while true; do
         clear; echo ""
-        green "=== Cloudflare 节点优选（cfy） ===\n"
+        green "=== Cloudflare优选 ===\n"
         green "1. 运行 cfy 节点优选"
         green "2. 查看最近一次优选结果（cfy -c）"
         green "3. 更新 cfy（cfy --update）"
@@ -16575,7 +16792,7 @@ dispatch_cli_action() {
             green "      --update      显式更新本地 sb 管理脚本，不修改已有节点"
             green "  -c, --check       查看节点信息和订阅链接"
             green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
-            green "      --cfy         进入 Cloudflare 节点优选（cfy）菜单"
+            green "      --cfy         进入 Cloudflare优选 菜单"
             green "  -u, --uninstall   uninstall sing-box and keep nginx"
             green "      --purge-nginx  uninstall sing-box and remove nginx"
             green "  -h, --help        显示此帮助信息"
@@ -16622,7 +16839,7 @@ menu() {
     green "9. 增加/删除协议"
     echo "==============="
     purple "10. ssh综合工具箱"
-    green "11. Cloudflare 节点优选（cfy）"
+    purple "11. Cloudflare优选"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="

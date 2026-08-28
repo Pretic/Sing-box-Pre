@@ -419,7 +419,7 @@ loop_output="$(printf '1\n\n4\n' | manage_cfy 2>&1)"
 loop_status=$?
 set -e
 assert_equal 0 "$loop_status" 'submenu return after cfy rc37'
-[[ "$(grep -Fc 'Cloudflare 节点优选（cfy）' <<< "$loop_output")" -ge 2 ]] ||
+[[ "$(grep -Fc 'Cloudflare优选' <<< "$loop_output")" -ge 2 ]] ||
     fail 'cfy child did not return to the submenu loop'
 assert_equal 1 "$(grep -Fc '按回车返回 cfy 菜单' "$MOCK_READING_LOG")" \
     'submenu pause after cfy child'
@@ -510,11 +510,16 @@ for menu_line in \
     '8. WARP分流管理' \
     '9. 增加/删除协议' \
     '10. ssh综合工具箱' \
-    '11. Cloudflare 节点优选（cfy）' \
+    '11. Cloudflare优选' \
     '0. 退出脚本'; do
     grep -Fq "$menu_line" <<< "$main_menu_output" ||
         fail "main menu missing or renumbered: $menu_line"
 done
+grep -Fq 'purple "11. Cloudflare优选"' "$script" ||
+    fail 'main menu option 11 does not use the tools-group purple color'
+if grep -Fq 'Cloudflare 节点优选（cfy）' "$script"; then
+    fail 'legacy cfy menu wording is still present'
+fi
 grep -Fq 'reading "请输入选择(0-11): " choice' "$script" ||
     fail 'main menu prompt is not 0-11'
 grep -Eq '11\)[[:space:]]+manage_cfy;[[:space:]]+need_pause=false' "$script" ||

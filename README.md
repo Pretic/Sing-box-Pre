@@ -1,6 +1,6 @@
 <div align="center">
 
-# sing-box 多协议代理工具
+# Sing-box-Pre 多协议代理脚本
 
 ![Debian](https://img.shields.io/badge/Debian-A81D33?logo=debian&logoColor=white)
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-E95420?logo=ubuntu&logoColor=white)
@@ -8,22 +8,24 @@
 ![Alpine](https://img.shields.io/badge/Alpine-0D597F?logo=alpinelinux&logoColor=white)
 ![Red Hat](https://img.shields.io/badge/Red%20Hat-EE0000?logo=redhat&logoColor=white)
 
-基于原项目二次修改的 VPS 一键脚本，当前 README 只保留 `sing-box.sh` 主脚本说明。
-
-原作者交流反馈群组：https://t.me/eooceu
+面向普通 VPS、端口受限 NAT VPS 以及 IPv4/IPv6 单栈、双栈环境的深度维护版一键脚本。
 
 </div>
 
 ## 项目说明
 
-本仓库基于原作者 [eooce/Sing-box](https://github.com/eooce/Sing-box) 二次修改，保留原作者信息、原项目说明和免责声明。感谢 eooce 及原项目贡献者提供的脚本基础。
+本仓库从 [eooce/Sing-box](https://github.com/eooce/Sing-box) 演进而来，现由本仓库独立维护，不代表上游项目。当前实现以 `sing-box.sh` 为主，重点是让安装、订阅、Cloudflare Tunnel、WARP 分流和 cfy 优选在不同 VPS 网络条件下保持可用、可回滚、便于更新。
 
-本仓库主要用于个人 VPS 节点部署与 Cloudflare Tunnel / 优选入口链路测试，不代表上游项目。二改重点集中在 VPS 一键脚本 `sing-box.sh`：
+当前主要能力：
 
 - 默认订阅输出 `VLESS-Reality` 与 `VLESS-WS-TLS-Argo`，不再默认依赖旧 `VMess-WS-TLS-Argo`。
 - 适配 Xray-core 新版本移除旧 TLS `allowInsecure` 后，部分客户端导入或连接 VMess 节点报错的问题。
 - Argo 本地入口改为 VLESS + WebSocket，并限制监听 `127.0.0.1:${ARGO_PORT}`，由 `cloudflared` 本机转发。
 - 默认订阅不输出 HY2/TUIC 等 UDP 系节点；如需输出，可设置 `INCLUDE_UDP_LINKS=1`。
+- 内置 WARP 采用每台 VPS 独立注册的 sing-box WireGuard endpoint，只接管用户选择的服务，不修改系统默认路由。
+- 支持 HTTP 原始订阅和用户主动配置的 Cloudflare Tunnel HTTPS 订阅；订阅发布失败不会影响代理服务。
+- 主菜单可安全安装和调用独立项目 cfy，cfy 失败不会覆盖最近一次成功结果或基础节点。
+- 关键配置变更采用临时文件、校验、原子替换和事务回滚，避免出现半更新状态。
 
 ## 快速开始
 
@@ -110,14 +112,16 @@ NODE_NAME=US-PreNet bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/S
 `WARP分流管理` 还提供三个内置身份操作：
 
 - `查看内置 WARP 状态及解锁情况`：脱敏显示设备 ID、出口 IP、地区、Cloudflare 机房及 Netflix、Disney+、ChatGPT、Gemini 检测结果，不显示令牌、私钥、client ID 或 reserved bytes。
-- `更换内置 WARP 身份/IP`：最多尝试 5 个候选，只有验证在线且出口 IP 确实变化后才事务替换；候选重复或失败时保留原身份。
-- `自动优选 WARP IP（多平台解锁）`：用户可多选上述四个平台，默认全选；候选必须满足 WARP 在线、出口 IP 已改变且所选项目全部通过。最多尝试 5 个候选，失败时保留原身份，不会无限注册或留下后台进程。
+- `更换内置 WARP 身份/IP`：先注册并隔离探测候选身份。IPv4 出口确实变化时继续使用 IPv4；如果 Cloudflare 将当前 POP 的 IPv4 固定为共享出口，则提交新身份并让已选择的 WARP 分流规则优先使用 IPv6。验证或服务重启失败会恢复旧身份。
+- `自动优选 WARP IP（多平台解锁）`：用户可多选上述四个平台，默认全选；候选必须满足 WARP 在线且所选项目全部通过。IPv4 被 POP 固定时同样可以使用 IPv6 优先路径，不会因重复注册相同 IPv4 而无限循环。
+
+Cloudflare WARP 的 IPv4 常由 POP 共享 NAT，重新注册身份并不保证立即得到不同 IPv4。公网 IPv6 也可能随连接变化，因此脚本对 IPv4 使用严格地址对比，对 IPv6 验证 WARP 状态和地址族，不把某一次临时 IPv6 当作永久设备标识。每批候选、总批次和总耗时均有上限；未提交候选会清理云端注册和本地临时文件。
 
 首页的 `WARP 状态` 指 sing-box 内置端点而非系统网卡：`running` 表示最近探测正常，`not configured` 表示尚未初始化，`degraded` 表示端点存在但最近探测失败。状态结果短暂缓存，避免每次重绘菜单都重复测速。上述操作只启动临时的 localhost 探测代理，不安装系统 WARP、Cloudflare Client、WireProxy、定时任务或守护进程；公网 IP 和地区由 Cloudflare Anycast 调度，脚本无法保证得到指定国家或指定 IP。
 
 ## 订阅与 cfy 联动
 
-- cfy 仍是独立项目、独立命令和独立更新周期，Sing-box 不复制或改写其节点生成逻辑。可从主菜单 `11. Cloudflare 节点优选（cfy）` 或 `sb --cfy` 进入；子菜单可运行 cfy、查看最近结果、调用 `cfy --update`，退出后返回 sb。
+- cfy 仍是独立项目、独立命令和独立更新周期，Sing-box 不复制或改写其节点生成逻辑。可从主菜单 `11. Cloudflare优选` 或 `sb --cfy` 进入；子菜单可运行 cfy、查看最近结果、调用 `cfy --update`，退出后返回 sb。
 - 首次运行且 `/usr/local/bin/cfy` 不存在时，sb 才会自动安装。安装内容固定到已验证的 cfy 提交与 SHA-256，使用带超时的 `curl -fsSL` 下载到目标同目录临时文件，依次通过非空、Bash 语法、功能标识及摘要校验后无覆盖发布；不会执行空脚本或直接使用 `curl | bash`。
 - cfy 下载、安装或运行失败不会重启 sing-box、Argo、Nginx，不会更改端口、基础节点或已有服务配置；cfy 自身仍通过原有事务发布规则保留最近一次成功结果。成功运行后才更新 cfy 优选结果及综合订阅。
 - 对外订阅地址默认使用 IPv4 公网地址生成，避免 VPS 没有 IPv6 时订阅 URL 不可访问；默认等同 `SUB_ADDR_FAMILY=ipv4`。
@@ -191,7 +195,7 @@ HTTPS 只有在脚本从公网取得的内容与本机 `/etc/sing-box/sub.txt` �
       --update      仅更新 sb 快捷命令，不修改已有节点
   -c, --check       查看节点信息和订阅链接
   -r, --restart     重新获取 Argo 临时隧道并更新到订阅
-      --cfy         进入 Cloudflare 节点优选（cfy）菜单
+      --cfy         进入 Cloudflare优选 菜单
   -u, --uninstall   无交互卸载 sing-box（保留 nginx）
       --purge-nginx  卸载 sing-box 并同时卸载 nginx
   -h, --help        显示帮助信息
@@ -206,10 +210,10 @@ HTTPS 只有在脚本从公网取得的内容与本机 `/etc/sing-box/sub.txt` �
 - NAT 机只有新装或重装生成节点时需要带 `PORT=你的端口`，并确认 `PORT+1`、`PORT+2`、`PORT+3` 是否也在服务商开放范围内；如果只有单个端口，优先使用 Argo/cfy 节点。
 - 默认节点名前缀使用 `国家代码-VPS名称`，未手动输入时取 VPS 主机名；交互生成节点时可手动输入 VPS 名称替换主机名部分。
 
-## 原作者信息
+## 上游与鸣谢
 
-- 原项目：[eooce/Sing-box](https://github.com/eooce/Sing-box)
-- Telegram 交流反馈群组：https://t.me/eooceu
+- 上游项目：[eooce/Sing-box](https://github.com/eooce/Sing-box)
+- 感谢 eooce 及上游贡献者提供早期脚本基础。
 
 ## ⚠️ 免责声明
 

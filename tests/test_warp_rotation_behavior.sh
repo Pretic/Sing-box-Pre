@@ -58,6 +58,7 @@ reset_fixture() {
     conf_dir="$tmp_root/conf"
     printf '%s\n' active-A > "$conf_dir/active-identity"
     printf '%s\n' active-account > "$conf_dir/warp/account.json"
+    printf '%s\n' current-route > "$conf_dir/route.json"
 
     GENERATE_CALLS=0
     START_CALLS=0
@@ -89,6 +90,7 @@ reset_fixture() {
     CANDIDATE_REMOVE_RESULTS=()
     SLEEP_DELAYS=()
     VERIFY_RESULT=0
+    ALLOW_IPV6_FALLBACK=false
     JQ_MODE=activation
     CURL_MODE=none
     WARP_PROBE_PROXY='mock-proxy'
@@ -158,6 +160,10 @@ mv() {
 validate_singbox_config() { return 0; }
 warp_endpoint_is_legacy() { return 1; }
 write_warp_status_cache() { return 0; }
+render_warp_route_family() {
+    command cat "$1" > "$2"
+    printf 'family=%s\n' "$3" >> "$2"
+}
 
 restart_singbox_checked() {
     local result
@@ -220,6 +226,9 @@ generate_unique_warp_identity() {
 
 start_warp_candidate_proxy() {
     local result
+    if [ "${2:-4}" = 6 ] && [ "$ALLOW_IPV6_FALLBACK" != true ]; then
+        return 1
+    fi
     START_CALLS=$((START_CALLS + 1))
     result="${START_RESULTS[$((START_CALLS - 1))]:-0}"
     [ "$result" -eq 0 ] || return "$result"
@@ -532,6 +541,8 @@ VERIFY_RESULT=1
 if activate_warp_candidate_real "$activation_candidate" B; then real_activation_rc=0; else real_activation_rc=$?; fi
 [ "$real_activation_rc" -eq 1 ] || fail "real rolled-back activation returned ${real_activation_rc}, expected 1"
 [ "$(<"$conf_dir/warp/account.json")" = old-account ] || fail 'real rc=1 activation did not restore the old account'
+[ "$(<"$conf_dir/route.json")" = current-route ] || fail 'real rc=1 activation did not restore the old route'
+[ ! -e "$conf_dir/warp/preferred-family" ] || fail 'real rc=1 activation retained the candidate address family'
 [ "$DELETE_CALLS" -eq 0 ] || fail 'real rc=1 activation deleted a cloud registration'
 assert_no_activation_backups
 
@@ -563,6 +574,14 @@ if activate_warp_candidate_real "$activation_candidate" B; then backup_cleanup_r
 [ "$(<"$conf_dir/warp/account.json")" = new-account ] || fail 'backup cleanup failure rolled back the committed account'
 [ "$DELETE_CALLS" -eq 1 ] || fail 'old registration was not deleted before backup cleanup failed'
 assert_one_activation_backup
+
+reset_fixture
+activation_candidate=$(make_activation_candidate)
+if activate_warp_candidate_real "$activation_candidate" B '' 6; then family_commit_rc=0; else family_commit_rc=$?; fi
+[ "$family_commit_rc" -eq 0 ] || fail "IPv6-family activation returned ${family_commit_rc}, expected 0"
+[ "$(<"$conf_dir/warp/preferred-family")" = 6 ] || fail 'IPv6-family activation did not persist family 6'
+grep -Fqx 'family=6' "$conf_dir/route.json" || fail 'IPv6-family activation did not commit its rendered route'
+assert_no_activation_backups
 
 reset_fixture
 JQ_MODE=generation_partial
