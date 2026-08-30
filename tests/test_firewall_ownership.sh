@@ -906,8 +906,8 @@ MOCK_NFT=1
 MOCK_NFT_INPUT_HOOK=1
 assert_fail allow_port --families 1 0 23003/tcp
 assert_not_contains '未检测到本机防火墙后端' "$CALL_LOG" 'nftables-only host was misclassified as having no firewall'
-assert_equal manual-firewall "${FIREWALL_LAST_RESULT_REASON:-}" \
-    'filtering nftables chain did not identify the safe manual-firewall path'
+[[ "${FIREWALL_LAST_RESULT_REASON:-}" == manual-firewall ]] ||
+    fail 'filtering nftables chain did not identify the safe manual-firewall path'
 
 # Provider images may pre-create an empty native nftables INPUT base chain.
 # An explicit accept policy with no rules is not active filtering and must not
@@ -926,8 +926,8 @@ reset_fixture
 MOCK_NFT=1
 MOCK_NFT_ACCEPT_INPUT_RULE=1
 assert_fail allow_port --families 1 0 23003/tcp
-assert_equal manual-firewall "${FIREWALL_LAST_RESULT_REASON:-}" \
-    'native nftables rule did not identify the safe manual-firewall path'
+[[ "${FIREWALL_LAST_RESULT_REASON:-}" == manual-firewall ]] ||
+    fail 'native nftables rule did not identify the safe manual-firewall path'
 
 reset_fixture
 MOCK_NFT=1
