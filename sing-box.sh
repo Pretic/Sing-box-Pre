@@ -3251,9 +3251,11 @@ raw_command_uses_nft() {
     [[ "$version_output" == *nf_tables* ]]
 }
 
-# Return 0 when an unmanaged nftables base chain actively handles INPUT,
-# 1 when no such hook exists (including nft not installed), and 2 when the
-# ruleset cannot be queried or parsed safely.  This helper never mutates nft.
+# Return 0 when an unmanaged nftables INPUT base chain can filter traffic
+# (non-accept policy or any rule), 1 when no effective unmanaged filtering
+# exists (including an empty accept-policy chain or nft not installed), and 2
+# when the ruleset cannot be queried or parsed safely.  This helper never
+# mutates nft.
 nft_input_filter_status() {
     local ignore_v4="${1:-0}" ignore_v6="${2:-0}" ruleset status
 
@@ -3263,11 +3265,19 @@ nft_input_filter_status() {
     printf '%s' "$ruleset" | jq -e \
         'type == "object" and (.nftables | type == "array")' >/dev/null 2>&1 || return 2
     if printf '%s' "$ruleset" | jq -e --arg ignore_v4 "$ignore_v4" --arg ignore_v6 "$ignore_v6" \
-        '[.nftables[]? | .chain? |
+        '. as $root |
+         [$root.nftables[]? | .chain? |
           select(type == "object" and .hook == "input") |
           select((((($ignore_v4 == "1") and .family == "ip" and .table == "filter" and .name == "INPUT") or
-                   (($ignore_v6 == "1") and .family == "ip6" and .table == "filter" and .name == "INPUT"))) | not)] |
-         length > 0' \
+                   (($ignore_v6 == "1") and .family == "ip6" and .table == "filter" and .name == "INPUT"))) | not)] as $chains |
+         any($chains[];
+             . as $chain |
+             (($chain.policy // "") != "accept") or
+             any($root.nftables[]? | .rule?;
+                 type == "object" and
+                 .family == $chain.family and
+                 .table == $chain.table and
+                 .chain == $chain.name))' \
         >/dev/null 2>&1; then
         return 0
     else
@@ -3521,10 +3531,11 @@ _allow_port_locked() {
         case "$compatibility_status" in
             0)
                 red "检测到 nftables INPUT 过滤链；脚本不会接管未知规则，请手动放行所需端口。"
+                FIREWALL_LAST_RESULT_REASON=manual-firewall
                 return 1
                 ;;
             1)
-                yellow "未检测到本机防火墙后端；nftables 没有 INPUT 过滤链，未修改本机规则。"
+                yellow "未检测到本机防火墙后端；nftables 未启用有效 INPUT 过滤，未修改本机规则。"
                 return 0
                 ;;
             *)
@@ -3538,6 +3549,7 @@ _allow_port_locked() {
         case "$compatibility_status" in
             0)
                 red "双栈防火墙后端不完整，且检测到 nftables INPUT 过滤链；请手动放行端口。"
+                FIREWALL_LAST_RESULT_REASON=manual-firewall
                 return 1
                 ;;
             1) ;;
@@ -3557,6 +3569,7 @@ _allow_port_locked() {
                 0) ;;
                 1)
                     red "双栈防火墙后端不完整，且现有 INPUT 链正在过滤；请手动放行端口。"
+                    FIREWALL_LAST_RESULT_REASON=manual-firewall
                     return 1
                     ;;
                 *)
@@ -3582,6 +3595,7 @@ _allow_port_locked() {
         case "$compatibility_status" in
             0)
                 red "检测到不属于 iptables 兼容层的 nftables INPUT 过滤链；请手动放行端口。"
+                FIREWALL_LAST_RESULT_REASON=manual-firewall
                 return 1
                 ;;
             1) ;;
@@ -3626,6 +3640,7 @@ _allow_port_locked() {
                     0) ;;
                     1)
                         red "原始防火墙缺少持久化能力，且现有 INPUT 链正在过滤；请手动放行端口。"
+                        FIREWALL_LAST_RESULT_REASON=manual-firewall
                         return 1
                         ;;
                     *)
@@ -3786,6 +3801,7 @@ _allow_port_locked() {
 allow_port() {
     local status=0 release_status=0
 
+    FIREWALL_LAST_RESULT_REASON=''
     acquire_firewall_lock || return $?
     _allow_port_locked "$@" || status=$?
     release_firewall_lock || release_status=$?
@@ -5336,16 +5352,33 @@ render_inbounds_config() {
     printf '%s\n' '  ]' '}'
 }
 
-# Preserve allow_port's tri-state result: 0=committed/no local mutation needed,
-# 1=safe failure, 2=firewall state unknown or recovery required.
+# Preserve allow_port's tri-state result.  A known, non-mutating firewall
+# ownership conflict may continue only after an explicit install-time
+# confirmation that the operator will manage the required ports manually.
 open_install_firewall_ports() {
-    local has_v4="${1:-0}" has_v6="${2:-0}" status
+    local has_v4="${1:-0}" has_v6="${2:-0}" status confirm=''
 
     if allow_port --families "$has_v4" "$has_v6" \
         "$vless_port/tcp" "$nginx_port/tcp" "$tuic_port/udp" "$hy2_port/udp"; then
         return 0
     else
         status=$?
+    fi
+    if [ "$status" -eq 1 ] && [ "${FIREWALL_LAST_RESULT_REASON:-}" = manual-firewall ]; then
+        if declare -p FIREWALL_LAST_ADDED_RECORDS >/dev/null 2>&1 &&
+           [ "${#FIREWALL_LAST_ADDED_RECORDS[@]}" -ne 0 ]; then
+            red "防火墙操作已产生所有权记录，拒绝切换为手动管理模式。"
+            return 2
+        fi
+        yellow "脚本未修改现有 nftables/iptables 规则。"
+        yellow "请手动放行 TCP 端口 ${vless_port}、${nginx_port}，以及 UDP 端口 ${tuic_port}、${hy2_port}。"
+        reading "确认由您负责放行以上端口并继续安装？[y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            yellow "已选择手动管理防火墙；继续安装 sing-box。"
+            return 0
+        fi
+        red "未确认手动管理防火墙，安装中止。"
+        return 1
     fi
     return "$status"
 }
