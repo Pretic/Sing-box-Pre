@@ -629,14 +629,28 @@ grep -Fq 'open_install_firewall_ports "$has_v4" "$has_v6"' <<< "$install_source"
     allow_port() {
         assert_equal '--families 1 0 25001/tcp 25002/tcp 25001/udp 25002/udp' \
             "$*" 'install firewall helper changed its exact protocol rules'
+        FIREWALL_LAST_RESULT_REASON="${MOCK_INSTALL_ALLOW_REASON:-}"
+        FIREWALL_LAST_ADDED_RECORDS=()
         return "${MOCK_INSTALL_ALLOW_STATUS:-0}"
+    }
+    reading() {
+        printf -v "$2" '%s' "${MOCK_INSTALL_CONFIRM:-}"
     }
     MOCK_INSTALL_ALLOW_STATUS=0
     assert_ok open_install_firewall_ports 1 0
     MOCK_INSTALL_ALLOW_STATUS=1
+    MOCK_INSTALL_ALLOW_REASON=''
     assert_equal 1 "$(set +e; open_install_firewall_ports 1 0; printf '%s' "$?")" \
         'install firewall helper masked ordinary failure'
+    MOCK_INSTALL_ALLOW_REASON=manual-firewall
+    MOCK_INSTALL_CONFIRM=y
+    assert_ok open_install_firewall_ports 1 0
+    MOCK_INSTALL_CONFIRM=n
+    assert_equal 1 "$(set +e; open_install_firewall_ports 1 0; printf '%s' "$?")" \
+        'install firewall helper continued without explicit manual-firewall confirmation'
     MOCK_INSTALL_ALLOW_STATUS=2
+    MOCK_INSTALL_ALLOW_REASON=manual-firewall
+    MOCK_INSTALL_CONFIRM=y
     assert_equal 2 "$(set +e; open_install_firewall_ports 1 0; printf '%s' "$?")" \
         'install firewall helper downgraded unknown firewall status'
 )

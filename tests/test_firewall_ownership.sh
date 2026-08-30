@@ -198,6 +198,8 @@ MOCK_NFT=0
 MOCK_NFT_QUERY_FAIL=0
 MOCK_NFT_INVALID_JSON=0
 MOCK_NFT_INPUT_HOOK=0
+MOCK_NFT_ACCEPT_INPUT_HOOK=0
+MOCK_NFT_ACCEPT_INPUT_RULE=0
 MOCK_NFT_COMPAT_HOOK=0
 MOCK_IP6_ADD_FAIL=0
 MOCK_FIREWALLD_PERMANENT_ADD_FAIL=0
@@ -237,6 +239,8 @@ reset_fixture() {
     MOCK_NFT_QUERY_FAIL=0
     MOCK_NFT_INVALID_JSON=0
     MOCK_NFT_INPUT_HOOK=0
+    MOCK_NFT_ACCEPT_INPUT_HOOK=0
+    MOCK_NFT_ACCEPT_INPUT_RULE=0
     MOCK_NFT_COMPAT_HOOK=0
     MOCK_IP6_ADD_FAIL=0
     MOCK_FIREWALLD_PERMANENT_ADD_FAIL=0
@@ -309,6 +313,10 @@ nft() {
         printf 'not-json\n'
     elif [ "$MOCK_NFT_INPUT_HOOK" = 1 ]; then
         printf '%s\n' '{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","type":"filter","hook":"input","prio":0,"policy":"drop"}}]}'
+    elif [ "$MOCK_NFT_ACCEPT_INPUT_RULE" = 1 ]; then
+        printf '%s\n' '{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","type":"filter","hook":"input","prio":0,"policy":"accept"}},{"rule":{"family":"inet","table":"filter","chain":"input","expr":[{"counter":{"packets":0,"bytes":0}}]}}]}'
+    elif [ "$MOCK_NFT_ACCEPT_INPUT_HOOK" = 1 ]; then
+        printf '%s\n' '{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}'
     elif [ "$MOCK_NFT_COMPAT_HOOK" = 1 ]; then
         printf '%s\n' '{"nftables":[{"chain":{"family":"ip","table":"filter","name":"INPUT","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}'
     else
@@ -898,6 +906,28 @@ MOCK_NFT=1
 MOCK_NFT_INPUT_HOOK=1
 assert_fail allow_port --families 1 0 23003/tcp
 assert_not_contains '未检测到本机防火墙后端' "$CALL_LOG" 'nftables-only host was misclassified as having no firewall'
+assert_equal manual-firewall "${FIREWALL_LAST_RESULT_REASON:-}" \
+    'filtering nftables chain did not identify the safe manual-firewall path'
+
+# Provider images may pre-create an empty native nftables INPUT base chain.
+# An explicit accept policy with no rules is not active filtering and must not
+# block an otherwise clean installation.
+reset_fixture
+MOCK_NFT=1
+MOCK_NFT_ACCEPT_INPUT_HOOK=1
+assert_ok allow_port --families 1 0 23003/tcp
+assert_contains '未启用有效 INPUT 过滤' "$CALL_LOG" \
+    'empty accept nftables chain was not treated as effectively unfiltered'
+[ ! -e "$FIREWALL_STATE_FILE" ] || fail 'empty accept nftables chain created ownership state'
+
+# Once the same accept-policy chain contains any rule, its effect is unknown to
+# this script and installation must require explicit manual firewall handling.
+reset_fixture
+MOCK_NFT=1
+MOCK_NFT_ACCEPT_INPUT_RULE=1
+assert_fail allow_port --families 1 0 23003/tcp
+assert_equal manual-firewall "${FIREWALL_LAST_RESULT_REASON:-}" \
+    'native nftables rule did not identify the safe manual-firewall path'
 
 reset_fixture
 MOCK_NFT=1
