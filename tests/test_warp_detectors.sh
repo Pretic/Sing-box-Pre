@@ -46,6 +46,7 @@ curl() {
       chatgpt-subdomain:https://ios.chat.openai.com) code=200; body='{"status":"ok"}' ;;
       chatgpt-path-spoof:https://chatgpt.com) code=200; effective='https://evil.com/path.chatgpt.com/'; body='<html>ChatGPT</html>' ;;
       chatgpt-path-spoof:https://ios.chat.openai.com) code=200; body='{"status":"ok"}' ;;
+      gemini-timeout:https://gemini.google.com/app) code=000; curl_rc=28 ;;
       gemini-generic:https://gemini.google.com/app) code=200; body='<html>Google sign in</html>' ;;
       gemini-pass:https://gemini.google.com/app) code=200; body='[45631641,null,true]' ;;
       gemini-legacy-error:https://gemini.google.com/app) code=200; body='<html><head><title>Gemini</title></head><body>[45631641,null,true] Service unavailable for maintenance</body></html>' ;;
@@ -139,6 +140,11 @@ if check_unlock_chatgpt proxy; then fail 'ChatGPT was accepted without a success
 MOCK_CASE=gemini-generic
 if check_unlock_gemini proxy; then fail 'Gemini generic HTTP 200 page was accepted'; else rc=$?; fi
 [ "$rc" -eq 2 ] || fail "Gemini generic page returned ${rc}, expected ambiguous rc=2"
+
+MOCK_CASE=gemini-timeout
+if check_unlock_gemini proxy; then fail 'Gemini timeout was accepted'; else rc=$?; fi
+[ "$rc" -eq 2 ] || fail 'Gemini timeout must remain inconclusive'
+[[ "$WARP_UNLOCK_STATUS" == *'超时'* ]] || fail 'Gemini timeout reason was hidden'
 
 MOCK_CASE=gemini-pass
 check_unlock_gemini proxy || fail 'Gemini positive application marker was rejected'

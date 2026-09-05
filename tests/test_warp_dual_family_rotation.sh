@@ -68,6 +68,7 @@ delete_warp_registration() { DELETE_CALLS=$((DELETE_CALLS + 1)); }
 remove_warp_candidate_dir() { rm -rf -- "$1"; }
 run_selected_unlock_checks() { WARP_UNLOCK_SUMMARY='ok'; return 0; }
 activate_warp_candidate() {
+    [[ "$LOG" != *'并将所选分流规则切换为'* ]] || fail 'candidate was reported as switched before activation'
     ACTIVATE_CALLS=$((ACTIVATE_CALLS + 1))
     ACTIVATE_IP="${2:-}"
     ACTIVATE_FAMILY="${4:-4}"
@@ -77,7 +78,7 @@ rotate_warp_identity_once || fail 'IPv4-pinned candidate with a usable IPv6 path
 [[ "$ACTIVATE_CALLS" -eq 1 ]] || fail "rotation activated ${ACTIVATE_CALLS} candidates, expected one"
 [[ "$ACTIVATE_FAMILY" = 6 ]] || fail "rotation activated family ${ACTIVATE_FAMILY:-unset}, expected IPv6"
 [[ "$ACTIVATE_IP" = '2001:db8::10' ]] || fail "rotation activated unexpected IPv6 probe result: ${ACTIVATE_IP:-unset}"
-[[ "$LOG" == *'固定了当前 POP 的 IPv4 出口'* && "$LOG" == *'优先使用 IPv6'* ]] ||
+[[ "$LOG" == *'没有取得不同的 IPv4 出口'* && "$LOG" == *'优先使用 IPv6'* ]] ||
     fail 'rotation did not explain the IPv4 pinning and IPv6 fallback'
 
 rm -rf -- "$conf_dir/warp"

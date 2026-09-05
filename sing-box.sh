@@ -12952,12 +12952,20 @@ extract_html_visible_text() {
 }
 
 check_unlock_gemini() {
-    local proxy="$1" result meta code effective visible
+    local proxy="$1" result meta code effective visible curl_rc
     WARP_UNLOCK_STATUS='检测失败'
     result=$(mktemp) || return 2
-    if ! meta=$(curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+    if meta=$(curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
       -A 'Mozilla/5.0' -H 'Accept-Language: en-US,en;q=0.9' -o "$result" \
       -w $'%{http_code}\t%{url_effective}' https://gemini.google.com/app 2>/dev/null); then
+        :
+    else
+        curl_rc=$?
+        if [ "$curl_rc" -eq 28 ]; then
+            WARP_UNLOCK_STATUS='检测超时（未确认解锁）'
+        else
+            WARP_UNLOCK_STATUS="检测失败（curl ${curl_rc}）"
+        fi
         rm -f -- "$result"; return 2
     fi
     IFS=$'\t' read -r code effective <<< "$meta"
@@ -12985,19 +12993,22 @@ check_unlock_gemini() {
 }
 
 run_selected_unlock_checks() {
-    local proxy="$1" selection="$2" digit label rc overall=0
+    local proxy="$1" selection="$2" progress="${3:-false}" digit label checker rc overall=0
     WARP_UNLOCK_SUMMARY=''
     [[ "$selection" =~ ^[1-4]+$ ]] || return 1
     for digit in 1 2 3 4; do
         [[ "$selection" == *"$digit"* ]] || continue
         case "$digit" in
-          1) label='Netflix'; check_unlock_netflix "$proxy" || rc=$? ;;
-          2) label='Disney+'; check_unlock_disney "$proxy" || rc=$? ;;
-          3) label='ChatGPT'; check_unlock_chatgpt "$proxy" || rc=$? ;;
-          4) label='Gemini'; check_unlock_gemini "$proxy" || rc=$? ;;
+          1) label='Netflix'; checker=check_unlock_netflix ;;
+          2) label='Disney+'; checker=check_unlock_disney ;;
+          3) label='ChatGPT'; checker=check_unlock_chatgpt ;;
+          4) label='Gemini'; checker=check_unlock_gemini ;;
         esac
-        rc=${rc:-0}
+        [ "$progress" != true ] || printf '正在检测 %s...\n' "$label"
+        rc=0
+        "$checker" "$proxy" || rc=$?
         WARP_UNLOCK_SUMMARY+="${label}: ${WARP_UNLOCK_STATUS}"$'\n'
+        [ "$progress" != true ] || printf '%s: %s\n' "$label" "$WARP_UNLOCK_STATUS"
         [ "$rc" -eq 0 ] || overall=1
         unset rc
     done
@@ -13135,26 +13146,22 @@ activate_warp_candidate() {
 }
 
 verify_activated_warp() {
-    local expected_ip="${1:-}" selection="${2:-}" family="${3:-4}" endpoint
-    probe_active_warp "$family" || return 1
-    case "$family" in
-      4)
-        [[ "$WARP_PROBE_IP" != *:* ]] || return 1
-        [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ] || return 1
-        ;;
-      6)
-        # Cloudflare may use a different public IPv6 address for the next
-        # connection made by the same WARP identity. Verify the working address
-        # family instead of comparing two temporary trace addresses verbatim.
-        [[ "$WARP_PROBE_IP" == *:* ]] || return 1
-        ;;
-      *) return 1 ;;
-    esac
-    [ -z "$selection" ] && return 0
+    local expected_ip="${1:-}" selection="${2:-}" family="${3:-4}" endpoint rc=1
+    case "$family" in 4|6) ;; *) return 1 ;; esac
     endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json")
     start_warp_candidate_proxy "$endpoint" "$family" || return 1
-    local rc
-    if run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then rc=0; else rc=$?; fi
+    if probe_warp_trace "$WARP_PROBE_PROXY"; then
+        if [ "$family" = 4 ]; then
+            if [[ "$WARP_PROBE_IP" != *:* ]] && \
+               { [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ]; }; then rc=0; fi
+        elif [[ "$WARP_PROBE_IP" == *:* ]]; then
+            # Cloudflare public IPv6 can change between connections of one identity.
+            rc=0
+        fi
+        if [ "$rc" -eq 0 ] && [ -n "$selection" ]; then
+            if run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then rc=0; else rc=$?; fi
+        fi
+    fi
     stop_warp_candidate_proxy
     return "$rc"
 }
@@ -13276,7 +13283,7 @@ rotate_warp_identity_once() {
             if [ -n "$candidate_ipv6" ]; then
                 selected_family=6
                 new_ip="$candidate_ipv6"
-                yellow "Cloudflare 固定了当前 POP 的 IPv4 出口 ${old_ipv4:-不可用}；已注册新 WARP 身份，并将所选分流规则切换为优先使用 IPv6。"
+                yellow "候选没有取得不同的 IPv4 出口（当前 ${old_ipv4:-不可用}）；已探测到可用 IPv6，验证通过后将优先使用 IPv6。"
                 yellow "提示：Cloudflare 的公网 IPv6 可能随连接变化，不作为固定身份标识。"
             fi
         fi
@@ -13460,7 +13467,7 @@ auto_select_warp_candidate() {
                 if [ -n "$candidate_ipv6" ]; then
                     candidate_ip="$candidate_ipv6"
                     selected_family=6
-                    yellow "Cloudflare 固定了当前 POP 的 IPv4 出口 ${active_ipv4:-不可用}；已注册新 WARP 身份，并将所选分流规则切换为优先使用 IPv6。"
+                    yellow "候选没有取得不同的 IPv4 出口（当前 ${active_ipv4:-不可用}）；正在测试 IPv6，全部所选平台通过后才会切换。"
                     yellow "提示：Cloudflare 的公网 IPv6 可能随连接变化，不作为固定身份标识。"
                 fi
             fi
@@ -13468,8 +13475,7 @@ auto_select_warp_candidate() {
         if [ "$probe_ok" = true ]; then
             if [ -z "$candidate_ip" ]; then
                 yellow "候选 IPv4/IPv6 出口均未变化，继续。"
-            elif run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then
-                printf '%s' "$WARP_UNLOCK_SUMMARY"
+            elif run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" true; then
                 stop_warp_candidate_proxy
                 proxy_started=false
                 if activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection" "$selected_family"; then activate_rc=0; else activate_rc=$?; fi
@@ -13491,8 +13497,6 @@ auto_select_warp_candidate() {
                     red "因回滚不完整，自动优选已立即停止。"
                     return 2
                 fi
-            else
-                printf '%s' "$WARP_UNLOCK_SUMMARY"
             fi
         fi
         [ "$proxy_started" = true ] && stop_warp_candidate_proxy
@@ -13513,20 +13517,27 @@ auto_select_warp_candidate() {
 }
 
 show_warp_status_and_unlocks() {
-    local account_file="${conf_dir}/warp/account.json" selection="${1:-1234}" family
-    warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
+    local account_file="${conf_dir}/warp/account.json" selection="${1:-1234}" family endpoint
+    endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
+    warp_endpoint_is_valid "$endpoint" || {
         yellow "内置 WARP 尚未初始化。"; return 1
     }
     family=$(get_warp_preferred_family)
-    if ! probe_active_warp "$family"; then red "内置 WARP 运行探测失败。"; return 1; fi
-    start_warp_candidate_proxy "$(extract_warp_endpoint "${conf_dir}/endpoints.json")" "$family" || return 1
-    run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" || true
-    stop_warp_candidate_proxy
-    write_warp_status_cache "$selection" "$WARP_UNLOCK_SUMMARY" "$family"
+    yellow "正在检测内置 WARP 连通性（握手最多等待 30 秒）..."
+    if ! start_warp_candidate_proxy "$endpoint" "$family"; then
+        red "无法启动内置 WARP 临时探测代理。"; return 1
+    fi
+    if ! probe_warp_trace "$WARP_PROBE_PROXY"; then
+        stop_warp_candidate_proxy
+        red "内置 WARP 运行探测失败。"; return 1
+    fi
     green "设备 ID: $(jq -r '.id // "unknown"' "$account_file" 2>/dev/null)"
     green "出口 IP: ${WARP_PROBE_IP}（IPv${family}）  地区: ${WARP_PROBE_LOC:-未知}  机房: ${WARP_PROBE_COLO:-未知}"
     green "WARP: ${WARP_PROBE_STATE}"
-    printf '%s' "$WARP_UNLOCK_SUMMARY"
+    run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" true || true
+    stop_warp_candidate_proxy
+    write_warp_status_cache "$selection" "$WARP_UNLOCK_SUMMARY" "$family" || \
+        yellow "状态已显示，但缓存写入失败。"
 }
 
 get_warp_menu_status() {
@@ -14871,7 +14882,7 @@ warp_manage() {
         2)  delete_rule_menu ;;
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
-        5)  clear; show_warp_status_and_unlocks; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
+        5)  clear; show_warp_status_and_unlocks || true; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
         6)  clear; dispatch_warp_rotation_menu_action || true; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
         7)
             clear

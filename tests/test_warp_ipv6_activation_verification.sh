@@ -15,7 +15,20 @@ verify_block=$(sed -n '/^verify_activated_warp() {/,/^}/p' "$script")
 source /dev/stdin <<< "$verify_block"
 
 ACTUAL_IP=''
+conf_dir=/unused-test-conf
+READY=false
+STARTS=0
+STOPS=0
+extract_warp_endpoint() { printf '{}\n'; }
+start_warp_candidate_proxy() { STARTS=$((STARTS + 1)); READY=false; WARP_PROBE_PROXY=proxy; }
+stop_warp_candidate_proxy() { STOPS=$((STOPS + 1)); READY=false; }
 probe_active_warp() {
+    start_warp_candidate_proxy
+    probe_warp_trace
+    stop_warp_candidate_proxy
+}
+probe_warp_trace() {
+    READY=true
     WARP_PROBE_IP="$ACTUAL_IP"
     WARP_PROBE_STATE=on
 }
@@ -39,5 +52,16 @@ ACTUAL_IP='198.51.100.21'
 if verify_activated_warp '198.51.100.20' '' 4; then
     fail 'IPv4 activation accepted a different address'
 fi
+
+run_selected_unlock_checks() {
+    [[ "$READY" == true ]] || fail 'activation checks ran on a newly started, unready proxy'
+}
+STARTS=0; STOPS=0
+verify_activated_warp '' 1234 4 || fail 'ready activation was rejected'
+[[ "$STARTS" == 1 && "$STOPS" == 1 ]] || fail 'activation did not reuse and clean up one proxy'
+STOPS=0
+run_selected_unlock_checks() { return 2; }
+if verify_activated_warp '' 1234 4; then fail 'inconclusive platforms were accepted'; else rc=$?; fi
+[[ "$rc" == 2 && "$STOPS" == 1 ]] || fail 'activation failure lost its result or left a probe running'
 
 echo 'WARP IPv6 activation verification tests passed.'
