@@ -5186,7 +5186,7 @@ disable_hy2_port_hopping_transaction() {
     finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
-reality_handshake_dns_strategy() {
+public_route_dns_strategy() {
     local route4=0 route6=0
 
     # Listener/address availability does not imply a usable public route.
@@ -5326,7 +5326,7 @@ render_inbounds_config() {
 
     [[ "$has_v4" =~ ^[01]$ && "$has_v6" =~ ^[01]$ && "$bindv6only" =~ ^[01]$ ]] || return 1
     [ "$has_v4" = 1 ] || [ "$has_v6" = 1 ] || return 1
-    dns_strategy=$(reality_handshake_dns_strategy) || return 1
+    dns_strategy=$(public_route_dns_strategy) || return 1
 
     if [ "$has_v4" = 1 ] && [ "$has_v6" = 1 ] && [ "$bindv6only" = 0 ]; then
         listeners=('::')
@@ -5408,7 +5408,7 @@ install_singbox() {
     local has_v4=0
     local has_v6=0
     local bindv6only=0
-    local dns_strategy
+    local dns_strategy direct_dns_strategy
     local inbounds_json
     local firewall_status
 
@@ -5429,6 +5429,7 @@ install_singbox() {
         return 1
     fi
     bindv6only=$(get_bindv6only)
+    direct_dns_strategy=$(public_route_dns_strategy) || return 1
     if [ "$has_v4" = 1 ]; then
         dns_strategy="prefer_ipv4"
     else
@@ -5523,7 +5524,8 @@ EOF
   "outbounds": [
     {
       "type": "direct",
-      "tag": "direct"
+      "tag": "direct",
+      "domain_resolver": {"server": "local", "strategy": "$direct_dns_strategy"}
     }
   ]
 }
@@ -8216,7 +8218,7 @@ mutate_reality_sni_files() {
     local tmp_client dns_strategy use_local_resolver=false
 
     is_valid_subscription_domain "$new_sni" || return 1
-    dns_strategy=$(reality_handshake_dns_strategy) || return 1
+    dns_strategy=$(public_route_dns_strategy) || return 1
     if jq -e 'any(.dns.servers[]?; .tag == "local")' "${conf_dir}/dns.json" >/dev/null 2>&1; then
         use_local_resolver=true
     fi
@@ -13982,7 +13984,8 @@ ensure_warp_prerequisites() {
 
     if [ -s "$current_outbound_file" ] && jq empty "$current_outbound_file" >/dev/null 2>&1; then
         jq '
-          .outbounds = ([{"type":"direct","tag":"direct"}] + [
+          ([.outbounds[]? | select(.tag == "direct" and .type == "direct")] | first) as $direct |
+          .outbounds = ([($direct // {"type":"direct","tag":"direct"})] + [
             .outbounds[]? | select(.tag != "direct")
           ])
         ' "$current_outbound_file" > "$outbound_tmp"

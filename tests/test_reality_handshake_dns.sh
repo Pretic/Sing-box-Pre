@@ -22,7 +22,7 @@ render_vless_reality_inbound vless-reality 0.0.0.0 ipv4_only > "$tmp_dir/inbound
 jq -e '.tls.reality.handshake.domain_resolver == {server:"local",strategy:"ipv4_only"}' \
     "$tmp_dir/inbound.json" >/dev/null || fail 'IPv4 Reality handshake can still select IPv6'
 
-for function_name in reality_handshake_dns_strategy render_argo_inbound \
+for function_name in public_route_dns_strategy render_argo_inbound \
     render_hysteria2_inbound render_tuic_inbound render_inbounds_config \
     mutate_reality_sni_files apply_jq_config; do
     load_function "$function_name"
@@ -38,7 +38,7 @@ ip() {
 }
 for scenario in '1 0 ipv4_only' '0 1 ipv6_only' '1 1 prefer_ipv4' '0 0 prefer_ipv4'; do
     read -r ROUTE4 ROUTE6 expected <<< "$scenario"
-    [[ "$(reality_handshake_dns_strategy)" == "$expected" ]] || fail "wrong route strategy: $scenario"
+    [[ "$(public_route_dns_strategy)" == "$expected" ]] || fail "wrong route strategy: $scenario"
     # Both listeners must use the same available outbound route family.
     render_inbounds_config 1 1 1 > "$tmp_dir/rendered.json"
     jq -e --arg strategy "$expected" '
@@ -49,6 +49,19 @@ for scenario in '1 0 ipv4_only' '0 1 ipv6_only' '1 1 prefer_ipv4' '0 0 prefer_ip
           .listen_port == 12000 and .tls.reality.private_key == "test-private-key" and .tls.reality.short_id == [""]) and
       all(.inbounds[] | select(.tls.reality == null); .tls.reality.handshake.domain_resolver == null)
     ' "$tmp_dir/rendered.json" >/dev/null || fail "listener family affected handshake/identity: $scenario"
+done
+
+# Check the actual installer's direct-outbound template without running install.
+install_direct_template="$(sed -n '/atomic_write_secret_file "${conf_dir}\/outbounds.json" << EOF/,/^EOF/p' "$script")"
+[[ -n "$install_direct_template" ]] || fail 'direct install template missing'
+conf_dir="$tmp_dir/install-conf"
+mkdir -p "$conf_dir"
+atomic_write_secret_file() { cat > "$1"; }
+for direct_dns_strategy in ipv4_only ipv6_only prefer_ipv4; do
+    eval "$install_direct_template"
+    jq -e --arg strategy "$direct_dns_strategy" '
+        .outbounds == [{type:"direct",tag:"direct",domain_resolver:{server:"local",strategy:$strategy}}]
+    ' "$conf_dir/outbounds.json" >/dev/null || fail "direct outbound can use unavailable family: $direct_dns_strategy"
 done
 
 ROUTE4=1 ROUTE6=0

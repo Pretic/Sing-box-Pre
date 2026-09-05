@@ -128,7 +128,12 @@ EOF
 
 reset_fixture
 write_custom_fixture
+direct_settings='{"type":"direct","tag":"direct","domain_resolver":{"server":"custom-doh","strategy":"ipv4_only"},"bind_interface":"eth0","connect_timeout":"7s"}'
+jq --argjson direct "$direct_settings" '.outbounds += [$direct]' "$outbound_file" > "$tmp_root/custom-outbounds.json"
+mv "$tmp_root/custom-outbounds.json" "$outbound_file"
 ensure_warp_prerequisites
+jq -e --argjson direct "$direct_settings" '[.outbounds[] | select(.tag == "direct")] == [$direct]' \
+    "$outbound_file" >/dev/null || fail 'WARP setup discarded existing direct DNS/dial settings'
 
 jq -e --arg path "$work_dir/cache.db" \
     '.experimental.cache_file.enabled == true and .experimental.cache_file.path == $path' \
@@ -230,6 +235,8 @@ jq -e '.outbounds | any(.tag == "direct")' "$outbound_file" >/dev/null || \
     fail 'global route deleted the direct outbound'
 
 restore_direct_route
+jq -e --argjson direct "$direct_settings" '[.outbounds[] | select(.tag == "direct")] == [$direct]' \
+    "$outbound_file" >/dev/null || fail 'WARP route changes discarded direct DNS/dial settings'
 [[ "$(jq -r '.route.final' "$route_file")" == direct ]] || \
     fail 'direct route was not restored explicitly'
 [[ -s "$conf_dir/endpoints.json" ]] || fail 'direct restore deleted endpoints.json'

@@ -22,7 +22,7 @@ for function_name in \
     acquire_node_subscription_lock release_node_subscription_lock \
     publish_node_change_subscription apply_node_change_transaction \
     mutate_uuid_node_files change_uuid_transaction \
-    reality_handshake_dns_strategy mutate_reality_sni_files change_reality_sni_transaction \
+    public_route_dns_strategy mutate_reality_sni_files change_reality_sni_transaction \
     mutate_client_ip_files change_client_ip_transaction; do
     load_function "$function_name"
 done

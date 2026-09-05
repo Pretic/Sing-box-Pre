@@ -316,7 +316,7 @@ assert_equal $'0.0.0.0\n::' "$(get_listener_address 1 1 1)" \
 assert_fail get_listener_address 0 0 0
 
 for function_name in \
-    reality_handshake_dns_strategy \
+    public_route_dns_strategy \
     render_vless_reality_inbound \
     render_argo_inbound \
     render_hysteria2_inbound \
