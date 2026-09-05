@@ -114,6 +114,8 @@ if ! (
     publish_tracked_argo_transition_subscription_locked() { return 0; }
     green() { :; }
     purple() { :; }
+    yellow() { :; }
+    show_current_cfy_results() { return 1; }
     source <(extract_function change_argo_transition_subscription)
     change_argo_transition_subscription fixed fixed.example.com preferred.example.com 443 1
 ); then

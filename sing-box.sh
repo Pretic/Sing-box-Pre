@@ -11363,8 +11363,40 @@ change_argo_domain() {
 
     green "vless-ws-tls-argo节点已更新\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
-    [ -s "${work_dir}/cfy-url.txt" ] && grep 'path=%2Fvless-argo' "${work_dir}/cfy-url.txt" | while IFS= read -r line; do purple "$line\n"; done
+    show_current_cfy_results argo || yellow "无法读取优选结果，请稍后运行 sb -c 查看。"
+    return 0
 }
+show_current_cfy_results() {
+    with_subscription_lock show_current_cfy_results_locked "${1:-all}"
+}
+
+show_current_cfy_results_locked() {
+    local mode="${1:-all}" cfy_file="${work_dir}/cfy-url.txt" selected_source line
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    if [ ! -s "$cfy_file" ]; then
+        if [ "$mode" = all ]; then
+            yellow "\n尚未找到优选结果，请运行 cfy 生成优选节点。\n"
+        fi
+        return 0
+    fi
+    selected_source=$(select_cfy_subscription_source_locked) || return 1
+    if [ "$selected_source" = /dev/null ]; then
+        yellow "\n优选结果已过期或无法核对：基础节点可能已变化，请重新运行 cfy。旧结果不会加入当前订阅。\n"
+        return 0
+    fi
+    [ "$mode" != all ] || green "\n=== 当前 cfy 优选节点 ===\n"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line//$'\r'/}"
+        [ -n "$line" ] || continue
+        if [ "$mode" = argo ] && [[ "$line" != *'path=%2Fvless-argo'* ]]; then
+            continue
+        fi
+        purple "$line\n"
+    done < "$selected_source"
+    return 0
+}
+
 check_nodes() {
     if [ ! -f "${work_dir}/url.txt" ]; then
         red "节点信息文件不存在，请先安装 sing-box"; return 1
@@ -11378,8 +11410,7 @@ check_nodes() {
     fi
 
     server_ip=$(get_subscription_host)
-    local base64_url cfy_result_file
-    cfy_result_file="${work_dir}/cfy-url.txt"
+    local base64_url
     base64_url=$(resolve_installed_subscription_source_url "$server_ip" 2>/dev/null || true)
 
     clear; echo ""
@@ -11390,15 +11421,7 @@ check_nodes() {
         echo -e "${purple}${line}${re}\n"
     done < "${work_dir}/url.txt"
 
-    if [ -s "$cfy_result_file" ]; then
-        green "\n=== 最近一次 cfy 优选节点 ===\n"
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            echo -e "${purple}${line}${re}\n"
-        done < "$cfy_result_file"
-    else
-        yellow "\n未找到 cfy 优选结果文件：${cfy_result_file}\n"
-    fi
+    show_current_cfy_results || yellow "无法读取优选结果，请稍后重试。"
 
     yellow "\n温馨提醒: 如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
     green "\n=== 订阅链接 ===\n"
@@ -11759,7 +11782,7 @@ change_argo_transition_subscription() {
 
     green "vless-ws-tls-argo节点已更新\n"
     grep 'path=%2Fvless-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
-    [ -s "${work_dir}/cfy-url.txt" ] && grep 'path=%2Fvless-argo' "${work_dir}/cfy-url.txt" | while IFS= read -r line; do purple "$line\n"; done
+    show_current_cfy_results argo || yellow "无法读取优选结果，请稍后运行 sb -c 查看。"
     return 0
 }
 
