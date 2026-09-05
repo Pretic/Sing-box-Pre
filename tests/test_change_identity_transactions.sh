@@ -22,7 +22,7 @@ for function_name in \
     acquire_node_subscription_lock release_node_subscription_lock \
     publish_node_change_subscription apply_node_change_transaction \
     mutate_uuid_node_files change_uuid_transaction \
-    mutate_reality_sni_files change_reality_sni_transaction \
+    reality_handshake_dns_strategy mutate_reality_sni_files change_reality_sni_transaction \
     mutate_client_ip_files change_client_ip_transaction; do
     load_function "$function_name"
 done
@@ -68,6 +68,7 @@ setup_fixture() {
     ARGO_OPENRC_SERVICE_FILE="${ROOT}/etc/init.d/argo"
     mkdir -p "$conf_dir" "$(dirname "$ARGO_SYSTEMD_SERVICE_FILE")" \
         "$(dirname "$ARGO_OPENRC_SERVICE_FILE")"
+    printf '%s\n' '{"dns":{"servers":[{"type":"local","tag":"local"}]}}' > "${conf_dir}/dns.json"
     cat > "${conf_dir}/inbounds.json" <<'JSON'
 {"inbounds":[
  {"type":"vless","tag":"vless-reality","listen_port":11001,"users":[{"uuid":"11111111-1111-4111-8111-111111111111"}],"tls":{"server_name":"old.example","reality":{"handshake":{"server":"old.example"}}}},

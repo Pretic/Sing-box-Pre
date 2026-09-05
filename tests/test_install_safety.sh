@@ -316,6 +316,7 @@ assert_equal $'0.0.0.0\n::' "$(get_listener_address 1 1 1)" \
 assert_fail get_listener_address 0 0 0
 
 for function_name in \
+    reality_handshake_dns_strategy \
     render_vless_reality_inbound \
     render_argo_inbound \
     render_hysteria2_inbound \
@@ -1106,6 +1107,7 @@ if [[ -x "$sing_box_bin" ]] && command -v openssl >/dev/null 2>&1; then
     openssl req -new -x509 -days 1 -key "${work_dir}/private.key" \
         -out "${work_dir}/cert.pem" -subj '/CN=bing.com' >/dev/null 2>&1
     render_inbounds_config 1 1 1 > "${check_root}/conf/inbounds.json"
+    printf '%s\n' '{"dns":{"servers":[{"type":"local","tag":"local"}]}}' > "${check_root}/conf/dns.json"
     printf '%s\n' '{"outbounds":[{"type":"direct","tag":"direct"}]}' > "${check_root}/conf/outbounds.json"
     printf '%s\n' '{"endpoints":[]}' > "${check_root}/conf/endpoints.json"
     printf '%s\n' '{"route":{"rules":[],"final":"direct"}}' > "${check_root}/conf/route.json"

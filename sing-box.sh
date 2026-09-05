@@ -5186,11 +5186,29 @@ disable_hy2_port_hopping_transaction() {
     finish_transaction_release "$status" release_proxy_transaction_lock
 }
 
+reality_handshake_dns_strategy() {
+    local route4=0 route6=0
+
+    # Listener/address availability does not imply a usable public route.
+    # These lookups do not send packets or depend on working DNS.
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 route get 1.1.1.1 >/dev/null 2>&1 && route4=1
+        ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1 && route6=1
+    fi
+    case "${route4}:${route6}" in
+        1:0) printf '%s\n' ipv4_only ;;
+        0:1) printf '%s\n' ipv6_only ;;
+        *) printf '%s\n' prefer_ipv4 ;;
+    esac
+}
+
 render_vless_reality_inbound() {
     local tag="${1:-}"
     local listen_address="${2:-}"
+    local dns_strategy="${3:-prefer_ipv4}"
 
     [ -n "$tag" ] && [ -n "$listen_address" ] || return 1
+    case "$dns_strategy" in ipv4_only|ipv6_only|prefer_ipv4) ;; *) return 1 ;; esac
     cat << EOF
     {
       "type": "vless",
@@ -5210,7 +5228,8 @@ render_vless_reality_inbound() {
           "enabled": true,
           "handshake": {
             "server": "www.iij.ad.jp",
-            "server_port": 443
+            "server_port": 443,
+            "domain_resolver": {"server": "local", "strategy": "$dns_strategy"}
           },
           "private_key": "$private_key",
           "short_id": [""]
@@ -5302,11 +5321,12 @@ render_inbounds_config() {
     local has_v4="${1:-0}"
     local has_v6="${2:-0}"
     local bindv6only="${3:-0}"
-    local listener suffix separator=''
+    local listener suffix dns_strategy separator=''
     local -a listeners suffixes
 
     [[ "$has_v4" =~ ^[01]$ && "$has_v6" =~ ^[01]$ && "$bindv6only" =~ ^[01]$ ]] || return 1
     [ "$has_v4" = 1 ] || [ "$has_v6" = 1 ] || return 1
+    dns_strategy=$(reality_handshake_dns_strategy) || return 1
 
     if [ "$has_v4" = 1 ] && [ "$has_v6" = 1 ] && [ "$bindv6only" = 0 ]; then
         listeners=('::')
@@ -5332,7 +5352,7 @@ render_inbounds_config() {
         [ -z "$separator" ] || printf ',\n'
         listener="${listeners[$index]}"
         suffix="${suffixes[$index]}"
-        render_vless_reality_inbound "vless-reality${suffix}" "$listener" || return 1
+        render_vless_reality_inbound "vless-reality${suffix}" "$listener" "$dns_strategy" || return 1
         separator=1
     done
     printf ',\n'
@@ -8193,16 +8213,25 @@ change_uuid_transaction() {
 mutate_reality_sni_files() {
     local staged_client="${1:-}"
     local new_sni="${2:-}"
-    local tmp_client
+    local tmp_client dns_strategy use_local_resolver=false
 
     is_valid_subscription_domain "$new_sni" || return 1
-    apply_jq_config "${conf_dir}/inbounds.json" --arg sni "$new_sni" '
+    dns_strategy=$(reality_handshake_dns_strategy) || return 1
+    if jq -e 'any(.dns.servers[]?; .tag == "local")' "${conf_dir}/dns.json" >/dev/null 2>&1; then
+        use_local_resolver=true
+    fi
+    apply_jq_config "${conf_dir}/inbounds.json" --arg sni "$new_sni" --arg strategy "$dns_strategy" \
+        --argjson use_local_resolver "$use_local_resolver" '
       (.inbounds[] |
         select(.type == "vless" and (.tag | startswith("vless-reality")) and
                (.tls.reality? != null)) | .tls.server_name) = $sni |
       (.inbounds[] |
         select(.type == "vless" and (.tag | startswith("vless-reality")) and
-               (.tls.reality? != null)) | .tls.reality.handshake.server) = $sni
+               (.tls.reality? != null)) | .tls.reality.handshake) |=
+        (.server = $sni |
+         if $use_local_resolver and .domain_resolver == null and .domain_strategy == null and .detour == null then
+           .domain_resolver = {server:"local",strategy:$strategy}
+         else . end)
     ' || return 1
     tmp_client=$(mktemp "${work_dir}/.tmp.node-client.XXXXXX") || return 1
     sed -E "/^vless:\/\// { /security=reality/ s#(sni=)[^&]*#\\1${new_sni}#; }" \
