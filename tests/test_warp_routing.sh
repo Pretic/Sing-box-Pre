@@ -130,6 +130,10 @@ reset_fixture
 write_custom_fixture
 ensure_warp_prerequisites
 
+jq -e --arg path "$work_dir/cache.db" \
+    '.experimental.cache_file.enabled == true and .experimental.cache_file.path == $path' \
+    "$route_file" >/dev/null || fail 'remote rule sets must have a persistent cache after repair'
+
 jq -e '.outbounds | any(.tag == "direct" and .type == "direct")' "$outbound_file" >/dev/null || \
     fail 'direct outbound was not repaired'
 jq -e '.outbounds | any(.tag == "custom-proxy")' "$outbound_file" >/dev/null || \
@@ -167,7 +171,12 @@ jq -e '.route.rules | any(.domain_suffix == ["example.com"])' "$route_file" >/de
 cat > "$conf_dir/endpoints.json" <<'EOF'
 {"endpoints":[{"type":"wireguard","tag":"wireguard-out","address":["172.16.0.2/32","2606:4700:110:8dfe:d141:69bb:6b80:925/128"],"private_key":"legacy","peers":[{"public_key":"legacy","reserved":[78,135,76]}]}]}
 EOF
+jq '.experimental = {cache_file: {enabled: false, path: "/custom/rules.db", cache_id: "custom"}, clash_api: {external_controller: "127.0.0.1:9090"}}' \
+    "$route_file" > "$tmp_root/custom-route.json"
+mv "$tmp_root/custom-route.json" "$route_file"
 ensure_warp_prerequisites
+jq -e '.experimental == {cache_file: {enabled: false, path: "/custom/rules.db", cache_id: "custom"}, clash_api: {external_controller: "127.0.0.1:9090"}}' \
+    "$route_file" >/dev/null || fail 'repair must preserve explicit cache settings and unrelated experimental options'
 jq -e '.endpoints | any(
     .tag == "wireguard-out" and
     (.address | index("2606:4700:110:8abc::1234/128")) and
@@ -232,6 +241,25 @@ jq -e '.route.rules | any((.rule_set? | index("gemini")) and .outbound == "wireg
     fail 'selected service was not routed through WARP after direct restore'
 jq -e '.route.rules | all((.rule_set? | index("netflix")) | not)' "$route_file" >/dev/null || \
     fail 'an unselected service unexpectedly gained a WARP route'
+
+reset_fixture
+ensure_warp_prerequisites
+jq -e --arg path "$work_dir/cache.db" \
+    '.experimental.cache_file.enabled == true and .experimental.cache_file.path == $path and .route.final == "direct"' \
+    "$route_file" >/dev/null || fail 'new route configuration must enable persistent rule caching'
+
+reset_fixture
+write_custom_fixture
+cp "$route_file" "$tmp_root/route.before"
+cat > "$conf_dir/experimental.json" <<'EOF'
+{"experimental":{"cache_file":{"enabled":false,"path":"/external/cache.db"}}}
+EOF
+cp "$conf_dir/experimental.json" "$tmp_root/experimental.before"
+ensure_warp_prerequisites
+jq -e '.experimental.cache_file == null' "$route_file" >/dev/null || \
+    fail 'repair must not override cache settings from another configuration file'
+cmp -s "$tmp_root/experimental.before" "$conf_dir/experimental.json" || \
+    fail 'repair modified a separate experimental configuration'
 
 reset_fixture
 write_custom_fixture

@@ -119,6 +119,10 @@ Cloudflare WARP 的 IPv4 常由 POP 共享 NAT，重新注册身份并不保证�
 
 首页的 `WARP 状态` 指 sing-box 内置端点而非系统网卡：`running` 表示最近探测正常，`not configured` 表示尚未初始化，`degraded` 表示端点存在但最近探测失败。状态结果短暂缓存，避免每次重绘菜单都重复测速。上述操作只启动临时的 localhost 探测代理，不安装系统 WARP、Cloudflare Client、WireProxy、定时任务或守护进程；公网 IP 和地区由 Cloudflare Anycast 调度，脚本无法保证得到指定国家或指定 IP。
 
+首次注册的进度提示与 endpoint JSON 分开输出，避免身份已经保存却未能启用出站。探测会为 WireGuard 冷启动握手保留最多 30 秒的重试窗口；成功和失败状态均缓存 5 分钟，避免网络故障时每次打开菜单都重新等待。
+
+新安装和 WARP 配置修复默认开启 `/etc/sing-box/cache.db` 持久规则缓存。规则首次下载成功后，重启可直接读取缓存，减少 DNS 或规则源短暂不可用导致的启动失败；已有自定义缓存设置会保留。
+
 ## 订阅与 cfy 联动
 
 - cfy 仍是独立项目、独立命令和独立更新周期，Sing-box 不复制或改写其节点生成逻辑。可从主菜单 `11. Cloudflare优选` 或 `sb --cfy` 进入；子菜单可运行 cfy、查看最近结果、调用 `cfy --update`，退出后返回 sb。

@@ -5517,6 +5517,9 @@ EOF
 
     cat > "${conf_dir}/route.json" << EOF || return 1
 {
+  "experimental": {
+    "cache_file": {"enabled": true, "path": "${work_dir}/cache.db"}
+  },
   "route": {
     "rule_set": [
       {"tag":"gemini","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/gemini.srs","download_detour":"direct"},
@@ -12538,9 +12541,26 @@ start_warp_candidate_proxy() {
 }
 
 probe_warp_trace() {
-    local proxy="$1" trace
-    trace=$(curl -fsS --connect-timeout 5 --max-time 12 --proxy "$proxy" \
-      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || return 1
+    local proxy="$1" trace attempt deadline remaining request_timeout
+    WARP_PROBE_IP=''; WARP_PROBE_LOC=''; WARP_PROBE_COLO=''; WARP_PROBE_STATE=''
+    # A listening SOCKS port does not mean the WireGuard handshake is ready.
+    # Give cold handshakes a 30-second window, even when SOCKS rejects requests
+    # immediately. A definitive trace is final; transport retries stay bounded.
+    deadline=$(( $(date +%s) + 30 ))
+    for attempt in {1..16}; do
+        remaining=$(( deadline - $(date +%s) ))
+        [ "$remaining" -gt 0 ] || return 1
+        request_timeout=$remaining
+        [ "$request_timeout" -le 12 ] || request_timeout=12
+        if trace=$(curl -fsS --connect-timeout 5 --max-time "$request_timeout" --proxy "$proxy" \
+          https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null); then
+            break
+        fi
+        [ "$attempt" -lt 16 ] || return 1
+        remaining=$(( deadline - $(date +%s) ))
+        [ "$remaining" -gt 2 ] || return 1
+        sleep 2
+    done
     WARP_PROBE_IP=$(awk -F= '/^ip=/{print $2; exit}' <<< "$trace")
     WARP_PROBE_LOC=$(awk -F= '/^loc=/{print $2; exit}' <<< "$trace")
     WARP_PROBE_COLO=$(awk -F= '/^colo=/{print $2; exit}' <<< "$trace")
@@ -13516,7 +13536,14 @@ get_warp_menu_status() {
     now=$(date +%s); checked=$(jq -r '.checked_at // 0' "$cache" 2>/dev/null || echo 0)
     warp=$(jq -r '.warp // empty' "$cache" 2>/dev/null || true)
     if [ $((now - checked)) -gt 300 ]; then
-        if probe_active_warp; then write_warp_status_cache; warp="$WARP_PROBE_STATE"; else warp='failed'; fi
+        if probe_active_warp; then
+            warp="$WARP_PROBE_STATE"
+        else
+            warp='failed'
+            WARP_PROBE_STATE=failed
+            WARP_PROBE_IP=''; WARP_PROBE_LOC=''; WARP_PROBE_COLO=''
+        fi
+        write_warp_status_cache || true
     fi
     [[ "$warp" =~ ^(on|plus)$ ]] && echo running || echo degraded
 }
@@ -13540,8 +13567,8 @@ warp_endpoint_json() {
     if [ -z "$state_endpoint" ] || \
        ! warp_endpoint_is_valid "$state_endpoint" || \
        warp_endpoint_is_legacy "$state_endpoint"; then
-        yellow "正在为本机注册独立 WARP 身份..."
-        generate_unique_warp_identity || return 1
+        yellow "正在为本机注册独立 WARP 身份..." >&2
+        generate_unique_warp_identity >&2 || return 1
         state_endpoint=$(extract_warp_endpoint "$state_file" 2>/dev/null || true)
     fi
 
@@ -13591,10 +13618,20 @@ ensure_warp_prerequisites() {
     local current_outbound_file="${conf_dir}/outbounds.json"
     local endpoint_tmp route_tmp outbound_tmp backup_dir
     local warp_endpoint required_rule_sets target_file target_name
+    local separate_cache=false cache_config
     local -a target_files
 
     command_exists jq || { red "WARP 分流需要 jq。"; return 1; }
     mkdir -p "$conf_dir" || return 1
+
+    # Directory configurations may keep experimental settings in a separate file.
+    for cache_config in "${conf_dir}"/*.json; do
+        [ "$cache_config" != "$current_route_file" ] || continue
+        if jq -e '.experimental.cache_file != null' "$cache_config" >/dev/null 2>&1; then
+            separate_cache=true
+            break
+        fi
+    done
 
     warp_endpoint=$(warp_endpoint_json) || return 1
     required_rule_sets=$(warp_rule_sets_json) || return 1
@@ -13637,7 +13674,10 @@ ensure_warp_prerequisites() {
     }
 
     if [ -s "$current_route_file" ] && jq empty "$current_route_file" >/dev/null 2>&1; then
-        jq --argjson required "$required_rule_sets" '
+        jq --argjson required "$required_rule_sets" --arg cache_path "${work_dir}/cache.db" --argjson separate_cache "$separate_cache" '
+          (if $separate_cache then . else
+            .experimental.cache_file = ({enabled: true, path: $cache_path} + (.experimental.cache_file // {}))
+          end) |
           .route = (if (.route | type) == "object" then .route else {} end) |
           (.route.rule_set // []) as $current |
           .route.rule_set = ([
@@ -13648,8 +13688,11 @@ ensure_warp_prerequisites() {
           .route.final = (if (.route.final | type) == "string" and (.route.final | length) > 0 then .route.final else "direct" end)
         ' "$current_route_file" > "$route_tmp"
     else
-        jq -n --argjson required "$required_rule_sets" \
-           '{route: {rule_set: $required, rules: [], final: "direct"}}' > "$route_tmp"
+        jq -n --argjson required "$required_rule_sets" --arg cache_path "${work_dir}/cache.db" --argjson separate_cache "$separate_cache" \
+           '{route: {rule_set: $required, rules: [], final: "direct"}} |
+            if $separate_cache then . else
+              .experimental.cache_file = {enabled: true, path: $cache_path}
+            end' > "$route_tmp"
     fi || {
         restore_warp_file_backups "$backup_dir" "${target_files[@]}"
         rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
@@ -16596,11 +16639,11 @@ cfy_executable_path() {
 }
 
 cfy_download_url() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/e4a4778045669afe15bfdda821cdf26c86c2af46/cfy.sh}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/2eb6b4611986d1fd0939c7dcf90aeb9e0704d202/cfy.sh}"
 }
 
 cfy_expected_download_sha256() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-2b10ad70a28e3f974695dedab2ef582b2950e2bc2252ab6f8291b3b43db11c5a}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-959cdeb10a205332825ccdc9ac7cd9fb9f6220de63fb3fed1ec061cbc2ee9ee6}"
 }
 
 validate_cfy_target_path() {
