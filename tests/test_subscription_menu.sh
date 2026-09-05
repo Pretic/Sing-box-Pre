@@ -813,15 +813,14 @@ grep -Fq 'Path:' <<< "$manual_source"
 grep -Fq 'Type:' <<< "$manual_source"
 grep -Fq 'http://localhost:' <<< "$manual_source"
 
+# The user guide must explain the available operations, without fixing its
+# heading structure or requiring internal implementation details.
 for documentation_item in \
-    '## 可选的 Cloudflare HTTPS 订阅' \
-    '默认仍生成 HTTP 原始订阅' \
-    '用户自己的 Cloudflare 域名' \
-    'Cloudflare Tunnel/Connector Write' \
-    'DNS Write' \
-    '不写入磁盘' \
-    'IPv4 单栈' \
-    'IPv6 单栈' \
+    'Cloudflare HTTPS 订阅' \
+    '默认提供 HTTP 订阅' \
+    '自己的 Cloudflare 域名' \
+    '查看订阅链接与详细状态' \
+    '配置 Cloudflare HTTPS 订阅' \
     '关闭节点订阅' \
     '关闭 Cloudflare HTTPS 订阅' \
     '重新生成订阅密钥'; do
