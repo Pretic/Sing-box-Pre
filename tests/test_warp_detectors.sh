@@ -14,7 +14,7 @@ extract_function() {
 }
 
 source <(
-    for name in check_unlock_netflix check_unlock_disney check_unlock_chatgpt \
+    for name in warp_platform_curl check_unlock_netflix check_unlock_disney check_unlock_chatgpt \
       extract_html_visible_text check_unlock_gemini run_selected_unlock_checks; do
         extract_function "$name"
     done

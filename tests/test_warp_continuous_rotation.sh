@@ -56,6 +56,11 @@ if rotate_warp_identity_until_new; then unsafe_rc=0; else unsafe_rc=$?; fi
 [[ "$unsafe_rc" -eq 2 ]] || fail "unsafe result returned ${unsafe_rc}, expected 2"
 [[ "$ROTATE_CALLS" -eq 1 ]] || fail 'unsafe result did not stop immediately'
 
+reset_case 4 0
+if rotate_warp_identity_until_new; then network_rc=0; else network_rc=$?; fi
+[[ "$network_rc" -eq 4 ]] || fail "network stop returned ${network_rc}, expected 4"
+[[ "$ROTATE_CALLS" -eq 1 ]] || fail 'network outage started another registration batch'
+
 reset_case 1 1 1 1 0
 WARP_ROTATION_MAX_BATCHES=4
 if rotate_warp_identity_until_new; then capped_rc=0; else capped_rc=$?; fi

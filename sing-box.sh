@@ -11120,7 +11120,7 @@ manage_argo() {
     skyblue "------------"
     green "2. 停止Argo服务"
     skyblue "------------"
-    green "3. 重启Argo服务"
+    green "3. 重启Argo服务（临时隧道会同步更新域名）"
     skyblue "------------"
     green "4. 添加Argo固定隧道"
     skyblue "----------------"
@@ -11147,11 +11147,14 @@ manage_argo() {
                 return 1
             }
             if [ "$argo_mode" = quick ]; then
-                get_quick_tunnel && change_argo_domain
+                refresh_quick_argo "$service_file" || return $?
             else
-                green "\n当前使用固定隧道,无需获取临时域名"
-                sleep 2
-                menu
+                if restart_argo; then
+                    green "\n固定 Argo 隧道服务已重启，域名保持不变。"
+                else
+                    red "固定 Argo 隧道服务重启失败，请检查服务日志。"
+                    return 1
+                fi
             fi
             ;;
         4)
@@ -12274,11 +12277,136 @@ commit_warp_identity_pair() {
 # 私钥始终在本机生成；账户令牌和 endpoint 仅以 600 权限保存在本机。
 # 返回 1 表示没有遗留云端注册，可由调用者重试；返回 2 表示注册状态不确定
 # 或清理失败，恢复材料已尽可能保留，调用者必须停止重试。
+warp_underlay_family() {
+    if ip -4 route get 1.1.1.1 >/dev/null 2>&1; then
+        printf '4\n'
+    elif ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then
+        printf '6\n'
+    else
+        printf '4\n'
+    fi
+}
+
+warp_bootstrap_ip_valid() {
+    local ip="${1:-}"
+    if is_valid_ipv4_address "$ip"; then
+        case "$ip" in 0.*|10.*|127.*|169.254.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 1 ;; esac
+        [ "${ip%%.*}" -lt 224 ]
+    else
+        is_valid_ipv6_address "$ip" && [[ "$ip" == [23]*:* ]]
+    fi
+}
+
+warp_forget_bootstrap_ip() {
+    case "${1:-}" in api.cloudflareclient.com|engage.cloudflareclient.com) ;; *) return 1 ;; esac
+    local dir="${conf_dir}/warp/dns-cache"
+    [ ! -L "${conf_dir}/warp" ] && [ ! -L "$dir" ] || return 1
+    rm -f -- "$dir/$1.json"
+}
+
+warp_resolve_bootstrap_ip() {
+    local host="${1:-}" fresh_doh="${2:-false}" dir="${conf_dir}/warp/dns-cache" cache now ip='' expires ttl=30
+    local native provider resolver bootstrap url payload answers value record_ttl tmp family query_type query_number
+    case "$host" in api.cloudflareclient.com|engage.cloudflareclient.com) ;; *) return 1 ;; esac
+    cache="$dir/$host.json"
+    family=$(warp_underlay_family)
+    case "$family" in 6) query_type=AAAA; query_number=28 ;; *) query_type=A; query_number=1 ;; esac
+    [ ! -L "${conf_dir}/warp" ] && [ ! -L "$dir" ] && [ ! -L "$cache" ] || return 1
+    mkdir -p "$dir" && chmod 700 "$dir" || return 1
+    now=$(date +%s) || return 1
+    if [ "$fresh_doh" != true ] && [ -f "$cache" ]; then
+        IFS=$'\t' read -r ip expires < <(jq -r --arg host "$host" \
+            'select(.host==$host) | [.ip,.expires] | @tsv' "$cache" 2>/dev/null) || true
+        if [[ "$expires" =~ ^[0-9]{1,11}$ ]] && [ "$expires" -gt "$now" ] && \
+           [ "$expires" -le "$((now+60))" ] && warp_bootstrap_ip_valid "$ip" && \
+           is_valid_ipv"${family}"_address "$ip"; then
+            printf '%s\n' "$ip"; return 0
+        fi
+        rm -f -- "$cache" || return 1
+    fi
+    ip=''
+    native=''
+    if [ "$fresh_doh" != true ]; then native=$(timeout 3 getent ahosts "$host" 2>/dev/null || true); fi
+    while read -r value _; do
+        is_valid_ipv"${family}"_address "$value" || continue
+        if warp_bootstrap_ip_valid "$value"; then ip="$value"; break; fi
+    done <<< "$native"
+    if [ -z "$ip" ]; then
+        for provider in cloudflare google; do
+            if [ "$provider" = cloudflare ]; then
+                resolver=cloudflare-dns.com; bootstrap='1.1.1.1,[2606:4700:4700::1111]'; url=https://cloudflare-dns.com/dns-query
+            else
+                resolver=dns.google; bootstrap='8.8.8.8,[2001:4860:4860::8888]'; url=https://dns.google/resolve
+            fi
+            payload=$(curl -q --noproxy '*' --proto '=https' --retry 0 -fsS \
+                --connect-timeout 2 --max-time 4 --max-filesize 16384 \
+                --resolve "${resolver}:443:${bootstrap}" --get --data-urlencode "name=$host" \
+                --data-urlencode "type=$query_type" -H 'accept: application/dns-json' "$url" 2>/dev/null || true)
+            answers=$(jq -r --arg host "$host" --argjson type "$query_number" '
+                select(.Status==0 and any(.Question[]?; (.name|ascii_downcase|rtrimstr("."))==$host and .type==$type)) |
+                .Answer[]? | select(.type==$type and (.TTL|type)=="number" and .TTL>=0) | [.data,.TTL] | @tsv
+                ' <<< "$payload" 2>/dev/null || true)
+            while IFS=$'\t' read -r value record_ttl; do
+                is_valid_ipv"${family}"_address "$value" || continue
+                if warp_bootstrap_ip_valid "$value" && [[ "$record_ttl" =~ ^[0-9]{1,9}$ ]]; then
+                    ip="$value"; ttl="$record_ttl"; break
+                fi
+            done <<< "$answers"
+            [ -z "$ip" ] || break
+        done
+    fi
+    [ -n "$ip" ] || return 1
+    [ "$ttl" -le 60 ] || ttl=60
+    if [ "$ttl" -gt 0 ]; then
+        tmp=$(mktemp "$dir/.dns.XXXXXX") || return 1
+        if ! jq -n --arg host "$host" --arg ip "$ip" --argjson expires "$((now+ttl))" \
+            '{host:$host,ip:$ip,expires:$expires}' > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$cache"; then
+            rm -f -- "$tmp"; return 1
+        fi
+    fi
+    printf '%s\n' "$ip"
+}
+
+# 0=HTTP 200; 1=explicit rejection; 2=outcome unknown (retain recovery);
+# 4=confirmed pre-request network failure (clean local files and stop the action).
+warp_registration_post() {
+    local request="$1" response="$2" attempt ip meta rc http sent uploaded extra
+    for attempt in 1 2; do
+        ip=$(warp_resolve_bootstrap_ip api.cloudflareclient.com "$([ "$attempt" -eq 2 ] && echo true || echo false)") || return 4
+        [[ "$ip" != *:* ]] || ip="[$ip]"
+        : > "$response" || return 2
+        chmod 600 "$response" || return 2
+        rc=0
+        meta=$(curl -q --noproxy '*' --proto '=https' --retry 0 -sS \
+            --connect-timeout 10 --max-time 45 --resolve "api.cloudflareclient.com:443:$ip" \
+            -o "$response" -w $'%{http_code}\t%{size_request}\t%{size_upload}' \
+            --request POST 'https://api.cloudflareclient.com/v0a2158/reg' \
+            --header 'User-Agent: okhttp/3.12.1' --header 'CF-Client-Version: a-6.10-2158' \
+            --header 'Content-Type: application/json' --data-binary "@$request") || rc=$?
+        IFS=$'\t' read -r http sent uploaded extra <<< "$meta"
+        if [ "$rc" -eq 0 ] && [ "$http" = 200 ]; then return 0; fi
+        if [ "$rc" -eq 0 ] && [[ "$http" =~ ^(400|401|403|404|405|422|429)$ ]] && \
+           ! jq -e 'has("id") or has("token")' "$response" >/dev/null 2>&1; then
+            return 1
+        fi
+        # No redirects, proxy, curlrc or automatic retries can hide an earlier POST.
+        if [[ "$rc" =~ ^(6|7)$ ]] && [ "$http" = 000 ] && [ "$sent" = 0 ] && \
+           [[ "$uploaded" =~ ^0([.]0+)?$ ]] && [ -z "$extra" ] && [ ! -s "$response" ]; then
+            warp_forget_bootstrap_ip api.cloudflareclient.com || return 4
+            [ "$attempt" -lt 2 ] || return 4
+            sleep 1
+        else
+            return 2
+        fi
+    done
+    return 4
+}
+
 generate_unique_warp_identity() {
     local state_dir="${1:-${conf_dir}/warp}"
     local register_dir response_file request_file endpoint_file account_file
     local singbox_bin keypair private_key public_key random_hex install_id fcm_token tos
-    local http_code client_id reserved_bytes r1 r2 r3 extra
+    local request_rc client_id reserved_bytes r1 r2 r3 extra
     local v4 v6 peer_key failure_rc commit_rc
 
     command_exists curl || { red "生成独立 WARP 身份需要 curl。"; return 1; }
@@ -12334,22 +12462,21 @@ generate_unique_warp_identity() {
       }
     chmod 600 "$request_file"
 
-    http_code=""
-    if ! http_code=$(curl -sS --location --connect-timeout 10 --max-time 45 \
-      -o "$response_file" -w '%{http_code}' \
-      --request POST 'https://api.cloudflareclient.com/v0a2158/reg' \
-      --header 'User-Agent: okhttp/3.12.1' \
-      --header 'CF-Client-Version: a-6.10-2158' \
-      --header 'Content-Type: application/json' \
-      --data-binary "@${request_file}"); then
+    if warp_registration_post "$request_file" "$response_file"; then request_rc=0; else request_rc=$?; fi
+    if [ "$request_rc" -eq 2 ]; then
         [ ! -e "$response_file" ] || chmod 600 "$response_file" 2>/dev/null || true
         red "Cloudflare WARP 注册请求结果不确定，已停止后续注册尝试。"
         red "注册恢复材料保留在: ${register_dir}"
         return 2
     fi
     [ ! -e "$response_file" ] || chmod 600 "$response_file" 2>/dev/null || true
-    if [ "$http_code" != 200 ]; then
-        rm -rf -- "$register_dir"
+    if [ "$request_rc" -eq 4 ]; then
+        rm -rf -- "$register_dir" || return 2
+        red "WARP 注册前的 DNS/连接不可用，本轮已停止；未发送的请求不会被误记为未知注册。"
+        return 4
+    fi
+    if [ "$request_rc" -ne 0 ]; then
+        rm -rf -- "$register_dir" || return 2
         red "Cloudflare WARP 注册失败，现有配置未修改。"
         return 1
     fi
@@ -12441,15 +12568,19 @@ generate_unique_warp_identity() {
 }
 
 delete_warp_registration() {
-    local account_file="$1" device_id device_token
+    local account_file="$1" device_id device_token ip http
     [ -s "$account_file" ] || return 0
     device_id=$(jq -r '.id // empty' "$account_file" 2>/dev/null)
     device_token=$(jq -r '.token // empty' "$account_file" 2>/dev/null)
     [ -n "$device_id" ] && [ -n "$device_token" ] || return 0
-    curl -fsS --connect-timeout 5 --max-time 15 -X DELETE \
+    ip=$(warp_resolve_bootstrap_ip api.cloudflareclient.com) || return 1
+    [[ "$ip" != *:* ]] || ip="[$ip]"
+    http=$(curl -q --noproxy '*' --proto '=https' --retry 0 -fsS --connect-timeout 5 --max-time 15 \
+      --resolve "api.cloudflareclient.com:443:$ip" -o /dev/null -w '%{http_code}' -X DELETE \
       "https://api.cloudflareclient.com/v0a2158/reg/${device_id}" \
       -H "Authorization: Bearer ${device_token}" \
-      -H 'User-Agent: okhttp/3.12.1' >/dev/null 2>&1 || return 1
+      -H 'User-Agent: okhttp/3.12.1' 2>/dev/null) || return 1
+    [[ "$http" == 200 || "$http" == 204 ]]
 }
 
 WARP_PROBE_PID=''
@@ -12475,20 +12606,71 @@ stop_warp_candidate_proxy() {
         wait "$WARP_PROBE_PID" 2>/dev/null || true
     fi
     [ "$safe_dir" = true ] && rm -rf -- "$WARP_PROBE_DIR"
-    unset WARP_PROBE_PID WARP_PROBE_DIR WARP_PROBE_PROXY WARP_PROBE_PORT WARP_PROBE_FAMILY
+    unset WARP_PROBE_PID WARP_PROBE_DIR WARP_PROBE_PROXY WARP_PROBE_PORT WARP_PROBE_FAMILY WARP_PROBE_BINARY
+}
+
+render_warp_probe_config() {
+    local endpoint="$1" port="$2" family="$3" mode="${4:-local}" strategy cf_dns=1.1.1.1 google_dns=8.8.8.8
+    case "$family" in 4) strategy=ipv4_only ;; 6) strategy=ipv6_only ;; *) return 1 ;; esac
+    case "$mode" in local|cloudflare|google) ;; *) return 1 ;; esac
+    if [ "$(warp_underlay_family)" = 6 ]; then
+        cf_dns=2606:4700:4700::1111; google_dns=2001:4860:4860::8888
+    fi
+    jq -n --argjson endpoint "$endpoint" --argjson port "$port" --arg strategy "$strategy" --arg mode "$mode" \
+        --arg cf_dns "$cf_dns" --arg google_dns "$google_dns" '
+        {log:{level:"error"},
+         dns:{servers:[{tag:"local",type:"local"},
+             {tag:"cloudflare",type:"https",server:$cf_dns,tls:{enabled:true,server_name:"cloudflare-dns.com"}},
+             {tag:"google",type:"https",server:$google_dns,tls:{enabled:true,server_name:"dns.google"}}],
+             strategy:$strategy,final:$mode},
+         inbounds:[{type:"mixed",tag:"warp-probe",listen:"127.0.0.1",listen_port:$port}],
+         endpoints:[$endpoint],route:{final:"wireguard-out"}}
+    '
+}
+
+# Switch DNS only inside our temporary proxy, keeping the same identity and port.
+warp_probe_dns_fallback() {
+    local mode binary="${WARP_PROBE_BINARY:-${work_dir}/${server_name}}" tmp
+    case "${WARP_PROBE_DIR:-}" in "${conf_dir}/warp/.probe."*) ;; *) return 1 ;; esac
+    [ -f "$WARP_PROBE_DIR/config.json" ] && [ -r "/proc/${WARP_PROBE_PID:-}/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$WARP_PROBE_PID/cmdline" | grep -Fq "$WARP_PROBE_DIR/config.json" || return 1
+    mode=$(jq -r '.dns.final // "local"' "$WARP_PROBE_DIR/config.json") || return 1
+    case "$mode" in local) mode=cloudflare ;; cloudflare) mode=google ;; *) return 1 ;; esac
+    tmp=$(mktemp "$WARP_PROBE_DIR/.dns.XXXXXX") || return 1
+    jq --arg mode "$mode" '.dns.final=$mode' "$WARP_PROBE_DIR/config.json" > "$tmp" && \
+        "$binary" check -c "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; return 1; }
+    kill "$WARP_PROBE_PID" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    local stop_attempt
+    for stop_attempt in {1..10}; do
+        kill -0 "$WARP_PROBE_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -0 "$WARP_PROBE_PID" 2>/dev/null && kill -9 "$WARP_PROBE_PID" 2>/dev/null || true
+    wait "$WARP_PROBE_PID" 2>/dev/null || true
+    mv -f -- "$tmp" "$WARP_PROBE_DIR/config.json" || return 1
+    "$binary" run -c "$WARP_PROBE_DIR/config.json" >> "$WARP_PROBE_DIR/sing-box.log" 2>&1 &
+    WARP_PROBE_PID=$!
+    sleep 1
+    kill -0 "$WARP_PROBE_PID" 2>/dev/null
 }
 
 start_warp_candidate_proxy() {
-    local endpoint_json="$1" family="${2:-4}" singbox_bin port attempt target_strategy
+    local endpoint_json="$1" family="${2:-4}" singbox_bin port attempt peer_host peer_ip
     case "$family" in
-      4) target_strategy=prefer_ipv4 ;;
-      6) target_strategy=prefer_ipv6 ;;
+      4|6) ;;
       *) return 1 ;;
     esac
     warp_endpoint_is_valid "$endpoint_json" || return 1
     endpoint_json=$(jq -c '
       .domain_resolver = {server:"local",strategy:"prefer_ipv4"}
     ' <<< "$endpoint_json") || return 1
+    # Bootstrap the WireGuard peer before starting it. The cached address is only
+    # installed in this short-lived config, never pinned into the saved identity.
+    peer_host=$(jq -r '.peers[0].address // empty' <<< "$endpoint_json")
+    if [ "$peer_host" = engage.cloudflareclient.com ]; then
+        peer_ip=$(warp_resolve_bootstrap_ip "$peer_host") || return 1
+        endpoint_json=$(jq -c --arg ip "$peer_ip" '.peers[0].address=$ip' <<< "$endpoint_json") || return 1
+    fi
     stop_warp_candidate_proxy
     mkdir -p "${conf_dir}/warp" && chmod 700 "${conf_dir}/warp"
     WARP_PROBE_DIR=$(mktemp -d "${conf_dir}/warp/.probe.XXXXXX") || return 1
@@ -12501,20 +12683,13 @@ start_warp_candidate_proxy() {
         fi
     done
     [ -n "${WARP_PROBE_PORT:-}" ] || { stop_warp_candidate_proxy; return 1; }
-    jq -n --argjson endpoint "$endpoint_json" --argjson port "$WARP_PROBE_PORT" \
-      --arg strategy "$target_strategy" '
-      {
-        log:{level:"error"},
-        dns:{servers:[{tag:"local",type:"local"}],strategy:$strategy},
-        inbounds:[{type:"mixed",tag:"warp-probe",listen:"127.0.0.1",listen_port:$port}],
-        endpoints:[$endpoint],
-        route:{final:"wireguard-out"}
-      }
-    ' > "${WARP_PROBE_DIR}/config.json" || { stop_warp_candidate_proxy; return 1; }
+    render_warp_probe_config "$endpoint_json" "$WARP_PROBE_PORT" "$family" \
+        > "${WARP_PROBE_DIR}/config.json" || { stop_warp_candidate_proxy; return 1; }
     chmod 600 "${WARP_PROBE_DIR}/config.json"
     singbox_bin="${work_dir}/${server_name}"
     [ -x "$singbox_bin" ] || singbox_bin=$(command -v sing-box 2>/dev/null || true)
     [ -x "$singbox_bin" ] || { stop_warp_candidate_proxy; return 1; }
+    WARP_PROBE_BINARY="$singbox_bin"
     "$singbox_bin" check -c "${WARP_PROBE_DIR}/config.json" >/dev/null 2>&1 || {
         stop_warp_candidate_proxy; return 1
     }
@@ -12556,6 +12731,11 @@ probe_warp_trace() {
           https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null); then
             break
         fi
+        # At most two DNS profile changes; both reconnect the same saved identity.
+        if [ -n "${WARP_PROBE_DIR:-}" ] && [ "$attempt" -le 2 ] && \
+           [ "$((deadline-$(date +%s)))" -gt 3 ]; then
+            warp_probe_dns_fallback || true
+        fi
         [ "$attempt" -lt 16 ] || return 1
         remaining=$(( deadline - $(date +%s) ))
         [ "$remaining" -gt 2 ] || return 1
@@ -12565,7 +12745,12 @@ probe_warp_trace() {
     WARP_PROBE_LOC=$(awk -F= '/^loc=/{print $2; exit}' <<< "$trace")
     WARP_PROBE_COLO=$(awk -F= '/^colo=/{print $2; exit}' <<< "$trace")
     WARP_PROBE_STATE=$(awk -F= '/^warp=/{print $2; exit}' <<< "$trace")
-    [ -n "$WARP_PROBE_IP" ] && [[ "$WARP_PROBE_STATE" =~ ^(on|plus)$ ]]
+    [ -n "$WARP_PROBE_IP" ] && [[ "$WARP_PROBE_STATE" =~ ^(on|plus)$ ]] || return 1
+    case "${WARP_PROBE_FAMILY:-}" in
+        4) is_valid_ipv4_address "$WARP_PROBE_IP" || return 1 ;;
+        6) is_valid_ipv6_address "$WARP_PROBE_IP" || return 1 ;;
+    esac
+    return 0
 }
 
 get_warp_preferred_family() {
@@ -12632,10 +12817,25 @@ render_warp_route_family() {
     ' "$source_file" > "$output_file"
 }
 
+warp_platform_curl() {
+    local rc=0
+    curl "$@" || rc=$?
+    case "$rc" in
+        5|6|7|28|35|52|55|56|97)
+            case "${WARP_PROBE_DIR:-}" in
+                "${conf_dir:-}/warp/.probe."*)
+                    [ ! -d "$WARP_PROBE_DIR" ] || : > "$WARP_PROBE_DIR/transport-failure"
+                    ;;
+            esac
+            ;;
+    esac
+    return "$rc"
+}
+
 check_unlock_netflix() {
     local proxy="$1" title body parsed_region region='' successful=0 playable=false
     for title in 81280792 70143836; do
-        if body=$(curl -fsSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+        if body=$(warp_platform_curl -fsSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
           -A 'Mozilla/5.0' "https://www.netflix.com/title/${title}" 2>/dev/null); then
             successful=$((successful + 1))
             parsed_region=$(sed -n 's/.*"requestCountry"[^}]*"id"[ ]*:[ ]*"\([A-Za-z][A-Za-z]\)".*/\1/p' \
@@ -12655,14 +12855,14 @@ check_unlock_netflix() {
 
 check_unlock_disney() {
     local proxy="$1" assertion token_content refresh_token graph_payload graph_result effective region supported
-    assertion=$(curl -fsS --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+    assertion=$(warp_platform_curl -fsS --connect-timeout 5 --max-time 12 --proxy "$proxy" \
       -A 'Mozilla/5.0' -X POST https://disney.api.edge.bamgrid.com/devices \
       -H 'authorization: Bearer ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84' \
       -H 'content-type: application/json; charset=UTF-8' \
       -d '{"deviceFamily":"browser","applicationRuntime":"chrome","deviceProfile":"windows","attributes":{}}' 2>/dev/null || true)
     assertion=$(jq -r '.assertion // empty' <<< "$assertion" 2>/dev/null)
     [ -n "$assertion" ] || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
-    token_content=$(curl -fsS --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+    token_content=$(warp_platform_curl -fsS --connect-timeout 5 --max-time 12 --proxy "$proxy" \
       -A 'Mozilla/5.0' -X POST https://disney.api.edge.bamgrid.com/token \
       -H 'authorization: Bearer ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84' \
       -H 'content-type: application/x-www-form-urlencoded' \
@@ -12677,14 +12877,14 @@ check_unlock_disney() {
     [ -n "$refresh_token" ] || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
     graph_payload=$(jq -n --arg refresh "$refresh_token" \
       '{query:"mutation refreshToken($input: RefreshTokenInput!) { refreshToken(refreshToken: $input) { activeSession { sessionId } } }",variables:{input:{refreshToken:$refresh}}}')
-    graph_result=$(curl -fsSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+    graph_result=$(warp_platform_curl -fsSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
       -A 'Mozilla/5.0' -X POST https://disney.api.edge.bamgrid.com/graph/v1/device/graphql \
       -H 'authorization: ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84' \
       -H 'content-type: application/json' -d "$graph_payload" 2>/dev/null || true)
     region=$(sed -n 's/.*"countryCode":[ ]*"\([^"]*\)".*/\1/p' <<< "$graph_result" | head -1)
     supported=$(sed -n 's/.*"inSupportedLocation":[ ]*\([^,}]*\).*/\1/p' <<< "$graph_result" | head -1)
     [ -n "$region" ] || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
-    effective=$(curl -fsSL -o /dev/null -w '%{url_effective}' --connect-timeout 5 --max-time 12 \
+    effective=$(warp_platform_curl -fsSL -o /dev/null -w '%{url_effective}' --connect-timeout 5 --max-time 12 \
       --proxy "$proxy" -A 'Mozilla/5.0' https://www.disneyplus.com 2>/dev/null) || {
         WARP_UNLOCK_STATUS='检测失败'; return 2
     }
@@ -12699,12 +12899,12 @@ check_unlock_disney() {
 
 check_unlock_chatgpt() {
     local proxy="$1" web_meta web_code web_url ios_file ios_meta ios_code restriction
-    web_meta=$(curl -sSIL -L --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+    web_meta=$(warp_platform_curl -sSIL -L --connect-timeout 5 --max-time 12 --proxy "$proxy" \
       -A 'Mozilla/5.0' -o /dev/null -w $'%{http_code}\t%{url_effective}' \
       https://chatgpt.com 2>/dev/null) || web_meta=''
     IFS=$'\t' read -r web_code web_url <<< "$web_meta"
     ios_file=$(mktemp) || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
-    if ! ios_meta=$(curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+    if ! ios_meta=$(warp_platform_curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
       -A 'Mozilla/5.0' -o "$ios_file" -w '%{http_code}' \
       https://ios.chat.openai.com 2>/dev/null); then
         rm -f -- "$ios_file"; WARP_UNLOCK_STATUS='检测失败'; return 2
@@ -12955,7 +13155,7 @@ check_unlock_gemini() {
     local proxy="$1" result meta code effective visible curl_rc
     WARP_UNLOCK_STATUS='检测失败'
     result=$(mktemp) || return 2
-    if meta=$(curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
+    if meta=$(warp_platform_curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
       -A 'Mozilla/5.0' -H 'Accept-Language: en-US,en;q=0.9' -o "$result" \
       -w $'%{http_code}\t%{url_effective}' https://gemini.google.com/app 2>/dev/null); then
         :
@@ -12993,8 +13193,12 @@ check_unlock_gemini() {
 }
 
 run_selected_unlock_checks() {
-    local proxy="$1" selection="$2" progress="${3:-false}" digit label checker rc overall=0
+    local proxy="$1" selection="$2" progress="${3:-false}" digit label checker rc overall=0 marker=''
     WARP_UNLOCK_SUMMARY=''
+    WARP_UNLOCK_TRANSPORT_FAILED=0
+    case "${WARP_PROBE_DIR:-}" in
+        "${conf_dir:-}/warp/.probe."*) marker="$WARP_PROBE_DIR/transport-failure" ;;
+    esac
     [[ "$selection" =~ ^[1-4]+$ ]] || return 1
     for digit in 1 2 3 4; do
         [[ "$selection" == *"$digit"* ]] || continue
@@ -13005,8 +13209,21 @@ run_selected_unlock_checks() {
           4) label='Gemini'; checker=check_unlock_gemini ;;
         esac
         [ "$progress" != true ] || printf '正在检测 %s...\n' "$label"
+        [ -z "$marker" ] || rm -f -- "$marker"
         rc=0
         "$checker" "$proxy" || rc=$?
+        if [ "$rc" -eq 2 ] && [ -n "$marker" ] && [ -f "$marker" ]; then
+            [ "$progress" != true ] || printf '%s 连接失败，正在复核同一 WARP 连接...\n' "$label"
+            if probe_warp_trace "$proxy"; then
+                rm -f -- "$marker"
+                rc=0
+                "$checker" "$proxy" || rc=$?
+                if [ "$rc" -eq 2 ] && [ -f "$marker" ]; then WARP_UNLOCK_TRANSPORT_FAILED=1; fi
+            else
+                WARP_UNLOCK_TRANSPORT_FAILED=1
+                WARP_UNLOCK_STATUS='WARP 连接暂不可用'
+            fi
+        fi
         WARP_UNLOCK_SUMMARY+="${label}: ${WARP_UNLOCK_STATUS}"$'\n'
         [ "$progress" != true ] || printf '%s: %s\n' "$label" "$WARP_UNLOCK_STATUS"
         [ "$rc" -eq 0 ] || overall=1
@@ -13160,6 +13377,15 @@ verify_activated_warp() {
         fi
         if [ "$rc" -eq 0 ] && [ -n "$selection" ]; then
             if run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection"; then rc=0; else rc=$?; fi
+            # A transport recovery may reconnect the probe and update its exit IP.
+            if [ "$rc" -eq 0 ]; then
+                if [ "$family" = 4 ]; then
+                    [[ "$WARP_PROBE_IP" != *:* ]] && \
+                      { [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ]; } || rc=1
+                else
+                    [[ "$WARP_PROBE_IP" == *:* ]] || rc=1
+                fi
+            fi
         fi
     fi
     stop_warp_candidate_proxy
@@ -13237,6 +13463,11 @@ rotate_warp_identity_once() {
         chmod 700 "$candidate_dir"
         if generate_unique_warp_identity "$candidate_dir"; then generate_rc=0; else generate_rc=$?; fi
         if [ "$generate_rc" -ne 0 ]; then
+            if [ "$generate_rc" -eq 4 ]; then
+                remove_warp_candidate_dir "$candidate_dir" || return 2
+                red "WARP 注册前网络不可用，已停止本轮更换，原身份保持不变。"
+                return 4
+            fi
             if [ "$generate_rc" -eq 2 ]; then
                 red "候选 WARP 注册状态不确定或云端清理失败，已停止更换。"
                 red "候选凭据保留在: ${candidate_dir}"
@@ -13299,9 +13530,8 @@ rotate_warp_identity_once() {
                 red "候选凭据保留在: ${candidate_dir}"
                 return 2
             fi
-            failed_candidates=$((failed_candidates + 1))
-            [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
-            continue
+            red "候选 WARP 连接复核失败，已停止后续注册，原身份保持不变。"
+            return 4
         fi
         if [ -z "$new_ip" ]; then
             same_ip_candidates=$((same_ip_candidates + 1))
@@ -13405,6 +13635,7 @@ auto_select_warp_candidate() {
     local attempt candidate_ip activate_rc generate_rc selected_family=4
     local candidate_ipv4='' candidate_ipv6='' proxy_started probe_ok
     local WARP_MAX_CANDIDATES=5
+    WARP_UNLOCK_TRANSPORT_FAILED=0
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
         red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
     }
@@ -13423,6 +13654,11 @@ auto_select_warp_candidate() {
         candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
         chmod 700 "$candidate_dir"
         if generate_unique_warp_identity "$candidate_dir"; then generate_rc=0; else generate_rc=$?; fi
+        if [ "$generate_rc" -eq 4 ]; then
+            remove_warp_candidate_dir "$candidate_dir" || return 2
+            red "WARP 注册前网络不可用，已停止本轮优选，原身份保持不变。"
+            return 4
+        fi
         if [ "$generate_rc" -eq 2 ]; then
             red "候选 WARP 注册状态不确定或云端清理失败，自动优选已立即停止。"
             red "候选凭据保留在: ${candidate_dir}"
@@ -13509,6 +13745,10 @@ auto_select_warp_candidate() {
             red "候选本地文件清理失败，自动优选已立即停止。"
             red "候选凭据保留在: ${candidate_dir}"
             return 2
+        fi
+        if [ "$probe_ok" != true ] || [ "${WARP_UNLOCK_TRANSPORT_FAILED:-0}" -eq 1 ]; then
+            red "网络复核仍失败，已停止后续注册；原 WARP 身份保持不变。"
+            return 4
         fi
         [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
     done
@@ -14809,6 +15049,9 @@ dispatch_warp_rotation_menu_action() {
         red "WARP 身份更换未安全完成：回滚或状态不完整。"
         red "请停止使用自动结论，并按上方提示的恢复目录处理。"
         ;;
+      4)
+        red "WARP 网络暂不可用，已停止后续注册；原身份和分流配置保持不变。"
+        ;;
       *)
         red "WARP 身份更换返回未知状态 ${rotate_rc}，请检查上方日志后再处理。"
         ;;
@@ -14990,21 +15233,21 @@ set_global_outbound() {
         sleep 2; add_rule_menu; return
     fi
 
-    # 检查是否存在 socks5/http 代理出站（排除 direct 和 wireguard-out）
-    local proxy_tags
-    proxy_tags=($(jq -r '.outbounds[] | select(.tag != "direct" and .tag != "wireguard-out") | .tag' \
-        "$outbound_file" 2>/dev/null))
-
-    if [ ${#proxy_tags[@]} -eq 0 ]; then
-        yellow "\n当前没有可用的 socks5/http 代理出站。"
-        yellow "请先返回 → 添加 Socks5/HTTP 出站，再设置全局代理。\n"
-        sleep 3; add_rule_menu; return
-    fi
+    # 内置 WireGuard 位于 endpoints 中，也应作为全局出站候选。
+    local -a proxy_tags
+    mapfile -t proxy_tags < <(
+        printf '%s\n' wireguard-out
+        jq -r '.outbounds[]? | select(.tag != "direct" and .tag != "wireguard-out") | .tag' "$outbound_file"
+    )
 
     echo ""
     green "请选择全局代理出站:"
     for i in "${!proxy_tags[@]}"; do
-        echo -e "  ${green}$((i+1)). ${skyblue}${proxy_tags[$i]}${re}"
+        if [ "${proxy_tags[$i]}" = wireguard-out ]; then
+            echo -e "  ${green}$((i+1)). ${skyblue}wireguard-out [内置WARP]${re}"
+        else
+            echo -e "  ${green}$((i+1)). ${skyblue}${proxy_tags[$i]}${re}"
+        fi
     done
     echo ""
     reading "请输入编号: " out_choice
@@ -16650,11 +16893,11 @@ cfy_executable_path() {
 }
 
 cfy_download_url() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/2eb6b4611986d1fd0939c7dcf90aeb9e0704d202/cfy.sh}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/80231df35f6a0cca9bf5f7b44d89bc3cf08c855a/cfy.sh}"
 }
 
 cfy_expected_download_sha256() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-959cdeb10a205332825ccdc9ac7cd9fb9f6220de63fb3fed1ec061cbc2ee9ee6}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-65363e470bcab5b7bbefd12b4c78322370e3f17870988f6531099437aeaf322e}"
 }
 
 validate_cfy_target_path() {
@@ -16902,6 +17145,11 @@ menu() {
     nginx_status=$(check_nginx 2>/dev/null)
     argo_status=$(check_argo 2>/dev/null)
     warp_status=$(get_warp_menu_status 2>/dev/null || echo degraded)
+    case "$warp_status" in
+        running) warp_status=$(green "$warp_status") ;;
+        degraded) warp_status=$(yellow "$warp_status") ;;
+        *) warp_status=$(red "$warp_status") ;;
+    esac
 
     clear; echo ""
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
@@ -16963,7 +17211,7 @@ else
                 4)  manage_argo;        need_pause=true ;;
                 5)  check_nodes;        need_pause=true ;;
                 6)  change_config;      need_pause=true ;;
-                7)  disable_open_sub;   need_pause=true ;;
+                7)  disable_open_sub;   need_pause=false ;;
                 8)  warp_manage;        need_pause=false ;;
                 9)  manage_protocols;   need_pause=false ;;
                 10)

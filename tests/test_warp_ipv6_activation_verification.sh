@@ -64,4 +64,10 @@ run_selected_unlock_checks() { return 2; }
 if verify_activated_warp '' 1234 4; then fail 'inconclusive platforms were accepted'; else rc=$?; fi
 [[ "$rc" == 2 && "$STOPS" == 1 ]] || fail 'activation failure lost its result or left a probe running'
 
+ACTUAL_IP='198.51.100.20'
+run_selected_unlock_checks() { WARP_PROBE_IP='198.51.100.21'; return 0; }
+if verify_activated_warp '198.51.100.20' 1234 4; then
+    fail 'platform recovery invalidated the expected IPv4 check'
+fi
+
 echo 'WARP IPv6 activation verification tests passed.'

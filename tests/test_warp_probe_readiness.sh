@@ -3,6 +3,9 @@ set -euo pipefail
 
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
 source <(sed -n '/^probe_warp_trace() {/,/^}/p' "$script")
+for name in is_valid_ipv4_address is_valid_ipv6_address; do
+    source <(sed -n "/^${name}() {/,/^}/p" "$script")
+done
 test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT
 attempt_file="$test_dir/attempts"
@@ -22,6 +25,8 @@ curl() {
         ;;
       failed) return 28 ;;
       direct) printf 'ip=192.0.2.1\nwarp=off\n' ;;
+      ipv4) printf 'ip=104.28.1.2\nwarp=on\n' ;;
+      ipv6) printf 'ip=2606:4700::1\nwarp=on\n' ;;
     esac
 }
 scenario=warming
@@ -36,4 +41,12 @@ scenario=direct
 rm -f "$attempt_file"
 if probe_warp_trace socks5h://127.0.0.1:20000; then echo 'FAIL: direct connection was accepted as WARP' >&2; exit 1; fi
 [[ "$(cat "$attempt_file")" == 1 ]] || { echo 'FAIL: definitive non-WARP response was retried' >&2; exit 1; }
+for WARP_PROBE_FAMILY in 4 6; do
+    scenario="ipv${WARP_PROBE_FAMILY}"
+    probe_warp_trace socks5h://127.0.0.1:20000 || exit 1
+    if [[ "$WARP_PROBE_FAMILY" == 4 ]]; then scenario=ipv6; else scenario=ipv4; fi
+    if probe_warp_trace socks5h://127.0.0.1:20000; then
+        echo 'FAIL: wrong exit IP family was accepted' >&2; exit 1
+    fi
+done
 echo 'WARP probe readiness tests passed.'

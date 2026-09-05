@@ -131,6 +131,9 @@ jq() {
     fi
 }
 command_exists() { return 0; }
+# Transport is tested with real jq in test_warp_registration_transport.sh.
+# Keep these identity-commit fixtures independent of DNS and curl metadata.
+warp_registration_post() { curl -o "$2" >/dev/null; }
 curl() {
     local output_file='' arg
     [ "$CURL_MODE" = registered ] || return 1
@@ -361,24 +364,21 @@ fi
 assert_candidate_delete_targets 0
 assert_no_candidate_directories
 
-reset_fixture
-GENERATION_RESULTS=(1 0 0 0)
-START_RESULTS=(1 0 0)
-TRACE_RESULTS=(1 0)
-TRACE_IPS=(unused B)
-rotate_warp_identity_once || fail 'rotation did not continue past transient candidate failures'
-[ "$GENERATE_CALLS" -eq 4 ] || fail "generated ${GENERATE_CALLS} candidates, expected 4"
-[ "$START_CALLS" -eq 3 ] || fail "attempted to start ${START_CALLS} proxies, expected 3"
-[ "$STARTED_CALLS" -eq 2 ] || fail "started ${STARTED_CALLS} proxies, expected 2"
-[ "$STOP_CALLS" -eq 2 ] || fail "stopped ${STOP_CALLS} proxies, expected 2"
-[ "$STOP_CALLS" -eq "$STARTED_CALLS" ] || fail 'proxy stop count did not match started candidates'
-[ "$DELETE_CALLS" -eq 2 ] || fail "deleted ${DELETE_CALLS} failed candidates, expected 2"
-[ "$ACTIVATE_CALLS" -eq 1 ] || fail "activated ${ACTIVATE_CALLS} candidates, expected 1"
-[ "$RESTART_CALLS" -eq 1 ] || fail "restarted ${RESTART_CALLS} times, expected 1"
-[ "$(<"$conf_dir/active-identity")" = active-B ] || fail 'candidate B was not activated after transient failures'
-[ "${SLEEP_DELAYS[*]}" = '2 4 6' ] || fail "transient retry backoff was '${SLEEP_DELAYS[*]}', expected '2 4 6'"
-assert_candidate_delete_targets 2
-assert_no_candidate_directories
+for action in rotate_warp_identity_once auto_select_warp_candidate; do
+    reset_fixture
+    GENERATION_RESULTS=(4 0)
+    if "$action" 1; then network_rc=0; else network_rc=$?; fi
+    [[ "$network_rc" == 4 && "$GENERATE_CALLS" == 1 && "$START_CALLS" == 0 ]] || fail "$action repeated a pre-request failure"
+    assert_no_candidate_directories
+
+    reset_fixture
+    TRACE_RESULTS=(1 0)
+    TRACE_IPS=(unused B)
+    if "$action" 1; then network_rc=0; else network_rc=$?; fi
+    [[ "$network_rc" == 4 && "$GENERATE_CALLS" == 1 && "$DELETE_CALLS" == 1 ]] || fail "$action registered again after connection recovery failed"
+    [[ "$ACTIVATE_CALLS" == 0 && "$STOP_CALLS" == "$STARTED_CALLS" ]] || fail "$action changed active state after transport failure"
+    assert_no_candidate_directories
+ done
 
 reset_fixture
 TRACE_IPS=(A A A A A)
