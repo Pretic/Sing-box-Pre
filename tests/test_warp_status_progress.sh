@@ -20,7 +20,7 @@ red() { printf '%s\n' "$*"; }
 extract_warp_endpoint() { printf '{}\n'; }
 warp_endpoint_is_valid() { return 0; }
 get_warp_preferred_family() { printf '4\n'; }
-start_warp_candidate_proxy() {
+start_warp_active_proxy() {
     starts=$((starts + 1)); ready=false; WARP_PROBE_PROXY=proxy
 }
 stop_warp_candidate_proxy() { stops=$((stops + 1)); ready=false; }
@@ -31,7 +31,7 @@ probe_warp_trace() {
     WARP_PROBE_LOC=US; WARP_PROBE_COLO=LAX
 }
 probe_active_warp() {
-    start_warp_candidate_proxy '{}'
+    start_warp_active_proxy '{}'
     probe_warp_trace proxy
     stop_warp_candidate_proxy
 }
