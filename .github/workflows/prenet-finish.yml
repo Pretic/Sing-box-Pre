@@ -24,7 +24,7 @@ jobs:
             echo "Running $test_script"
             timeout 120 bash "$test_script"
           done
-          git ls-files -z -- '*.sh' | xargs -0 shellcheck -S error
+          git ls-files -z -- '*.sh' | xargs -0 shellcheck -s bash -S error
           echo '748583831715430e1759f408df9c53b896b7f93b88eba5bea83b8d88d94530df  sing-box.sh' | sha256sum -c -
       - name: Commit validated result and remove one-time build inputs
         shell: bash
