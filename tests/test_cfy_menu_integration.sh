@@ -127,11 +127,11 @@ source_sha="$(sha256sum "$source_cfy" | awk '{print $1}')"
 # Production defaults stay immutable: future edits must deliberately update
 # both the full commit URL and its reviewed content digest.
 assert_equal \
-    'https://raw.githubusercontent.com/Pretic/Pre-cfy/e24a8076e058204b6d255f43460f0b2ea55789ae/cfy.sh' \
+    'https://raw.githubusercontent.com/Pretic/Pre-cfy/1197c856d68fa29cc6cdbe3c548b894439ddd7d4/cfy.sh' \
     "$(cfy_download_url)" \
     'default cfy download URL pin'
 assert_equal \
-    '33a059c58439bbfaa164e8f47018ba3d1bb46a39bab2cd18566b35dda7544b68' \
+    '6040b45eeb578cd4f52327f9cd8addca3ce500c61519aa85cd5eba6074e58ea7' \
     "$(cfy_expected_download_sha256)" \
     'default cfy download SHA-256 pin'
 

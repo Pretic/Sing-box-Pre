@@ -525,11 +525,11 @@ systemd_unit="${secret_root}/etc/systemd/system/argo.service"
 openrc_init="${secret_root}/etc/init.d/argo"
 grep -Fq 'EnvironmentFile=-/etc/sing-box/argo.env' "$systemd_unit" || \
     fail 'systemd unit does not load the root-only Tunnel environment'
-grep -Fq 'ExecStart=/etc/sing-box/argo tunnel --no-autoupdate run' "$systemd_unit" || \
+grep -Fq 'ExecStart=/etc/sing-box/argo tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run' "$systemd_unit" || \
     fail 'systemd fixed Tunnel command is unexpected'
 grep -Fq '. /etc/sing-box/argo.env' "$openrc_init" || \
     fail 'OpenRC does not load the root-only Tunnel environment'
-grep -Fq 'command_args="tunnel --no-autoupdate run"' "$openrc_init" || \
+grep -Fq 'command_args="tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run"' "$openrc_init" || \
     fail 'OpenRC fixed Tunnel command is unexpected'
 ! grep -R -Fq -- '--token' "${secret_root}/etc/systemd/system" "${secret_root}/etc/init.d" || \
     fail 'a fixed Tunnel init command still places the token on the command line'

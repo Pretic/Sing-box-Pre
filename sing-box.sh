@@ -3,7 +3,7 @@
 # =========================
 # 老王sing-box四合一安装脚本
 # vless-version-reality|vless-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议]
-# 最后更新时间: 2026.8.15[修复WARP共享身份冲突与空闲失活]
+# 最后更新时间: 2026.9.19[正式核心WARP验证、双栈分流与安全更新]
 # =========================
 
 export LANG=en_US.UTF-8
@@ -33,12 +33,12 @@ green() { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue() { echo -e "\e[1;36m$1\033[0m"; }
-reading() { read -p "$(red "$1")" "$2"; }
+reading() { read -p "$(red "$1")" "$2" || { printf '\n输入已关闭，操作终止。\n' >&2; exit 1; }; }
 reading_secret() {
     local prompt="$1"
     local variable_name="$2"
 
-    read -rs -p "$(red "$prompt")" "$variable_name"
+    read -rs -p "$(red "$prompt")" "$variable_name" || { printf '\n输入已关闭，操作终止。\n' >&2; exit 1; }
     printf '\n'
 }
 
@@ -931,6 +931,10 @@ render_argo_systemd_service() {
         *) return 1 ;;
     esac
 
+    if [ "$tunnel_mode" != quick ] && [ "${2:-}" != legacy ]; then
+        exec_start="${exec_start% run} --edge-ip-version auto --protocol http2 run"
+    fi
+
     printf '%s\n' \
         '# sing-box-pre:managed-service-v1' \
         '[Unit]' \
@@ -964,6 +968,10 @@ render_argo_openrc_service() {
             ;;
         *) return 1 ;;
     esac
+
+    if [ "$tunnel_mode" != quick ] && [ "${2:-}" != legacy ]; then
+        command_args="${command_args% run} --edge-ip-version auto --protocol http2 run"
+    fi
 
     printf '%s\n' \
         '#!/sbin/openrc-run' \
@@ -1011,8 +1019,10 @@ managed_service_definition_is_canonical() {
             ;;
         systemd-argo)
             for variant in quick token local; do
-                if render_argo_systemd_service "$variant" > "$candidate_file" && \
-                   cmp -s -- "$target_file" "$candidate_file"; then
+                if { render_argo_systemd_service "$variant" > "$candidate_file" &&
+                      cmp -s -- "$target_file" "$candidate_file"; } ||
+                   { render_argo_systemd_service "$variant" legacy > "$candidate_file" &&
+                      cmp -s -- "$target_file" "$candidate_file"; }; then
                     status=0
                     break
                 fi
@@ -1020,8 +1030,10 @@ managed_service_definition_is_canonical() {
             ;;
         openrc-argo)
             for variant in quick token local; do
-                if render_argo_openrc_service "$variant" > "$candidate_file" && \
-                   cmp -s -- "$target_file" "$candidate_file"; then
+                if { render_argo_openrc_service "$variant" > "$candidate_file" &&
+                      cmp -s -- "$target_file" "$candidate_file"; } ||
+                   { render_argo_openrc_service "$variant" legacy > "$candidate_file" &&
+                      cmp -s -- "$target_file" "$candidate_file"; }; then
                     status=0
                     break
                 fi
@@ -1331,6 +1343,7 @@ partial_install_service_definition_is_managed() {
             fi
             for tunnel_mode in quick token local; do
                 cmp -s -- "$definition" <(render_argo_systemd_service "$tunnel_mode") && return 0
+                cmp -s -- "$definition" <(render_argo_systemd_service "$tunnel_mode" legacy) && return 0
             done
             return 1
             ;;
@@ -1344,6 +1357,7 @@ partial_install_service_definition_is_managed() {
             fi
             for tunnel_mode in quick token local; do
                 cmp -s -- "$definition" <(render_argo_openrc_service "$tunnel_mode") && return 0
+                cmp -s -- "$definition" <(render_argo_openrc_service "$tunnel_mode" legacy) && return 0
             done
             return 1
             ;;
@@ -1368,7 +1382,8 @@ partial_install_argo_service_mode() {
     [ -f "$definition" ] && [ ! -L "$definition" ] && [ -r "$definition" ] || return 1
 
     for tunnel_mode in quick token local; do
-        if cmp -s -- "$definition" <("$renderer" "$tunnel_mode"); then
+        if cmp -s -- "$definition" <("$renderer" "$tunnel_mode") || \
+           cmp -s -- "$definition" <("$renderer" "$tunnel_mode" legacy); then
             printf '%s\n' "$tunnel_mode"
             return 0
         fi
@@ -1822,35 +1837,40 @@ save_subscription_state() {
 }
 
 download_binary() {
-    local url="$1"
-    local target_file="$2"
-    local target_dir tmp_dir tmp_file
-
-    target_dir=$(dirname "$target_file")
+    local url="$1" target_file="$2" expected_sha="${3:-}"
+    local target_dir tmp_file magic actual_sha rc=0
+    case "$url" in https://*) ;; *) red "binary downloads require HTTPS"; return 1 ;; esac
+    [ ! -L "$target_file" ] || { red "binary target is a symlink"; return 1; }
+    if [ -n "$expected_sha" ]; then
+        [[ "$expected_sha" =~ ^[a-fA-F0-9]{64}$ ]] || return 1
+    fi
+    target_dir=$(dirname "$target_file") || return 1
     mkdir -p "$target_dir" || return 1
-    tmp_dir=$(mktemp -d "${work_dir}/.download.XXXXXX") || return 1
-    tmp_file="${tmp_dir}/$(basename "$target_file")"
-
-    if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 -o "$tmp_file" "$url"; then
-        rm -rf "$tmp_dir"
+    tmp_file=$(mktemp "${target_dir}/.binary-download.XXXXXX") || return 1
+    if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --retry 3 \
+      --connect-timeout 10 --max-time 120 -o "$tmp_file" "$url"; then
+        rm -f -- "$tmp_file"
         red "download failed: $url"
         return 1
     fi
-    if [ ! -s "$tmp_file" ]; then
-        rm -rf "$tmp_dir"
-        red "downloaded file is empty: $url"
+    magic=$(od -An -N4 -tx1 "$tmp_file" | tr -d ' \n')
+    if [ "$magic" != 7f454c46 ] || [ "$(wc -c < "$tmp_file")" -lt 64 ]; then
+        rm -f -- "$tmp_file"
+        red "download is not a complete ELF header: $url"
         return 1
     fi
-
-    chmod +x "$tmp_file"
-    if command_exists install; then
-        install -m 755 "$tmp_file" "$target_file"
-    else
-        cp "$tmp_file" "$target_file" && chmod 755 "$target_file"
+    if [ -n "$expected_sha" ]; then
+        actual_sha=$(sha256sum "$tmp_file") || rc=1
+        if [ "$rc" -ne 0 ] || [ "${actual_sha%% *}" != "${expected_sha,,}" ]; then
+            rm -f -- "$tmp_file"
+            red "binary SHA256 mismatch; existing binary preserved"
+            return 1
+        fi
     fi
-    local rc=$?
-    rm -rf "$tmp_dir"
-    return $rc
+    if ! chmod 755 "$tmp_file" || ! mv -f -- "$tmp_file" "$target_file"; then
+        rm -f -- "$tmp_file"
+        return 1
+    fi
 }
 
 # 检查服务状态通用函数
@@ -13301,6 +13321,93 @@ write_warp_status_cache() {
 
 # Authenticated loopback listeners are served by the RUNNING core. They never
 # create a second WireGuard device with the active private key.
+# shellcheck shell=bash
+# The reserved inline rule set makes public IP queries follow the same selected
+# WARP family as business rules, without changing the operating system routes.
+render_warp_check_sites() {
+    local source_file="$1" mode="$2"
+    case "$mode" in on|off) ;; *) return 1 ;; esac
+    jq --arg mode "$mode" '
+      {tag:"prenet-ip-check",type:"inline",rules:[{domain_suffix:["ip.sb","ifconfig.co","icanhazip.com"]}]} as $owned |
+      if any(.route.rule_set[]?; .tag == $owned.tag and . != $owned) then
+        error("reserved check-sites rule set conflicts with existing configuration")
+      else
+        .route.rule_set = ([.route.rule_set[]? | select(.tag != $owned.tag)] +
+          if $mode == "on" then [$owned] else [] end) |
+        .route.rules = ([.route.rules[]? |
+          if (.rule_set? | type) == "array" then .rule_set -= [$owned.tag] else . end |
+          select(.rule_set? != [])] +
+          if $mode == "on" then [{rule_set:[$owned.tag],action:"route",outbound:"wireguard-out"}] else [] end)
+      end' "$source_file"
+}
+
+set_warp_check_sites() {
+    local mode="${1:-on}"
+    case "$mode" in on|off) ;; *) return 1 ;; esac
+    (
+        local file="${conf_dir}/route.json" stage='' changed=false committed=false rc=0 rollback_ok=true
+        acquire_proxy_transaction_lock_checked "$conf_dir" "IP 查询分流设置" || exit $?
+        trap 'rc=$?; if [ "$changed" = true ] && [ "$committed" != true ]; then
+            cp -p "$stage/route.backup" "$file" || rollback_ok=false
+            restart_singbox_checked >/dev/null 2>&1 || rollback_ok=false
+            singbox_service_is_stably_active || rollback_ok=false
+          fi
+          if [ "$rollback_ok" = true ]; then [ -z "$stage" ] || rm -rf -- "$stage"; else
+            red "路由恢复不完整，保留恢复目录: $stage" >&2; rc=2
+          fi
+          release_proxy_transaction_lock || rc=2
+          exit "$rc"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        [ -f "$file" ] && [ ! -L "$file" ] || exit 1
+        if [ "$mode" = on ]; then
+            warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null)" || {
+                red "请先初始化内置 WARP。" >&2; exit 1;
+            }
+        fi
+        singbox_service_is_active || { red "sing-box 未运行，未修改路由。" >&2; exit 1; }
+        stage=$(mktemp -d "${conf_dir}/.check-sites.XXXXXX") || exit 1
+        chmod 700 "$stage" || exit 1
+        cp -p "$file" "$stage/route.backup" || exit 1
+        render_warp_check_sites "$file" "$mode" > "$stage/raw.json" || exit 1
+        render_warp_route_family "$stage/raw.json" "$stage/route.json" "$(get_warp_preferred_family)" || exit 1
+        if cmp -s "$file" "$stage/route.json"; then committed=true; exit 0; fi
+        chmod 600 "$stage/route.json" || exit 1
+        changed=true
+        mv "$stage/route.json" "$file" || exit 1
+        validate_singbox_config && restart_singbox_checked && singbox_service_is_stably_active || exit 1
+        committed=true
+        green "IP 查询分流已${mode}：仅影响经过本节点的 ip.sb、ifconfig.co、icanhazip.com。"
+    )
+}
+
+launch_external_toolbox() {
+    local source_url='https://ssh_tool.eooce.com'
+    local expected_sha='4518747b8036e1d0128d4429edbbefc55ef8bc7bc5fd7817e97ee50920999172'
+    local answer
+    yellow "将进入独立第三方工具箱（其中 12 是节点搭建合集）。"
+    yellow "内部功能可能修改内核、防火墙、端口或其他服务；不要叠装会接管同一节点的脚本。"
+    reading "确认进入？[y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    (
+        local stage='' actual_sha
+        umask 077
+        stage=$(mktemp -d) || exit 1
+        trap 'rm -rf -- "$stage"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
+          "$source_url" -o "$stage/toolbox.sh" || { red "工具箱下载失败，未执行。" >&2; exit 1; }
+        actual_sha=$(sha256sum "$stage/toolbox.sh") || exit 1
+        [ "${actual_sha%% *}" = "$expected_sha" ] || {
+            red "工具箱内容已变化，需重新审核后更新校验值；本次未执行。" >&2; exit 1;
+        }
+        bash -n "$stage/toolbox.sh" || { red "工具箱语法校验失败，未执行。" >&2; exit 1; }
+        # This verifies the entry script, not every program it may later fetch.
+        bash "$stage/toolbox.sh"
+    )
+}
+
 render_warp_health_config() {
     local port4="$1" port6="$2" port_route="$3" secret_file="$4"
     validate_port_value "$port4" && validate_port_value "$port6" && \
@@ -15301,6 +15408,7 @@ warp_manage() {
     green "6. 更换内置 WARP 身份/IP"
     skyblue "----------------------"
     green "7. 自动优选 WARP IP（多平台解锁）"
+    green "8. IP 查询网站 WARP 分流（ip.sb 等）"
     skyblue "----------------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -15328,6 +15436,11 @@ warp_manage() {
             read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage
             ;;
         0)  menu ;;
+        8)
+            reading "1 开启，2 关闭，其他返回: " check_sites_choice
+            case "$check_sites_choice" in 1) set_warp_check_sites on ;; 2) set_warp_check_sites off ;; esac
+            warp_manage
+            ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
     esac
@@ -17081,11 +17194,11 @@ cfy_executable_path() {
 }
 
 cfy_download_url() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/e24a8076e058204b6d255f43460f0b2ea55789ae/cfy.sh}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/1197c856d68fa29cc6cdbe3c548b894439ddd7d4/cfy.sh}"
 }
 
 cfy_expected_download_sha256() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-33a059c58439bbfaa164e8f47018ba3d1bb46a39bab2cd18566b35dda7544b68}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-6040b45eeb578cd4f52327f9cd8addca3ce500c61519aa85cd5eba6074e58ea7}"
 }
 
 validate_cfy_target_path() {
@@ -17303,6 +17416,8 @@ dispatch_cli_action() {
         -r|--restart) refresh_quick_argo "$service_file" ;;
         --cfy) manage_cfy ;;
         --warp-health) show_warp_health ;;
+        --warp-check-sites) set_warp_check_sites on ;;
+        --warp-check-sites-off) set_warp_check_sites off ;;
         -h|--help)
             echo ""
             green "用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)"
@@ -17313,6 +17428,7 @@ dispatch_cli_action() {
             green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
             green "      --cfy         进入 Cloudflare优选 菜单"
             green "      --warp-health 正式服务 WARP 双栈检查（首次会准备本机健康入口）"
+            green "      --warp-check-sites / --warp-check-sites-off 开关 IP 查询网站 WARP 分流"
             green "  -u, --uninstall   uninstall sing-box and keep nginx"
             green "      --purge-nginx  uninstall sing-box and remove nginx"
             green "  -h, --help        显示此帮助信息"
@@ -17408,7 +17524,7 @@ else
                 9)  manage_protocols;   need_pause=false ;;
                 10)
                     clear
-                    bash <(curl -Ls ssh_tool.eooce.com)
+                    launch_external_toolbox
                     need_pause=false
                     ;;
                 11) manage_cfy; need_pause=false ;;
