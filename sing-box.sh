@@ -17211,11 +17211,11 @@ cfy_executable_path() {
 }
 
 cfy_download_url() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/b1ae5aca63b7b385e6582f0fa6ac203d877a26bf/cfy.sh}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/6e3b6f12bd381f4c9c33647721cc73a98747e244/cfy.sh}"
 }
 
 cfy_expected_download_sha256() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-af612e2c01c06977a3f2f0a3b66ce7dafdd5c929f4c2cd6e38f723e8a5c26f92}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-f964f0378bf45c156ac331c71ae9858b7785d26b92b6f00058a66c2dff6cbd1e}"
 }
 
 validate_cfy_target_path() {
@@ -17367,7 +17367,7 @@ run_cfy() {
         yellow "尚未安装 cfy，正在进行安全下载安装..."
         install_cfy || return $?
     fi
-    run_cfy_existing
+    run_cfy_existing "$@"
 }
 
 manage_cfy() {
@@ -17382,6 +17382,7 @@ manage_cfy() {
         green "2. 查看最近一次优选结果（cfy -c）"
         green "3. 更新 cfy（cfy --update）"
         purple "4. 返回 sb 主菜单"
+        green "5. 手动粘贴节点优选"
         echo "==============="
         if ! reading "请输入选择: " cfy_choice; then
             return 0
@@ -17401,8 +17402,12 @@ manage_cfy() {
                 [ "$status" -eq 0 ] || yellow "cfy 更新失败（状态 ${status}），sing-box 服务不受影响。"
                 ;;
             4) return 0 ;;
+            5)
+                if run_cfy --manual; then status=0; else status=$?; fi
+                [ "$status" -eq 0 ] || yellow "手动优选已退出（状态 ${status}），原节点不受影响。"
+                ;;
             *)
-                red "无效的选项，请输入 1-4"
+                red "无效的选项，请输入 1-5"
                 continue
                 ;;
         esac
