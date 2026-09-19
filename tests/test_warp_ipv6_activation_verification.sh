@@ -20,10 +20,10 @@ READY=false
 STARTS=0
 STOPS=0
 extract_warp_endpoint() { printf '{}\n'; }
-start_warp_candidate_proxy() { STARTS=$((STARTS + 1)); READY=false; WARP_PROBE_PROXY=proxy; }
+start_warp_active_proxy() { STARTS=$((STARTS + 1)); READY=false; WARP_PROBE_PROXY=proxy; }
 stop_warp_candidate_proxy() { STOPS=$((STOPS + 1)); READY=false; }
 probe_active_warp() {
-    start_warp_candidate_proxy
+    start_warp_active_proxy
     probe_warp_trace
     stop_warp_candidate_proxy
 }
