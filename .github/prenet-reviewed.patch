@@ -87,7 +87,7 @@ index b651232..59a0029 100755
          degraded) warp_status=$(yellow "$warp_status") ;;
          *) warp_status=$(red "$warp_status") ;;
      esac
- diff --git a/tests/test_warp_failure_cache.sh b/tests/test_warp_failure_cache.sh
+diff --git a/tests/test_warp_failure_cache.sh b/tests/test_warp_failure_cache.sh
 index f1484cc..7b0fda8 100644
 --- a/tests/test_warp_failure_cache.sh
 +++ b/tests/test_warp_failure_cache.sh
