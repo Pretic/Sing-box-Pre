@@ -13838,19 +13838,22 @@ get_warp_menu_status() {
     local endpoint cache="${conf_dir}/warp/status.json" now checked warp
     endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
     warp_endpoint_is_valid "$endpoint" || { echo 'not configured'; return; }
-    now=$(date +%s); checked=$(jq -r '.checked_at // 0' "$cache" 2>/dev/null || echo 0)
-    warp=$(jq -r '.warp // empty' "$cache" 2>/dev/null || true)
-    if [ $((now - checked)) -gt 300 ]; then
-        if probe_active_warp; then
-            warp="$WARP_PROBE_STATE"
-        else
-            warp='failed'
-            WARP_PROBE_STATE=failed
-            WARP_PROBE_IP=''; WARP_PROBE_LOC=''; WARP_PROBE_COLO=''
-        fi
-        write_warp_status_cache || true
+    # Menu drawing is passive: no network requests, registration, restart or
+    # second process using the active WireGuard identity. Explicit diagnostics
+    # remain separate from configuration readiness.
+    now=$(date +%s) || { echo 'not checked'; return; }
+    checked=$(jq -r '.checked_at // 0' "$cache" 2>/dev/null) || checked=0
+    [[ "$checked" =~ ^[0-9]{1,10}$ ]] || { echo 'not checked'; return; }
+    if [ "$checked" = 0 ] || [ "$checked" -gt "$now" ] || [ $((now - 10#$checked)) -gt 300 ]; then
+        echo 'not checked'
+        return
     fi
-    [[ "$warp" =~ ^(on|plus)$ ]] && echo running || echo degraded
+    warp=$(jq -r '.warp // empty' "$cache" 2>/dev/null || true)
+    case "$warp" in
+        on|plus) echo 'cached success' ;;
+        failed) echo degraded ;;
+        *) echo 'not checked' ;;
+    esac
 }
 
 # 输出 sing-box 内置 WARP endpoint。它只供 sing-box 出站使用，
@@ -15148,6 +15151,7 @@ warp_manage() {
     else
         yellow "内置 WARP 出站: 未初始化（首次设置分流时自动注册独立身份）"
     fi
+    yellow "未命中规则的网站仍走原出口；ip.sb 查询结果不代表所有业务的 WARP 状态。"
     green "当前已启用的分流规则集:"
     list_enabled_warp_route_mappings "$route_file" 2>/dev/null | while read -r mapping; do
         echo -e " - ${skyblue}${mapping}${re}"
@@ -15215,8 +15219,8 @@ add_rule_menu() {
     green "9.  Telegram"
     green "10. 常见流媒体（聚合规则）"
     skyblue "-----------------------------"
-    green "11. 设置全局代理出站 (所有流量走指定代理)"
-    green "12. 恢复服务器原IP出站 (所有流量走服务器ip)"
+    green "11. 设置节点全局出站（仅经过本节点的流量）"
+    green "12. 恢复节点直连出站（不修改 VPS 默认路由）"
     skyblue "-----------------------------"
     purple "0.  返回上级菜单"
     skyblue "-----------------------------"
@@ -15334,6 +15338,7 @@ restore_direct_outbound() {
 }
 delete_rule_menu() {
     clear
+    yellow "未命中规则的网站仍走原出口；ip.sb 查询结果不代表所有业务的 WARP 状态。"
     green "当前已启用的分流规则集:"
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" | nl -w2 -s'. '
     reading "\n输入要删除的规则名称或序号: " del_input
@@ -16948,11 +16953,11 @@ cfy_executable_path() {
 }
 
 cfy_download_url() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/80231df35f6a0cca9bf5f7b44d89bc3cf08c855a/cfy.sh}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/e24a8076e058204b6d255f43460f0b2ea55789ae/cfy.sh}"
 }
 
 cfy_expected_download_sha256() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-65363e470bcab5b7bbefd12b4c78322370e3f17870988f6531099437aeaf322e}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-33a059c58439bbfaa164e8f47018ba3d1bb46a39bab2cd18566b35dda7544b68}"
 }
 
 validate_cfy_target_path() {
@@ -17202,6 +17207,8 @@ menu() {
     warp_status=$(get_warp_menu_status 2>/dev/null || echo degraded)
     case "$warp_status" in
         running) warp_status=$(green "$warp_status") ;;
+        "cached success") warp_status=$(yellow "最近检测成功（缓存，非实时验证）") ;;
+        "not checked") warp_status=$(yellow "已配置，待检测") ;;
         degraded) warp_status=$(yellow "$warp_status") ;;
         *) warp_status=$(red "$warp_status") ;;
     esac
