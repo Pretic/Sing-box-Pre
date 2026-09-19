@@ -170,7 +170,7 @@ VLESS 候选默认做 TLS/WebSocket 握手检查，失败候选被排除；全�
 
 ### 订阅管理
 
-`sb → 7 → 5. 查看订阅链接与详细状态` 查看地址。默认 HTTP 订阅；具备固定隧道和 Cloudflare 域名时，可在同页 `6. 配置 Cloudflare HTTPS 订阅`。成功验证可访问后才优先展示 HTTPS 地址，不需新增公网端口映射。
+`sb → 7 → 5. 查看订阅链接与详细状态` 查看地址。默认提供 HTTP 订阅；具备固定隧道和 Cloudflare 域名时，可在同页 `6. 配置 Cloudflare HTTPS 订阅`。成功验证可访问后才优先展示 HTTPS 地址，不需新增公网端口映射。
 
 “关闭节点订阅”停止 HTTP 和 HTTPS 订阅，不影响已有节点连接；“关闭 Cloudflare HTTPS 订阅”仅关闭 HTTPS；“重新生成订阅密钥”会使旧地址失效，需更新客户端地址。
 
