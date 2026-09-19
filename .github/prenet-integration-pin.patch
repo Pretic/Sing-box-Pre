@@ -1,0 +1,18 @@
+diff --git a/tests/test_cfy_menu_integration.sh b/tests/test_cfy_menu_integration.sh
+index b26d5a3..e2e8bd3 100644
+--- a/tests/test_cfy_menu_integration.sh
++++ b/tests/test_cfy_menu_integration.sh
+@@ -127,11 +127,11 @@ source_sha="$(sha256sum "$source_cfy" | awk '{print $1}')"
+ # Production defaults stay immutable: future edits must deliberately update
+ # both the full commit URL and its reviewed content digest.
+ assert_equal \
+-    'https://raw.githubusercontent.com/Pretic/Pre-cfy/80231df35f6a0cca9bf5f7b44d89bc3cf08c855a/cfy.sh' \
++    'https://raw.githubusercontent.com/Pretic/Pre-cfy/e24a8076e058204b6d255f43460f0b2ea55789ae/cfy.sh' \
+     "$(cfy_download_url)" \
+     'default cfy download URL pin'
+ assert_equal \
+-    '65363e470bcab5b7bbefd12b4c78322370e3f17870988f6531099437aeaf322e' \
++    '33a059c58439bbfaa164e8f47018ba3d1bb46a39bab2cd18566b35dda7544b68' \
+     "$(cfy_expected_download_sha256)" \
+     'default cfy download SHA-256 pin'
+ 
