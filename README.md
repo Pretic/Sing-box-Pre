@@ -1,229 +1,73 @@
 # Sing-box-Pre
 
-在 VPS 上安装和管理代理节点，查看订阅、管理 Argo 隧道，并按需使用 WARP 分流和 Cloudflare 候选入口。
+基于 sing-box 的 VPS 节点安装与管理脚本，支持 Argo 隧道、WARP 分流和订阅管理。
 
-安装后输入 `sb` 打开中文菜单。保持现有协议主体，以可靠性、可诊断性和低额外资源占用为优先。
+## 功能
 
-## 安装与导入
+- 支持 VLESS-Reality、VLESS-WS-TLS、Hysteria2、TUIC，可通过菜单管理附加协议。
+- 支持 Argo 临时隧道与固定隧道、WARP 分流及出口检测。
+- 支持 HTTP / HTTPS 订阅、节点配置修改，并可直接调用 [Pre-cfy](https://github.com/Pretic/Pre-cfy) 生成 Cloudflare 优选节点。
 
-### 1. 安装
+默认输出 Reality 和 Argo 节点；HY2 / TUIC 按需开启。
 
-通过 SSH 登录 VPS，使用 root 用户执行；当前不是 root 时可先运行 `sudo -i`。
+## 一键安装
+
+使用 root 用户执行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
 ```
 
-选择 `1. 安装sing-box`，按提示完成。普通安装不要求域名；固定 Argo 隧道或 Cloudflare HTTPS 订阅才需要自己的 Cloudflare 域名。
+安装后输入 `sb` 打开菜单。
 
-| 默认输出的节点 | 使用条件 |
+### NAT VPS
+
+指定服务商分配的端口：
+
+```bash
+PORT=你的端口 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh)
+```
+
+Reality 使用 `PORT`，HTTP 订阅使用 `PORT+1`，TUIC / HY2 使用 `PORT+2` / `PORT+3`。公网映射以服务商提供的范围为准；Argo 不需要额外开放入站端口。
+
+## 常用命令
+
+| 命令 | 功能 |
 | --- | --- |
-| VLESS-Reality | 客户端能访问 VPS 对应公网 TCP 端口。 |
-| VLESS-WS-TLS-Argo | VPS 能连接 Cloudflare Tunnel；无需开放 Argo 公网入站端口。 |
+| `sb` | 主菜单 |
+| `sb -i` | 无交互安装 |
+| `sb -c` | 查看节点与订阅 |
+| `sb -r` | 重新获取临时 Argo 隧道 |
+| `sb --warp-health` | 检查 WARP IPv4 / IPv6 |
+| `sb --cfy` | Cloudflare 优选菜单 |
+| `sb --update` | 更新管理脚本 |
+| `sb -h` | 查看帮助 |
 
-HY2/TUIC 的现有支持保留，但默认不加入节点输出和订阅。不需要这些协议时保持默认。
+WARP 在主菜单 `8` 中设置，默认只影响命中规则的节点流量，不改变 VPS 系统默认路由。Argo 隧道在主菜单 `4` 中管理，固定隧道需要自己的 Cloudflare 域名和凭据。
 
-无交互安装：
+## 订阅
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
-```
+默认提供 HTTP 订阅。进入 `sb → 7`，选择“查看订阅链接与详细状态”获取地址；使用固定隧道时，可选择“配置 Cloudflare HTTPS 订阅”。
 
-### 2. 导入客户端
-
-```bash
-sb -c
-```
-
-或进入 `sb → 5. 查看节点信息`，复制单个节点或订阅地址。单个链接导入一个连接；订阅用于批量导入，服务器生成新结果后仍需在客户端更新订阅。
-
-V2rayN、Shadowrocket、Nekobox、Loon、Karing、Streisand 可使用原始订阅。Clash/Mihomo、sing-box、Surge 可使用脚本展示的转换链接；转换由第三方服务完成，原订阅地址会发送给该服务。节点和订阅均可能含凭据，不应公开分享。
-
-### 3. 测试连接
-
-能导入不等于能连接。请从实际使用的客户端网络测试。Reality 需要端口可达；Argo 需要隧道和回源正常。节点可用但订阅不可达时，可先复制单个节点，再检查订阅端口或配置 HTTPS 订阅。
-
-## NAT VPS
-
-服务商只提供部分端口映射时，使用分配的端口安装：
-
-```bash
-PORT=你的端口 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
-```
-
-| 用途 | 端口 |
-| --- | --- |
-| Reality | `PORT`，TCP |
-| HTTP 订阅 | `PORT+1`，TCP |
-| TUIC / Hysteria2 | `PORT+2` / `PORT+3`，UDP |
-
-脚本不能替代服务商的公网映射。只有一个映射端口时可使用 Argo；cfy 可基于 Argo 生成候选入口。Argo 本地端口无需额外映射。订阅端口未映射时，可复制单个链接，或使用固定隧道配置 HTTPS 订阅。
-
-## 常用菜单
-
-| 操作 | 入口 |
-| --- | --- |
-| 启停或重启节点服务 | `3. sing-box管理` |
-| 临时或固定隧道 | `4. Argo隧道管理` |
-| 节点和订阅地址 | `5. 查看节点信息` |
-| 修改节点配置 | `6. 修改节点配置` |
-| 管理订阅 | `7. 管理节点订阅` |
-| WARP 分流和检测 | `8. WARP分流管理` |
-| 添加或删除协议 | `9. 增加/删除协议` |
-| 独立第三方工具箱 | `10. ssh综合工具箱`，其中的 `12` 为节点搭建合集。 |
-| Cloudflare 候选入口 | `11. Cloudflare优选` |
-
-退出菜单不会停止服务。工具箱入口有 HTTPS、下载超时、SHA256 和语法校验，并要求确认；**这些只验证入口脚本，不代表其下游全部脚本已审核**。不要叠装会接管相同目录、端口和服务的管理器，也不要在未理解影响时运行内核或防火墙修改项。
-
-## WARP：只改变经过节点的指定流量
-
-WARP 可让指定服务使用 Cloudflare 出口，其余流量仍使用 VPS 原出口。它不接管 VPS 的系统默认路由或 SSH 出口。服务器只有原生 IPv4，也可以通过 WARP 获得可用的 IPv6 出口，是否成功以实际检测为准。
-
-### 设置分流
-
-进入 `sb → 8 → 1. 设置分流服务`，选择服务及“内置 WARP”。首次使用注册本机独立身份；VPS 必须允许 WARP 所需的 UDP 出网。这与是否输出 HY2/TUIC 节点无关。
-
-同一页的 `11. 设置节点全局出站` 作用于经过节点的流量，不是整机接管。`12. 恢复节点直连出站` 恢复这些流量的原出口。全局设置会替换已有的按服务规则，应先确认所需策略。
-
-### 检查 IPv4 和 IPv6
-
-```bash
-sb --warp-health
-```
-
-该命令分别检查 WARP IPv4、IPv6，使用**正在运行的 sing-box 核心**。首次需要准备仅监听 `127.0.0.1`、带随机认证信息的本机健康入口，并重启一次核心；后续正常检查不会为同一身份再启动一个 WireGuard 实例。
-
-连接成功只证明该出口当时可用，不证明所有网站可访问。一个地址族失败不等于另一个也失败；分流选择和平台结果要分别检查。
-
-平台检测入口：`sb → 8 → 5. 查看内置 WARP 状态及解锁情况`。它先显示连接、IP 和地区，再逐项检测 Netflix、Disney+、ChatGPT、Gemini。
-
-| 首页显示 | 含义 |
-| --- | --- |
-| 最近检测成功（缓存，非实时验证） | 近期保存的连接检测成功，不代表平台全部通过。 |
-| 已配置，待检测 | 没有有效的近期缓存；不是连接失败。 |
-| degraded | 最近保存的连接检测失败。 |
-| not configured | 尚未配置有效 WARP。 |
-
-首页最多使用 5 分钟缓存，**打开或刷新菜单不主动联网检测、不注册身份、不重启服务**。要实时复核，使用上面的命令或状态菜单。
-
-### 使用 ip.sb 查询出口
-
-规则分流时，未命中 WARP 的查询网站可能显示原 IP，不能据此断定其他业务分流无效。可明确开启查询网站分流：
-
-```bash
-sb --warp-check-sites
-```
-
-或进入 `sb → 8 → 8. IP 查询网站 WARP 分流`。范围是经过本节点的 `ip.sb`、`ifconfig.co`、`icanhazip.com`，跟随所选 WARP 地址族策略。客户端必须实际使用这个节点，直连访问的结果不受它影响。
-
-关闭该专用规则：
-
-```bash
-sb --warp-check-sites-off
-```
-
-关闭不会自动删除其他业务规则，也不会修改系统默认路由。规则修改会校验配置并重启核心；失败时尝试恢复旧配置，并明确报告恢复不完整的情况。
-
-### 更换身份与自动优选
-
-`sb → 8 → 6` 尝试更换身份并验证出口。新的身份不保证得到不同 IPv4；IPv4 未变时可测试 IPv6，可用并验证通过后才切换。公网 IPv6 可能随连接变化，不应当作固定身份标识。
-
-`sb → 8 → 7` 按所选平台筛选：`1` Netflix、`2` Disney+、`3` ChatGPT、`4` Gemini，可输入如 `34`。默认 `1234`，所选条件全部通过后才启用候选。尝试有数量上限；失败保留原身份，不无限注册，也不把“连接成功”当作“全部解锁”。
-
-WARP 连通、IP 变化和平台可用是三件不同的事。某个出口持续收到平台拒绝时，不能仅靠更换身份保证解除；检测超时也不能报成已确认解锁。
-
-### 故障处理
-
-- “检测失败”或超时表示没有取得有效结论，不应直接等同于平台封锁。
-- “受限”表示检测接口返回了限制信号，不是所有账号、所有客户端的最终判定。
-- 连接或解析复核仍失败时停止注册，保留原身份；不会静默改成整机接管来掩盖问题。
-- 出现“注册状态不确定”“清理失败”“恢复不完整”时，保留提示路径中的恢复文件，先排查再重试。
-
-实现对照与版本边界见 [WARP 参考说明](docs/warp-reference-review.md)。
-
-## Cloudflare 候选入口与 cfy 联动
-
-```bash
-sb --cfy
-```
-
-等同于 `sb → 11`。未安装 cfy 时下载固定提交并核对 SHA256；安装后可运行、查看结果或显式更新，cfy 也保持独立使用。
-
-cfy 调整客户端进入节点的入口；WARP 调整访问目标网站时的出口。两者不是同一个“换 IP”功能。
-
-VLESS 候选默认做 TLS/WebSocket 握手检查，失败候选被排除；全部失败时保留原订阅。**这不是客户端带宽测速，也不是完整代理认证测试。** 旧 VMess 不应视为获得相同握手验证。原节点或 Argo 域名改变后需重新生成候选，再刷新客户端订阅。
-
-详情见 [Pre-cfy 使用说明](https://github.com/Pretic/Pre-cfy#readme)。
-
-## Argo 与订阅
-
-### 临时和固定隧道
-
-| 类型 | 条件与区别 |
-| --- | --- |
-| 临时隧道 | 无需域名；重新获取后域名可能改变，需更新订阅。 |
-| 固定隧道 | 需要自己的 Cloudflare 域名与隧道凭据，入口在 `sb → 4 → 4. 添加Argo固定隧道`。 |
-
-新生成的临时、Token 固定及 JSON 固定服务统一明确使用 HTTP/2，避免仅因切换隧道类型而改变默认传输选择。**更新管理脚本不会自动重写现有服务参数；现有手动配置要单独检查。** HTTP/2 也不保证在所有网络上最快，固定域名本身不是提速功能。
-
-`sb → 4 → 3. 重启Argo服务` 按类型处理：固定隧道保留域名，临时隧道同步新域名。`sb -r` 用于重新获取临时 Argo 域名，不更换 Reality 身份。使用过 cfy 时，域名变化后重新生成候选；脚本会隐藏不匹配当前节点的旧结果。
-
-### 订阅管理
-
-`sb → 7 → 5. 查看订阅链接与详细状态` 查看地址。默认提供 HTTP 订阅；具备固定隧道和 Cloudflare 域名时，可在同页 `6. 配置 Cloudflare HTTPS 订阅`。成功验证可访问后才优先展示 HTTPS 地址，不需新增公网端口映射。
-
-“关闭节点订阅”停止 HTTP 和 HTTPS 订阅，不影响已有节点连接；“关闭 Cloudflare HTTPS 订阅”仅关闭 HTTPS；“重新生成订阅密钥”会使旧地址失效，需更新客户端地址。
+“关闭节点订阅”关闭全部订阅；“关闭 Cloudflare HTTPS 订阅”仅关闭 HTTPS；“重新生成订阅密钥”会使旧地址失效。节点发生变化后，在客户端刷新订阅。
 
 ## 更新与卸载
 
-已安装 VPS 更新管理脚本：
-
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) --update
-```
+# 更新管理脚本，不重装节点
+sb --update
 
-只更新管理脚本，不重装核心、不自动迁移已有节点、端口、分流或隧道配置。完成后退出旧菜单，再输入 `sb`。安装脚本的通用二进制下载已增加 HTTPS、ELF 头检查和原子替换；只有调用时提供可信 SHA256 才进行该二进制的哈希比对，**不能把 ELF 头检查当作完整发布签名验证**。
-
-cfy 独立更新：
-
-```bash
+# 更新配套 cfy
 cfy --update
+
+# 卸载 sing-box，保留 nginx
+sb -u
 ```
 
-卸载入口是 `sb → 2`。**`--update` 是更新，`-u` 是卸载，不要混用。**
-
-## 常见问题
-
-| 现象 | 先检查 |
-| --- | --- |
-| Reality 不通、Argo 正常 | Reality TCP 端口与 NAT 映射，以及 VPS 到伪装域名的解析和连通；无原生 IPv6 时不能依赖原生 IPv6 出网。 |
-| Argo 域名改变后旧节点失效 | 重新生成 cfy 结果并刷新客户端订阅。 |
-| 部分候选不通或较慢 | 从实际客户端网络测试；VPS 握手成功不代表三网都快。 |
-| 没显示 HY2/TUIC | 默认不输出 UDP 节点，是预期行为。 |
-| 更新后菜单还是旧版 | 退出旧进程，重新运行 `sb`。 |
-| WARP 显示连通但业务仍不可用 | 核对请求是否经过本节点、是否命中规则，再看平台拒绝与超时，不能只看一个 IP 查询页面。 |
-
-## 可选安装设置
-
-| 变量 | 用途 |
-| --- | --- |
-| `NODE_NAME` | 自定义节点名前缀；默认使用国家和主机名。 |
-| `PROMPT_NODE_NAME=1` | 无交互安装时仍提示 VPS 名称。 |
-| `SUB_HOST` | 指定订阅域名或 IP。 |
-| `SUB_ADDR_FAMILY` | 默认 `ipv4`，也可指定 `ipv6` 或 `auto`。 |
-| `INCLUDE_UDP_LINKS` | 默认 `0`，设为 `1` 才输出 HY2/TUIC；需自行确认 UDP 可达。 |
-
-```bash
-NODE_NAME=US-MyVPS bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh) -i
-```
+**`--update` 是更新，`-u` 是卸载。**
 
 ## 项目来源
 
-基于 [eooce/Sing-box](https://github.com/eooce/Sing-box)，由 Pretic 独立维护，不代表上游项目。感谢 eooce 及上游贡献者提供早期脚本基础。
+基于 [eooce/Sing-box](https://github.com/eooce/Sing-box) 二次开发，由 Pretic 维护。感谢原作者及贡献者。
 
-配套项目：[Pre-cfy](https://github.com/Pretic/Pre-cfy)。
-
-## 免责声明
-
-- 本程序仅供学习了解，非盈利目的，请于下载后 24 小时内删除，不得用作任何商业用途；文字、数据及图片均有所属版权，如转载须注明来源。
-- 使用本程序必须遵守部署服务器所在地、所在国家和用户所在国家的法律法规，程序作者不对使用者任何不当行为负责。
+配套项目：[Pre-cfy](https://github.com/Pretic/Pre-cfy)。请遵守服务器所在地和使用所在地的法律法规。
