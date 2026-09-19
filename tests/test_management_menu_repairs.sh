@@ -10,9 +10,9 @@ failed=0
 fail() { echo "FAIL: $*" >&2; failed=$((failed+1)); }
 clear() { :; }; sleep() { :; }
 check_singbox() { echo running; }; check_argo() { echo running; }; check_nginx() { echo running; }
-get_warp_menu_status() { echo running; }
-line=$(menu | grep 'WARP 状态:')
-[[ "$line" == *$'\033[1;32mrunning'* ]] || fail 'WARP running is not green'
+get_warp_menu_status() { echo enabled; }
+line=$(menu | grep 'WARP 分流:')
+[[ "$line" == *$'\033[1;32m已启用'* ]] || fail 'WARP enabled routing is not green'
 
 outbound_file="$tmp/outbounds.json"
 printf '{"outbounds":[{"type":"direct","tag":"direct"}]}\n' > "$outbound_file"

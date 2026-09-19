@@ -12971,35 +12971,75 @@ check_unlock_disney() {
     WARP_UNLOCK_STATUS="受限 (${region^^})"; return 1
 }
 
+# HTTP reachability is not an authenticated ChatGPT conversation test.
+classify_chatgpt_response() {
+    local code="$1" effective="${2,,}" body="$3" headers="$4" visible error_code=''
+    WARP_UNLOCK_STATUS='未确认可用'
+    [[ "$effective" =~ ^https://([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*chatgpt\.com(:443)?([/?#]|$) ]] || return 2
+    [ -s "$body" ] || { WARP_UNLOCK_STATUS="响应为空（HTTP ${code}）"; return 2; }
+    # A challenge is not a country restriction, even with a 200 response.
+    if grep -qiE '^cf-mitigated:[[:space:]]*challenge[[:space:]]*$' "$headers" ||
+       grep -qiE '<title[^>]*>[[:space:]]*Just a moment|/cdn-cgi/challenge-platform/|window\._cf_chl_opt' "$body"; then
+        WARP_UNLOCK_STATUS='需要网页验证'; return 2
+    fi
+    error_code=$(jq -r '(.error.code // .code // .error.type // "") | select(type=="string")' "$body" 2>/dev/null || true)
+    case "$error_code" in
+        unsupported_country_region_territory|unsupported_country|unsupported_region)
+            WARP_UNLOCK_STATUS='地区不支持'; return 1 ;;
+    esac
+    visible=$(extract_html_visible_text "$body") || return 2
+    if grep -qiE 'not[[:space:]]+(available|supported)[[:space:]]+in[[:space:]]+your[[:space:]]+(country|region)|unsupported[[:space:]]+(country|region)' <<< "$visible"; then
+        WARP_UNLOCK_STATUS='地区不支持'; return 1
+    fi
+    if grep -qiE 'blocked_why_headline|cf-error-details|<title[^>]*>[^<]*Attention Required' "$body"; then
+        WARP_UNLOCK_STATUS="请求被拦截（HTTP ${code}）"; return 2
+    fi
+    case "$code" in
+        429) WARP_UNLOCK_STATUS='请求过于频繁（HTTP 429）'; return 2 ;;
+        401) WARP_UNLOCK_STATUS='需要登录（HTTP 401）'; return 2 ;;
+        403)
+            if [ "$error_code" = disallowed ] || grep -qiF 'request is not allowed' <<< "$visible"; then
+                WARP_UNLOCK_STATUS='请求被拒绝（HTTP 403）'; return 1
+            fi
+            WARP_UNLOCK_STATUS='HTTP 403，原因未确认'; return 2 ;;
+        5??) WARP_UNLOCK_STATUS="服务异常（HTTP ${code}）"; return 2 ;;
+        200) ;;
+        *) WARP_UNLOCK_STATUS="未确认可用（HTTP ${code}）"; return 2 ;;
+    esac
+    if grep -qiE 'something went wrong|temporarily unavailable|service unavailable' <<< "$visible"; then
+        WARP_UNLOCK_STATUS='网页返回错误'; return 2
+    fi
+    # Require an application page, not a generic HTTP-200 landing page.
+    if grep -qiE '<title[^>]*>[^<]*ChatGPT[^<]*</title>' "$body" &&
+       grep -qE '__NEXT_DATA__|__remixContext|__reactRouterContext|/cdn/assets/|/_next/static/' "$body"; then
+        WARP_UNLOCK_STATUS='网页可达'; return 0
+    fi
+    return 2
+}
+
 check_unlock_chatgpt() {
-    local proxy="$1" web_meta web_code web_url ios_file ios_meta ios_code restriction
-    web_meta=$(warp_platform_curl -sSIL -L --connect-timeout 5 --max-time 12 --proxy "$proxy" \
-      -A 'Mozilla/5.0' -o /dev/null -w $'%{http_code}\t%{url_effective}' \
-      https://chatgpt.com 2>/dev/null) || web_meta=''
-    IFS=$'\t' read -r web_code web_url <<< "$web_meta"
-    ios_file=$(mktemp) || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
-    if ! ios_meta=$(warp_platform_curl -sSL --connect-timeout 5 --max-time 12 --proxy "$proxy" \
-      -A 'Mozilla/5.0' -o "$ios_file" -w '%{http_code}' \
-      https://ios.chat.openai.com 2>/dev/null); then
-        rm -f -- "$ios_file"; WARP_UNLOCK_STATUS='检测失败'; return 2
+    local proxy="$1" stage meta code effective rc=0
+    stage=$(mktemp -d) || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
+    chmod 700 "$stage" || { rm -rf -- "$stage"; return 2; }
+    # Probe the web product with GET. The unrelated iOS endpoint must not veto it.
+    meta=$(warp_platform_curl -sSL --proto '=https' --proto-redir '=https' --max-redirs 3 \
+      --connect-timeout 5 --max-time 15 --max-filesize 4194304 --proxy "$proxy" \
+      -A 'Mozilla/5.0' -D "$stage/headers" -o "$stage/body" \
+      -w $'%{http_code}\t%{url_effective}' https://chatgpt.com 2>/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        case "$rc" in
+            5|6) WARP_UNLOCK_STATUS='域名解析失败' ;;
+            7) WARP_UNLOCK_STATUS='连接失败' ;;
+            28) WARP_UNLOCK_STATUS='检测超时' ;;
+            35|60) WARP_UNLOCK_STATUS='TLS 校验或握手失败' ;;
+            *) WARP_UNLOCK_STATUS="检测失败（curl ${rc}）" ;;
+        esac
+        rm -rf -- "$stage"; return 2
     fi
-    ios_code="$ios_meta"
-    restriction=$(cat "$ios_file" 2>/dev/null)
-    rm -f -- "$ios_file"
-    [ -n "$restriction" ] || { WARP_UNLOCK_STATUS='检测失败'; return 2; }
-    if grep -qiE 'unsupported_country_region_territory|unsupported_country|blocked_why_headline|blocked_why|disallowed|request is not allowed' <<< "$restriction"; then
-        WARP_UNLOCK_STATUS='受限'; return 1
-    fi
-    if grep -qE '\(1\)|\(2\)' <<< "$restriction"; then
-        WARP_UNLOCK_STATUS='仅网页可用'; return 1
-    fi
-    web_url=${web_url,,}
-    [[ "$web_code" =~ ^2[0-9][0-9]$ ]] && \
-      [[ "$web_url" =~ ^https://([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*chatgpt\.com(:443)?([/?#]|$) ]] && \
-      [[ "$ios_code" =~ ^[234][0-9][0-9]$ ]] || {
-        WARP_UNLOCK_STATUS='检测失败'; return 2
-    }
-    WARP_UNLOCK_STATUS='解锁'; return 0
+    IFS=$'\t' read -r code effective <<< "$meta"
+    classify_chatgpt_response "$code" "$effective" "$stage/body" "$stage/headers" || rc=$?
+    rm -rf -- "$stage"
+    return "$rc"
 }
 
 extract_html_visible_text() {
@@ -13322,62 +13362,69 @@ write_warp_status_cache() {
 # Authenticated loopback listeners are served by the RUNNING core. They never
 # create a second WireGuard device with the active private key.
 # shellcheck shell=bash
-# The reserved inline rule set makes public IP queries follow the same selected
-# WARP family as business rules, without changing the operating system routes.
-render_warp_check_sites() {
-    local source_file="$1" mode="$2"
-    case "$mode" in on|off) ;; *) return 1 ;; esac
-    jq --arg mode "$mode" '
-      {tag:"prenet-ip-check",type:"inline",rules:[{domain_suffix:["ip.sb","ifconfig.co","icanhazip.com"]}]} as $owned |
-      if any(.route.rule_set[]?; .tag == $owned.tag and . != $owned) then
-        error("reserved check-sites rule set conflicts with existing configuration")
+# Remove only the exact retired built-in rules; user rules are never guessed.
+render_retired_warp_routes() {
+    local file="$1"
+    jq '
+      "prenet-ip-check" as $tag |
+      {tag:$tag,type:"inline",rules:[{domain_suffix:["ip.sb","ifconfig.co","icanhazip.com"]}]} as $old |
+      def references($t): (.rule_set? == $t) or ((.rule_set? | type)=="array" and (.rule_set | index($t))!=null);
+      def owned_rule:
+        ((keys|sort)==["action","outbound","rule_set"] and .action=="route" and .outbound=="wireguard-out") or
+        ((keys|sort)==["action","network","rule_set","strategy"] and .action=="resolve" and .network==["tcp","udp"] and .strategy=="prefer_ipv6");
+      ([.route.rule_set[]? | select(.tag==$tag)]) as $definitions |
+      if ($definitions|length)>1 or any($definitions[]; . != $old) or
+         any(.route | .. | objects; references($tag) and (owned_rule | not)) or
+         any(.route.rules[]? | .rules? // [] | .. | objects; references($tag)) then
+        error("retired route was customized; refusing automatic removal")
       else
-        .route.rule_set = ([.route.rule_set[]? | select(.tag != $owned.tag)] +
-          if $mode == "on" then [$owned] else [] end) |
-        .route.rules = ([.route.rules[]? |
-          if (.rule_set? | type) == "array" then .rule_set -= [$owned.tag] else . end |
-          select(.rule_set? != [])] +
-          if $mode == "on" then [{rule_set:[$owned.tag],action:"route",outbound:"wireguard-out"}] else [] end)
-      end' "$source_file"
+        .route.rule_set = [.route.rule_set[]? | select(.tag!=$tag)] |
+        .route.rules = [.route.rules[]? |
+          if references($tag) then
+            .rule_set = ((if (.rule_set|type)=="array" then .rule_set else [.rule_set] end) - [$tag]) |
+            select(.rule_set|length>0)
+          else . end]
+      end
+    ' "$file"
 }
 
-set_warp_check_sites() {
-    local mode="${1:-on}"
-    case "$mode" in on|off) ;; *) return 1 ;; esac
+migrate_retired_warp_routes() {
+    local file="${conf_dir}/route.json"
+    [ -f "$file" ] || return 0
+    grep -Fq 'prenet-ip-check' "$file" || return 0
     (
-        local file="${conf_dir}/route.json" stage='' changed=false committed=false rc=0 rollback_ok=true
-        acquire_proxy_transaction_lock_checked "$conf_dir" "IP 查询分流设置" || exit $?
+        local stage='' changed=false committed=false was_active=false rc=0 rollback_ok=true
+        acquire_proxy_transaction_lock_checked "$conf_dir" "清理已移除的分流功能" || exit $?
         trap 'rc=$?; if [ "$changed" = true ] && [ "$committed" != true ]; then
             cp -p "$stage/route.backup" "$file" || rollback_ok=false
-            restart_singbox_checked >/dev/null 2>&1 || rollback_ok=false
-            singbox_service_is_stably_active || rollback_ok=false
+            if [ "$was_active" = true ]; then
+                restart_singbox_checked >/dev/null 2>&1 || rollback_ok=false
+                singbox_service_is_stably_active || rollback_ok=false
+            fi
           fi
           if [ "$rollback_ok" = true ]; then [ -z "$stage" ] || rm -rf -- "$stage"; else
-            red "路由恢复不完整，保留恢复目录: $stage" >&2; rc=2
+            red "恢复不完整，保留恢复目录: $stage" >&2; rc=2
           fi
           release_proxy_transaction_lock || rc=2
           exit "$rc"' EXIT
         trap 'exit 130' INT
-        trap 'exit 143' TERM
+        trap 'exit 143' TERM HUP
         [ -f "$file" ] && [ ! -L "$file" ] || exit 1
-        if [ "$mode" = on ]; then
-            warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null)" || {
-                red "请先初始化内置 WARP。" >&2; exit 1;
-            }
-        fi
-        singbox_service_is_active || { red "sing-box 未运行，未修改路由。" >&2; exit 1; }
-        stage=$(mktemp -d "${conf_dir}/.check-sites.XXXXXX") || exit 1
+        grep -Fq 'prenet-ip-check' "$file" || exit 0
+        stage=$(mktemp -d "${conf_dir}/.retired-routes.XXXXXX") || exit 1
         chmod 700 "$stage" || exit 1
         cp -p "$file" "$stage/route.backup" || exit 1
-        render_warp_check_sites "$file" "$mode" > "$stage/raw.json" || exit 1
-        render_warp_route_family "$stage/raw.json" "$stage/route.json" "$(get_warp_preferred_family)" || exit 1
-        if cmp -s "$file" "$stage/route.json"; then committed=true; exit 0; fi
+        render_retired_warp_routes "$file" > "$stage/route.json" || exit 1
+        singbox_service_is_active && was_active=true
         chmod 600 "$stage/route.json" || exit 1
         changed=true
-        mv "$stage/route.json" "$file" || exit 1
-        validate_singbox_config && restart_singbox_checked && singbox_service_is_stably_active || exit 1
+        mv -f -- "$stage/route.json" "$file" || exit 1
+        validate_singbox_config || exit 1
+        if [ "$was_active" = true ]; then
+            restart_singbox_checked && singbox_service_is_stably_active || exit 1
+        fi
         committed=true
-        green "IP 查询分流已${mode}：仅影响经过本节点的 ip.sb、ifconfig.co、icanhazip.com。"
+        green "已清理旧版附加分流规则。"
     )
 }
 
@@ -13922,7 +13969,7 @@ rotate_warp_identity_until_new() {
 auto_select_warp_candidate() {
     local selection="${1:-1234}" active_ipv4='' active_ipv6='' candidate_dir candidate_endpoint
     local attempt candidate_ip activate_rc generate_rc selected_family=4
-    local candidate_ipv4='' candidate_ipv6='' proxy_started probe_ok
+    local proxy_started probe_ok
     local WARP_MAX_CANDIDATES=5
     WARP_UNLOCK_TRANSPORT_FAILED=0
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
@@ -13966,41 +14013,27 @@ auto_select_warp_candidate() {
         candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
         proxy_started=false
         probe_ok=false
-        candidate_ipv4=''
-        candidate_ipv6=''
         candidate_ip=''
         selected_family=4
-        if start_warp_candidate_proxy "$candidate_endpoint" 4; then
-            proxy_started=true
-            if probe_warp_trace "$WARP_PROBE_PROXY" && [[ "$WARP_PROBE_IP" != *:* ]]; then
-                candidate_ipv4="$WARP_PROBE_IP"
-                probe_ok=true
-            fi
-        fi
-        if [ -n "$candidate_ipv4" ] && [ -n "$active_ipv4" ] && [ "$candidate_ipv4" != "$active_ipv4" ]; then
-            candidate_ip="$candidate_ipv4"
-            selected_family=4
-        else
-            [ "$proxy_started" = true ] && stop_warp_candidate_proxy
-            proxy_started=false
-            if start_warp_candidate_proxy "$candidate_endpoint" 6; then
+        local candidate_passed=false
+        for selected_family in 4 6; do
+            if start_warp_candidate_proxy "$candidate_endpoint" "$selected_family"; then
                 proxy_started=true
-                if probe_warp_trace "$WARP_PROBE_PROXY" && [[ "$WARP_PROBE_IP" == *:* ]]; then
-                    candidate_ipv6="$WARP_PROBE_IP"
+                if probe_warp_trace "$WARP_PROBE_PROXY"; then
                     probe_ok=true
+                    candidate_ip="$WARP_PROBE_IP"
+                    yellow "检测候选 IPv${selected_family} 出站..."
+                    if run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" true; then
+                        candidate_passed=true
+                        break
+                    fi
                 fi
-                if [ -n "$candidate_ipv6" ]; then
-                    candidate_ip="$candidate_ipv6"
-                    selected_family=6
-                    yellow "候选没有取得不同的 IPv4 出口（当前 ${active_ipv4:-不可用}）；正在测试 IPv6，全部所选平台通过后才会切换。"
-                    yellow "提示：Cloudflare 的公网 IPv6 可能随连接变化，不作为固定身份标识。"
-                fi
+                stop_warp_candidate_proxy
+                proxy_started=false
             fi
-        fi
+        done
         if [ "$probe_ok" = true ]; then
-            if [ -z "$candidate_ip" ]; then
-                yellow "候选 IPv4/IPv6 出口均未变化，继续。"
-            elif run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" true; then
+            if [ "$candidate_passed" = true ]; then
                 stop_warp_candidate_proxy
                 proxy_started=false
                 if activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection" "$selected_family"; then activate_rc=0; else activate_rc=$?; fi
@@ -14046,13 +14079,13 @@ auto_select_warp_candidate() {
 }
 
 show_warp_status_and_unlocks() {
-    local account_file="${conf_dir}/warp/account.json" selection="${1:-1234}" family endpoint
+    local selection="${1:-1234}" family endpoint
     endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
     warp_endpoint_is_valid "$endpoint" || {
         yellow "内置 WARP 尚未初始化。"; return 1
     }
     family=$(get_warp_preferred_family)
-    yellow "正在通过正式服务检测 WARP（首次准备本机健康入口时会重启一次核心）..."
+    yellow "正在检测 WARP 出站..."
     if ! start_warp_active_proxy "$family"; then
         red "无法使用正式服务的 WARP 健康入口。"; return 1
     fi
@@ -14060,7 +14093,6 @@ show_warp_status_and_unlocks() {
         stop_warp_candidate_proxy
         red "内置 WARP 运行探测失败。"; return 1
     fi
-    green "设备 ID: $(jq -r '.id // "unknown"' "$account_file" 2>/dev/null)"
     green "出口 IP: ${WARP_PROBE_IP}（IPv${family}）  地区: ${WARP_PROBE_LOC:-未知}  机房: ${WARP_PROBE_COLO:-未知}"
     green "WARP: ${WARP_PROBE_STATE}"
     run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" true || true
@@ -14070,25 +14102,18 @@ show_warp_status_and_unlocks() {
 }
 
 get_warp_menu_status() {
-    local endpoint cache="${conf_dir}/warp/status.json" now checked warp
+    local endpoint route_file="${conf_dir}/route.json"
     endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
-    warp_endpoint_is_valid "$endpoint" || { echo 'not configured'; return; }
-    # Menu drawing is passive: no network requests, registration, restart or
-    # second process using the active WireGuard identity. Explicit diagnostics
-    # remain separate from configuration readiness.
-    now=$(date +%s) || { echo 'not checked'; return; }
-    checked=$(jq -r '.checked_at // 0' "$cache" 2>/dev/null) || checked=0
-    [[ "$checked" =~ ^[0-9]{1,10}$ ]] || { echo 'not checked'; return; }
-    if [ "$checked" = 0 ] || [ "$checked" -gt "$now" ] || [ $((now - 10#$checked)) -gt 300 ]; then
-        echo 'not checked'
-        return
+    [ -n "$endpoint" ] || { echo 'not configured'; return; }
+    warp_endpoint_is_valid "$endpoint" || { echo invalid; return; }
+    jq -e '.route|type=="object"' "$route_file" >/dev/null 2>&1 || { echo invalid; return; }
+    if ! jq -e '.route.final=="wireguard-out" or any(.route.rules[]? | .. | objects; .outbound?=="wireguard-out")' \
+      "$route_file" >/dev/null 2>&1; then
+        echo disabled; return
     fi
-    warp=$(jq -r '.warp // empty' "$cache" 2>/dev/null || true)
-    case "$warp" in
-        on|plus) echo 'cached success' ;;
-        failed) echo degraded ;;
-        *) echo 'not checked' ;;
-    esac
+    singbox_service_is_active || { echo stopped; return; }
+    # This is routing enablement, not a cached handshake or platform verdict.
+    echo enabled
 }
 
 # 输出 sing-box 内置 WARP endpoint。它只供 sing-box 出站使用，
@@ -15380,13 +15405,12 @@ warp_manage() {
     if [ -n "$current_warp_endpoint" ] && \
        warp_endpoint_is_valid "$current_warp_endpoint" && \
        ! warp_endpoint_is_legacy "$current_warp_endpoint"; then
-        green "内置 WARP 出站: ready（本机独立身份，不修改系统默认路由）"
+        green "内置 WARP 出站: 已配置"
     elif [ -n "$current_warp_endpoint" ] && warp_endpoint_is_legacy "$current_warp_endpoint"; then
         yellow "内置 WARP 出站: 旧共享身份（下次设置分流时自动迁移）"
     else
         yellow "内置 WARP 出站: 未初始化（首次设置分流时自动注册独立身份）"
     fi
-    yellow "未命中规则的网站仍走原出口；ip.sb 查询结果不代表所有业务的 WARP 状态。"
     green "当前已启用的分流规则集:"
     list_enabled_warp_route_mappings "$route_file" 2>/dev/null | while read -r mapping; do
         echo -e " - ${skyblue}${mapping}${re}"
@@ -15403,12 +15427,11 @@ warp_manage() {
     skyblue "----------------------"
     red "4. 删除 Socks5/HTTP 出站"
     skyblue "----------------------"
-    green "5. 查看内置 WARP 状态及解锁情况"
+    green "5. 查看 WARP 出口与平台检测"
     skyblue "----------------------------"
-    green "6. 更换内置 WARP 身份/IP"
+    green "6. 更换 WARP 身份/IP"
     skyblue "----------------------"
-    green "7. 自动优选 WARP IP（多平台解锁）"
-    green "8. IP 查询网站 WARP 分流（ip.sb 等）"
+    green "7. 按平台优选 WARP 出站"
     skyblue "----------------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -15436,11 +15459,6 @@ warp_manage() {
             read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage
             ;;
         0)  menu ;;
-        8)
-            reading "1 开启，2 关闭，其他返回: " check_sites_choice
-            case "$check_sites_choice" in 1) set_warp_check_sites on ;; 2) set_warp_check_sites off ;; esac
-            warp_manage
-            ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
     esac
@@ -15579,7 +15597,6 @@ restore_direct_outbound() {
 }
 delete_rule_menu() {
     clear
-    yellow "未命中规则的网站仍走原出口；ip.sb 查询结果不代表所有业务的 WARP 状态。"
     green "当前已启用的分流规则集:"
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" | nl -w2 -s'. '
     reading "\n输入要删除的规则名称或序号: " del_input
@@ -17416,8 +17433,6 @@ dispatch_cli_action() {
         -r|--restart) refresh_quick_argo "$service_file" ;;
         --cfy) manage_cfy ;;
         --warp-health) show_warp_health ;;
-        --warp-check-sites) set_warp_check_sites on ;;
-        --warp-check-sites-off) set_warp_check_sites off ;;
         -h|--help)
             echo ""
             green "用法: [sb或脚本] [参数], 示例: sb -c(查看节点信息)"
@@ -17428,7 +17443,6 @@ dispatch_cli_action() {
             green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
             green "      --cfy         进入 Cloudflare优选 菜单"
             green "      --warp-health 正式服务 WARP 双栈检查（首次会准备本机健康入口）"
-            green "      --warp-check-sites / --warp-check-sites-off 开关 IP 查询网站 WARP 分流"
             green "  -u, --uninstall   uninstall sing-box and keep nginx"
             green "      --purge-nginx  uninstall sing-box and remove nginx"
             green "  -h, --help        显示此帮助信息"
@@ -17452,11 +17466,11 @@ menu() {
     argo_status=$(check_argo 2>/dev/null)
     warp_status=$(get_warp_menu_status 2>/dev/null || echo degraded)
     case "$warp_status" in
-        running) warp_status=$(green "$warp_status") ;;
-        "cached success") warp_status=$(yellow "最近检测成功（缓存，非实时验证）") ;;
-        "not checked") warp_status=$(yellow "已配置，待检测") ;;
-        degraded) warp_status=$(yellow "$warp_status") ;;
-        *) warp_status=$(red "$warp_status") ;;
+        enabled) warp_status=$(green "已启用") ;;
+        disabled) warp_status=$(yellow "未启用") ;;
+        stopped) warp_status=$(red "核心未运行") ;;
+        invalid) warp_status=$(red "配置异常") ;;
+        *) warp_status=$(yellow "未配置") ;;
     esac
 
     clear; echo ""
@@ -17465,7 +17479,7 @@ menu() {
     green "Github地址: ${purple}https://github.com/eooce/sing-box${re}\n"
     purple "=== 老王sing-box四合一安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
-    purple "---WARP 状态: ${warp_status}"
+    purple "---WARP 分流: ${warp_status}"
     purple "--Nginx 状态: ${nginx_status}"
     purple "singbox 状态: ${singbox_status}\n"
     green "1. 安装sing-box"
@@ -17495,6 +17509,15 @@ harden_runtime_secret_permissions || {
     red "无法收紧 sing-box 凭据文件权限，操作中止。"
     exit 1
 }
+
+# Decommission the old built-in query route on existing installations only.
+case "${1:-}" in
+    -h|--help|-u|--uninstall|--purge-nginx) ;;
+    *) migrate_retired_warp_routes || {
+        red "旧版附加规则清理未完成，原规则已保留；请检查恢复提示。"
+        exit 1
+    } ;;
+esac
 
 # 捕获 Ctrl+C
 trap 'stop_warp_candidate_proxy 2>/dev/null || true; red "\n强制退出"; exit' INT TERM

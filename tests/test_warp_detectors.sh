@@ -14,37 +14,39 @@ extract_function() {
 }
 
 source <(
-    for name in warp_platform_curl check_unlock_netflix check_unlock_disney check_unlock_chatgpt \
+    for name in warp_platform_curl check_unlock_netflix check_unlock_disney classify_chatgpt_response check_unlock_chatgpt \
       extract_html_visible_text check_unlock_gemini run_selected_unlock_checks; do
         extract_function "$name"
     done
 )
 
 curl() {
-    local output='' format='' url='' code=200 effective='' body='' curl_rc=0
+    local output='' headers='' format='' url='' code=200 effective='' body='' curl_rc=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
           -o) output="$2"; shift 2 ;;
+          -D) headers="$2"; shift 2 ;;
           -w) format="$2"; shift 2 ;;
           https://*) url="$1"; shift ;;
           *) shift ;;
         esac
     done
+    [ -z "$headers" ] || : > "$headers"
     effective="$url"
     case "${MOCK_CASE}:${url}" in
       chatgpt-403:https://chatgpt.com) code=403; body='<html>challenge</html>' ;;
       chatgpt-403:https://ios.chat.openai.com) code=200; body='{"status":"ok"}' ;;
-      chatgpt-restricted:https://chatgpt.com) code=403; body='<html>challenge</html>' ;;
+      chatgpt-restricted:https://chatgpt.com) code=403; body='{"error":{"code":"unsupported_country_region_territory"}}' ;;
       chatgpt-restricted:https://ios.chat.openai.com) code=403; body='{"cf_details":"Request is not allowed. Please try again later.","type":"dc"}' ;;
       chatgpt-web-error:https://chatgpt.com) code=000; body=''; curl_rc=28 ;;
       chatgpt-web-error:https://ios.chat.openai.com) code=403; body='{"cf_details":"Request is not allowed. Please try again later.","type":"dc"}' ;;
       chatgpt-web-error-clean:https://chatgpt.com) code=000; body=''; curl_rc=28 ;;
       chatgpt-web-error-clean:https://ios.chat.openai.com) code=200; body='{"status":"ok"}' ;;
-      chatgpt-pass:https://chatgpt.com) code=200; body='<html>ChatGPT</html>' ;;
+      chatgpt-pass:https://chatgpt.com) code=200; body='<html><title>ChatGPT</title><script src="/_next/static/app.js"></script></html>' ;;
       chatgpt-pass:https://ios.chat.openai.com) code=200; body='{"status":"ok"}' ;;
-      chatgpt-subdomain:https://chatgpt.com) code=200; effective='https://www.chatgpt.com/'; body='<html>ChatGPT</html>' ;;
+      chatgpt-subdomain:https://chatgpt.com) code=200; effective='https://www.chatgpt.com/'; body='<html><title>ChatGPT</title><script src="/_next/static/app.js"></script></html>' ;;
       chatgpt-subdomain:https://ios.chat.openai.com) code=200; body='{"status":"ok"}' ;;
-      chatgpt-path-spoof:https://chatgpt.com) code=200; effective='https://evil.com/path.chatgpt.com/'; body='<html>ChatGPT</html>' ;;
+      chatgpt-path-spoof:https://chatgpt.com) code=200; effective='https://evil.com/path.chatgpt.com/'; body='<html><title>ChatGPT</title><script src="/_next/static/app.js"></script></html>' ;;
       chatgpt-path-spoof:https://ios.chat.openai.com) code=200; body='{"status":"ok"}' ;;
       gemini-timeout:https://gemini.google.com/app) code=000; curl_rc=28 ;;
       gemini-generic:https://gemini.google.com/app) code=200; body='<html>Google sign in</html>' ;;
@@ -131,7 +133,7 @@ if check_unlock_chatgpt proxy; then fail 'ChatGPT explicit not-allowed response 
 
 MOCK_CASE=chatgpt-web-error
 if check_unlock_chatgpt proxy; then fail 'ChatGPT restriction was accepted after the web probe failed'; else rc=$?; fi
-[ "$rc" -eq 1 ] || fail "ChatGPT web probe failure hid an explicit restriction: rc=${rc}, expected restricted rc=1"
+[ "$rc" -eq 2 ] || fail "Web timeout must not inherit an unrelated iOS restriction"
 
 MOCK_CASE=chatgpt-web-error-clean
 if check_unlock_chatgpt proxy; then fail 'ChatGPT was accepted without a successful web probe'; else rc=$?; fi

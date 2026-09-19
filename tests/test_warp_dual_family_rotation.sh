@@ -66,7 +66,10 @@ probe_warp_trace() {
 stop_warp_candidate_proxy() { :; }
 delete_warp_registration() { DELETE_CALLS=$((DELETE_CALLS + 1)); }
 remove_warp_candidate_dir() { rm -rf -- "$1"; }
-run_selected_unlock_checks() { WARP_UNLOCK_SUMMARY='ok'; return 0; }
+run_selected_unlock_checks() {
+    [[ "$CURRENT_FAMILY" == "${PLATFORM_FAMILY:-6}" ]] || return 1
+    WARP_UNLOCK_SUMMARY='ok'; return 0
+}
 activate_warp_candidate() {
     [[ "$LOG" != *'并将所选分流规则切换为'* ]] || fail 'candidate was reported as switched before activation'
     ACTIVATE_CALLS=$((ACTIVATE_CALLS + 1))
@@ -95,4 +98,8 @@ auto_select_warp_candidate 134 || fail 'auto selection rejected an unlocking can
 [[ "$ACTIVATE_FAMILY" = 6 ]] || fail "auto selection activated family ${ACTIVATE_FAMILY:-unset}, expected IPv6"
 [[ "$ACTIVATE_IP" = '2001:db8::10' ]] || fail "auto selection activated unexpected IPv6 probe result: ${ACTIVATE_IP:-unset}"
 
+# Identical IPv4 still needs platform testing: no forced IPv6 fallback.
+LOG=''; ACTIVATE_CALLS=0; GENERATE_CALLS=0; PLATFORM_FAMILY=4
+auto_select_warp_candidate 3 || fail 'pinned but usable IPv4 was skipped'
+[[ "$ACTIVATE_CALLS" == 1 && "$ACTIVATE_FAMILY" == 4 && "$GENERATE_CALLS" == 1 ]] || fail 'usable IPv4 path was not selected'
 echo 'WARP dual-family rotation tests passed.'

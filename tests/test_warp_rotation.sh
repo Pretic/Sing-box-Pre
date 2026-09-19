@@ -31,10 +31,10 @@ grep -Fq 'local state_dir="${1:-${conf_dir}/warp}"' "$script" || \
     fail 'identity generation does not accept an isolated destination'
 grep -Fq 'local WARP_MAX_CANDIDATES=5' "$script" || \
     fail 'automatic selection is not capped at five candidates'
-grep -Fq -- '---WARP 状态:' "$script" || fail 'main-menu WARP status is missing'
-grep -Fq '5. 查看内置 WARP 状态及解锁情况' "$script" || fail 'status menu item is missing'
-grep -Fq '6. 更换内置 WARP 身份/IP' "$script" || fail 'single rotation menu item is missing'
-grep -Fq '7. 自动优选 WARP IP（多平台解锁）' "$script" || fail 'automatic selector menu item is missing'
+grep -Fq -- '---WARP 分流:' "$script" || fail 'main-menu WARP status is missing'
+grep -Fq '5. 查看 WARP 出口与平台检测' "$script" || fail 'status menu item is missing'
+grep -Fq '6. 更换 WARP 身份/IP' "$script" || fail 'single rotation menu item is missing'
+grep -Fq '7. 按平台优选 WARP 出站' "$script" || fail 'automatic selector menu item is missing'
 
 for service in Netflix Disney+ ChatGPT Gemini; do
     grep -Fq "$service" "$script" || fail "$service unlock support is missing"
@@ -46,7 +46,7 @@ if grep -nE 'show_warp_status_and_unlocks|get_warp_menu_status' "$script" | \
 fi
 
 grep -Fq 'not configured' "$script" || fail 'not configured status is missing'
-grep -Fq 'degraded' "$script" || fail 'degraded status is missing'
+grep -Fq '核心未运行' "$script" || fail 'stopped core status is missing'
 
 chatgpt_block=$(sed -n '/^check_unlock_chatgpt() {/,/^check_unlock_gemini() {/p' "$script")
 grep -Fq '%{http_code}' <<< "$chatgpt_block" || \
@@ -55,10 +55,9 @@ grep -Fq '%{url_effective}' <<< "$chatgpt_block" || \
     fail 'ChatGPT reachability does not record the final URL'
 ! grep -Eq '\(200\|301\|302\|307\|308\|403\)|\^\(200\|301\|302\|307\|308\|403\)' <<< "$chatgpt_block" || \
     fail 'ChatGPT HTTP 403 must never be accepted as unlocked'
-grep -Fq 'ios.chat.openai.com' <<< "$chatgpt_block" || fail 'ChatGPT iOS restriction probe is missing'
-grep -Fq "'\\(1\\)|\\(2\\)'" <<< "$chatgpt_block" || fail 'ChatGPT disallowed-ISP markers are not checked'
-! grep -Fq 'ios.chat.openai.com 2>/dev/null || true' <<< "$chatgpt_block" || \
-    fail 'ChatGPT iOS network failures are silently accepted'
+! grep -Fq 'ios.chat.openai.com' <<< "$chatgpt_block" || fail 'web test must not use the iOS endpoint'
+grep -Fq 'classify_chatgpt_response' <<< "$chatgpt_block" || fail 'structured HTTP classifier missing'
+grep -Fq 'cf-mitigated' "$script" || fail 'challenge header classification missing'
 
 disney_block=$(sed -n '/^check_unlock_disney() {/,/^check_unlock_chatgpt() {/p' "$script")
 grep -Fq 'disney.api.edge.bamgrid.com/token' <<< "$disney_block" || \
