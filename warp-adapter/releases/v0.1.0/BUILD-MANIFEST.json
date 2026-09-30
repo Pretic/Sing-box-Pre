@@ -1,0 +1,64 @@
+{
+  "go_version": "go1.24.13",
+  "flags": [
+    "CGO_ENABLED=0",
+    "GOOS=linux",
+    "-mod=readonly",
+    "-trimpath",
+    "-buildvcs=false",
+    "-ldflags=-s -w -buildid="
+  ],
+  "architecture_options": {
+    "386": "GO386=sse2",
+    "amd64": "GOAMD64=v1",
+    "armv7": "GOARCH=arm GOARM=7",
+    "arm64": "GOARM64=v8.0",
+    "s390x": "GOARCH=s390x"
+  },
+  "artifacts": [
+    {
+      "filename": "warp-registration-adapter-linux-386",
+      "sha256": "05371aa0dac381c2eceab646e1a18255f0ac1996204add41c29444c575408eae",
+      "size_bytes": 7266452,
+      "elf": "ELF 32-bit LSB executable, Intel i386, version 1 (SYSV), statically linked, stripped",
+      "reproducible_rebuild_equal": true,
+      "runtime_executed": false
+    },
+    {
+      "filename": "warp-registration-adapter-linux-amd64",
+      "sha256": "622f2766917cd2dcdc22a789a8ec232e6f2150eee2daf18f5c10d96f5363d9c2",
+      "size_bytes": 7577748,
+      "elf": "ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped",
+      "reproducible_rebuild_equal": true,
+      "runtime_executed": true
+    },
+    {
+      "filename": "warp-registration-adapter-linux-arm64",
+      "sha256": "ca7f6924a460a5d210bb0108cef339dad7fa90604b1a8ffb59a63070210fded5",
+      "size_bytes": 7143572,
+      "elf": "ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, stripped",
+      "reproducible_rebuild_equal": true,
+      "runtime_executed": false
+    },
+    {
+      "filename": "warp-registration-adapter-linux-armv7",
+      "sha256": "909adab9c5d8ac08ed7bda69b3701cc32e6c6b83b797dc6e8b6fefa3b0c84f14",
+      "size_bytes": 7274644,
+      "elf": "ELF 32-bit LSB executable, ARM, EABI5 version 1 (SYSV), statically linked, stripped",
+      "reproducible_rebuild_equal": true,
+      "runtime_executed": false
+    },
+    {
+      "filename": "warp-registration-adapter-linux-s390x",
+      "sha256": "963756245302d3761f15199a6df7ec333d1d795fec15929452db04698fec8a60",
+      "size_bytes": 7930004,
+      "elf": "ELF 64-bit MSB executable, IBM S/390, version 1 (SYSV), statically linked, stripped",
+      "reproducible_rebuild_equal": true,
+      "runtime_executed": false
+    }
+  ],
+  "source_manifest_sha256": "f7bb69216a6962c9546bb7bc785fbdeaaa31758ef375655d7c1d626835cc8018",
+  "additional_architecture_limits": "386 test executable compiled but host refused execution with exec format error. armv7, arm64 and s390x are cross-compiled only; no runtime validation on matching architecture.",
+  "reference_local_source_manifest_sha256": "66497e773eb03fa40f3ad7a1c7018495c67e0d7549e844a3c33cce7701f91ad5",
+  "source_manifest_note": "Only README and its checksum changed after the local reference build; Go source and resulting ELF hashes are unchanged."
+}

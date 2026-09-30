@@ -1,0 +1,118 @@
+name: Release WARP adapter
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-warp-adapter.yml'
+      - 'warp-adapter/RELEASE_VERSION'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warp-adapter-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify toolchain and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/go1.24.13.linux-amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 2 --max-time 180 \
+            https://dl.google.com/go/go1.24.13.linux-amd64.tar.gz -o "$archive"
+          printf '%s  %s\n' 1fc94b57134d51669c72173ad5d49fd62afb0f1db9bf3f798fd98ee423f8d730 "$archive" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/adapter-toolchain"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/adapter-toolchain"
+          echo "$RUNNER_TEMP/adapter-toolchain/go/bin" >> "$GITHUB_PATH"
+          cd warp-adapter
+          sha256sum -c SOURCE-SHA256SUMS
+      - name: Test and build exact release artifacts
+        shell: bash
+        env:
+          GOTOOLCHAIN: local
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          cd warp-adapter
+          version=$(cat RELEASE_VERSION)
+          [[ "$version" == v0.1.0 ]]
+          go version
+          go mod download
+          go mod verify
+          go test -count=1 ./...
+          go vet ./...
+          mkdir dist
+          for arch in amd64 arm64 386 armv7 s390x; do
+            target="$arch"
+            if [[ "$arch" == armv7 ]]; then target=arm; fi
+            GOOS=linux GOARCH="$target" GOAMD64=v1 GOARM64=v8.0 GOARM=7 GO386=sse2 \
+              go build -mod=readonly -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
+              -o "dist/warp-registration-adapter-linux-$arch" .
+          done
+          cp "releases/$version/SHA256SUMS.ELF" dist/
+          cp "releases/$version/SHA256SUMS" dist/
+          cp "releases/$version/BUILD-MANIFEST.json" dist/
+          cp SOURCE-SHA256SUMS THIRD-PARTY-NOTICES.md dist/
+          printf '%s\n' "$GITHUB_SHA" > dist/SOURCE-COMMIT
+          cd dist
+          sha256sum -c SHA256SUMS.ELF
+          for binary in warp-registration-adapter-linux-*; do gzip -n -9 "$binary"; done
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: warp-adapter-v0.1.0
+          path: warp-adapter/dist/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: warp-adapter-v0.1.0
+          path: release
+      - name: Verify and publish immutable version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd release
+          [[ "$(cat SOURCE-COMMIT)" == "$GITHUB_SHA" ]]
+          sha256sum -c SHA256SUMS
+          while read -r expected name; do
+            actual=$(gzip -dc "$name.gz" | sha256sum | cut -d ' ' -f1)
+            [[ "$actual" == "$expected" ]]
+          done < SHA256SUMS.ELF
+          tag=warp-adapter-v0.1.0
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing to overwrite immutable assets.' >&2
+            exit 1
+          fi
+          cat > RELEASE-NOTES.md <<'EOF'
+          WARP adapter v0.1.0 for Sing-box-Pre. Five Linux architectures; no Go installation required on the VPS.
+
+          Built from the tagged source with Go 1.24.13. SHA256SUMS verifies gzip assets; SHA256SUMS.ELF verifies decompressed executables. THIRD-PARTY-NOTICES.md contains redistribution licenses.
+
+          Only amd64 has runtime validation. Other architectures are verified reproducible cross-builds. Live Cloudflare registration and 128 MiB whole-system operation are not certified.
+          EOF
+          gh release create "$tag" --target "$GITHUB_SHA" --title 'WARP adapter v0.1.0' \
+            --notes-file RELEASE-NOTES.md \
+            warp-registration-adapter-linux-*.gz SHA256SUMS SHA256SUMS.ELF \
+            BUILD-MANIFEST.json SOURCE-SHA256SUMS SOURCE-COMMIT THIRD-PARTY-NOTICES.md
