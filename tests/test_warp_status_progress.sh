@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+begin_warp_serial_probe() { return 0; }
+end_warp_serial_probe() { return 0; }
 
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
 source <(sed -n '/^show_warp_status_and_unlocks() {/,/^}/p' "$script")
@@ -57,8 +59,24 @@ grep -q 'Gemini: 网络/地区可用' "$output" || fail 'later platforms were sk
 starts=0; stops=0
 probe_warp_trace() { return 1; }
 if show_warp_status_and_unlocks > "$output"; then fail 'failed WARP handshake was accepted'; fi
-[[ "$stops" == 1 ]] || fail 'failed handshake left the probe running'
-grep -q '探测失败' "$output" || fail 'failed handshake did not explain the failure'
+[[ "$starts" == 2 && "$stops" == 2 ]] || fail 'failed dual-family checks did not clean up both probes'
+grep -q '探测均失败' "$output" || fail 'failed handshake did not explain the failure'
+
+# A failed preferred family must not label the other working family as broken.
+starts=0; stops=0
+start_warp_active_proxy() {
+    starts=$((starts+1)); CURRENT_FAMILY="$1"; WARP_PROBE_PROXY=proxy
+}
+probe_warp_trace() {
+    [[ "$CURRENT_FAMILY" == 6 ]] || return 1
+    WARP_PROBE_IP=2001:db8::1; WARP_PROBE_STATE=on; WARP_PROBE_LOC=US; WARP_PROBE_COLO=LAX
+}
+write_warp_status_cache() { CACHE_FAMILY="$3"; }
+write_warp_preferred_family() { fail 'diagnostic fallback changed saved routing preference'; }
+show_warp_status_and_unlocks 3 > "$output"
+[[ "$starts" == 2 && "$stops" == 2 && "$CACHE_FAMILY" == 6 ]]
+grep -q '仅本次检测改用 IPv6' "$output"
+grep -q '2001:db8::1' "$output"
 
 menu_block=$(sed -n '/^warp_manage() {/,/^}/p' "$script")
 grep -Fq 'show_warp_status_and_unlocks || true' <<< "$menu_block" || \

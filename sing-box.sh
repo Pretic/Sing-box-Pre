@@ -6688,6 +6688,26 @@ validate_installed_singbox_config_strict() {
     "${work_dir}/${server_name}" check -C "${conf_dir}" >/dev/null 2>&1
 }
 
+prepare_low_memory_config_mutation() {
+    warp_use_serial_probe || return 0
+    singbox_service_is_active || return 0
+    # Only stop when an outer transaction already owns rollback and the lock.
+    if [ "${NODE_CHANGE_STAGE:-}" = mutating ] && [ "${restart_required:-0}" = 1 ]; then
+        NODE_CHANGE_LOW_MEMORY_STOPPED=1
+    elif [ "${DURABLE_TX_ACTIVE:-0}" = 1 ]; then
+        case "${DURABLE_TX_STAGE:-}" in precommit|config-mutated) ;; *) return 0 ;; esac
+        case "${DURABLE_TX_KIND:-}" in
+          public-port) [ "${PUBLIC_TX_CONFIG_MUTATED:-0}" = 1 ] || return 0 ;;
+          extra-protocol-add|extra-protocol-remove) EXTRA_PROTOCOL_SERVICE_TOUCHED=1; EXTRA_PROTOCOL_LOW_MEMORY_STOPPED=1 ;;
+          *) return 0 ;;
+        esac
+    else
+        return 0
+    fi
+    yellow "小内存节点配置事务：停止代理后串行校验，提交或回滚后恢复服务。" >&2
+    stop_singbox_checked && ! singbox_service_is_active
+}
+
 apply_jq_config() {
     local target_file="$1"
     shift
@@ -6710,6 +6730,7 @@ apply_jq_config() {
     fi
 
     cp -p "$target_file" "$backup_file" 2>/dev/null || cp "$target_file" "$backup_file" || { rm -f "$tmp_file" "$backup_file"; return 1; }
+    prepare_low_memory_config_mutation || { rm -f "$tmp_file" "$backup_file"; return 1; }
     if ! mv -f "$tmp_file" "$target_file"; then
         rm -f "$tmp_file" "$backup_file"
         return 1
@@ -7045,6 +7066,7 @@ apply_node_change_transaction() {
     local transaction_status=0 failure_status=0
     local failure_reason='' rollback_ok=1 publish_status=0
     local service_was_active=0 argo_was_active=0 argo_restart_attempted=0
+    local NODE_CHANGE_LOW_MEMORY_STOPPED=0
     local conflict_status=0 open_status=0 lock_status=0 old_firewall_rule=''
     local old_protocol='' old_port='' transport='' new_port='' new_transport=''
     local old_runtime_PORT="${PORT-}" old_runtime_REALITY_PORT="${REALITY_PORT-}"
@@ -7154,7 +7176,8 @@ apply_node_change_transaction() {
         local original_status="${2:-2}"
         local final_status="$original_status"
 
-        trap - HUP INT TERM EXIT
+        trap - EXIT
+        trap '' HUP INT TERM
         rollback_ok=1
         if [ "$node_change_committed" -eq 0 ] && [ -d "$transaction_dir" ]; then
             for ((index=${#snapshot_paths[@]} - 1; index >= 0; index--)); do
@@ -7383,6 +7406,12 @@ apply_node_change_transaction() {
         failure_reason="配置文件修改失败"
     fi
     if [ "$NODE_CHANGE_NOOP" -eq 1 ]; then
+        if [ "$NODE_CHANGE_LOW_MEMORY_STOPPED" = 1 ] && { ! restart_singbox_checked || ! singbox_service_is_active; }; then
+            _retain_node_change_recovery "no-op-service-restore-failed"
+            _finish_node_change_transaction 2
+            _restore_node_change_traps
+            return "$lock_status"
+        fi
         NODE_CHANGE_STAGE='no-op'
         if ! rm -rf -- "$transaction_dir"; then
             if [ "$failure_status" -eq 0 ]; then
@@ -9252,6 +9281,119 @@ create_shortcut() {
     fi
 }
 
+warp_adapter_release_spec() {
+    local arch="$1" compressed='' binary=''
+    # Published versioned assets are pinned by both archive and executable hashes.
+    case "$arch" in
+      amd64) compressed=5b43ac9d17e2b9d5783064824149a8aca487fc3b8b44ec170d6409edaa5de80a; binary=622f2766917cd2dcdc22a789a8ec232e6f2150eee2daf18f5c10d96f5363d9c2 ;;
+      arm64) compressed=1fe1b3e9b431f538ca14d5d9484cc7d31f443ffbf4755b518c9942bccb6125ca; binary=ca7f6924a460a5d210bb0108cef339dad7fa90604b1a8ffb59a63070210fded5 ;;
+      386) compressed=41550515c7fdcc0d89d66b21bd76961cf0a73c4457aa0b4c7fcd6f50cc970038; binary=05371aa0dac381c2eceab646e1a18255f0ac1996204add41c29444c575408eae ;;
+      armv7) compressed=b6cbb3ea2dd7f63c904ac21435be3fbb231e2ef16d54d08b015403423ea30b8c; binary=909adab9c5d8ac08ed7bda69b3701cc32e6c6b83b797dc6e8b6fefa3b0c84f14 ;;
+      s390x) compressed=f155a8ba00b926ff5a0fe2459b4c11e01224eb0c23e9609079c88c506d454602; binary=963756245302d3761f15199a6df7ec333d1d795fec15929452db04698fec8a60 ;;
+      *) return 1 ;;
+    esac
+    [[ "$compressed" =~ ^[0-9a-f]{64}$ && "$binary" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s %s %s\n' "https://github.com/Pretic/Sing-box-Pre/releases/download/warp-adapter-v0.1.0/warp-registration-adapter-linux-$arch.gz" "$compressed" "$binary"
+}
+
+warp_adapter_arch() {
+    case "$(uname -m)" in
+      x86_64|amd64) echo amd64 ;; aarch64|arm64) echo arm64 ;;
+      x86|i686|i386) echo 386 ;; armv7l) echo armv7 ;; s390x) echo s390x ;;
+      *) return 1 ;;
+    esac
+}
+
+validate_warp_adapter_elf() {
+    local file="$1" arch="$2" header class_data machine
+    header=$(od -An -tx1 -N20 "$file" 2>/dev/null | tr -d ' \n') || return 1
+    case "$arch" in
+      amd64) class_data=0201; machine=3e00 ;; arm64) class_data=0201; machine=b700 ;;
+      386) class_data=0101; machine=0300 ;; armv7) class_data=0101; machine=2800 ;;
+      s390x) class_data=0202; machine=0016 ;; *) return 1 ;;
+    esac
+    [[ ${header:0:8} = 7f454c46 && ${header:8:4} = "$class_data" &&
+       ${header:12:2} = 01 && ${header:36:4} = "$machine" ]]
+}
+
+ensure_warp_adapter() {
+    (
+    umask 077
+    local root="${1:-}" dir target marker lock fd stage='' arch spec url archive_sha binary_sha actual old_sha path mark_tmp rc=0
+    if [ -n "${SB_WARP_ADAPTER:-}" ]; then
+        [ -f "$SB_WARP_ADAPTER" ] && [ ! -L "$SB_WARP_ADAPTER" ] && [ -x "$SB_WARP_ADAPTER" ] || {
+            red "指定的 WARP 适配器不可用，未下载或覆盖自定义路径。" >&2; exit 1
+        }
+        exit 0
+    fi
+    [[ "$root" != *'/../'* && "$root" != */.. ]] || exit 1
+    dir="${root}/usr/local/lib/sing-box-pre"
+    target="$dir/warp-registration-adapter"; marker="$target.sha256"; lock="$dir/.warp-adapter-install.lock"
+    for path in "${root}/usr" "${root}/usr/local" "${root}/usr/local/lib" "$dir"; do
+        [ ! -L "$path" ] || exit 1
+        [ ! -e "$path" ] || [ -d "$path" ] || exit 1
+    done
+    arch=$(warp_adapter_arch) || { red "此架构没有配套 WARP 成品。" >&2; exit 1; }
+    spec=$(warp_adapter_release_spec "$arch") || { red "WARP 成品发布信息不完整，未下载。" >&2; exit 1; }
+    read -r url archive_sha binary_sha <<< "$spec"
+    [[ "$url" = https://* && "$archive_sha" =~ ^[0-9a-f]{64}$ && "$binary_sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
+    for path in curl gzip sha256sum od flock; do command -v "$path" >/dev/null 2>&1 || { red "安装 WARP 组件需要 $path。" >&2; exit 1; }; done
+    mkdir -p "$dir" || exit 1
+    [ "$(stat -c %u "$dir")" = "$EUID" ] || exit 1
+    [ $(( 8#$(stat -c %a "$dir") & 022 )) = 0 ] || exit 1
+    for path in "$target" "$marker" "$lock"; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] && continue
+        [ -f "$path" ] && [ ! -L "$path" ] || exit 1
+    done
+    exec {fd}>"$lock" || exit 1
+    flock -w 30 "$fd" || { red "WARP 组件正在由其他进程更新，请稍后重试。" >&2; exit 1; }
+    # Recheck after acquiring the lock; rename never follows the target path.
+    for path in "$target" "$marker"; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] && continue
+        [ -f "$path" ] && [ ! -L "$path" ] || exit 1
+    done
+    if [ -f "$target" ]; then
+        actual=$(sha256sum "$target") || exit 1; actual=${actual%% *}
+        if [ "$actual" = "$binary_sha" ]; then
+            validate_warp_adapter_elf "$target" "$arch" && chmod 755 "$target" || exit 1
+            old_sha=''; [ ! -f "$marker" ] || IFS= read -r old_sha < "$marker" || true
+            if [ "$old_sha" != "$binary_sha" ]; then
+                mark_tmp=$(mktemp "$dir/.warp-adapter-sha.XXXXXX") || exit 1
+                printf '%s\n' "$binary_sha" > "$mark_tmp" && mv -fT -- "$mark_tmp" "$marker" || { rm -f "$mark_tmp"; exit 1; }
+            fi
+            exit 0
+        fi
+        old_sha=''; [ ! -f "$marker" ] || IFS= read -r old_sha < "$marker" || true
+        if [ "$actual" != "$old_sha" ]; then
+            # Known local candidate versions can be upgraded without adopting
+            # arbitrary unmarked third-party executables.
+            case "$actual" in
+              0c40619470936afa1e4b6007cc23dbfcee1d128082f4f861e7e869d49a54672a|bbe04e1f4a3222d611cf96ccd271e8c04bda5797a167ca0e3398f9945a69aaef) ;;
+              *) red "默认路径存在未托管的 WARP 程序，未覆盖；请移走后重试或用 SB_WARP_ADAPTER 指定自定义程序。" >&2; exit 1 ;;
+            esac
+        fi
+    fi
+    stage=$(mktemp -d "$dir/.warp-adapter-stage.XXXXXX") || exit 1
+    trap 'rc=$?; [ -z "$stage" ] || rm -rf -- "$stage"; exit "$rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 --max-filesize 16777216 \
+         "$url" -o "$stage/adapter.gz"; then exit 1; fi
+    actual=$(sha256sum "$stage/adapter.gz") || exit 1; actual=${actual%% *}
+    [ "$actual" = "$archive_sha" ] || { red "WARP 压缩包校验失败，保留原组件。" >&2; exit 1; }
+    gzip -dc "$stage/adapter.gz" > "$stage/adapter" || exit 1
+    actual=$(sha256sum "$stage/adapter") || exit 1; actual=${actual%% *}
+    [ "$actual" = "$binary_sha" ] && validate_warp_adapter_elf "$stage/adapter" "$arch" || {
+        red "WARP 成品校验或架构不符，保留原组件。" >&2; exit 1
+    }
+    chmod 755 "$stage/adapter" || exit 1
+    printf '%s\n' "$binary_sha" > "$stage/sha256" || exit 1
+    mv -fT -- "$stage/adapter" "$target" || exit 1
+    mv -fT -- "$stage/sha256" "$marker" || { red "组件已安装，但版本标记写入失败，请检查 $marker。" >&2; exit 2; }
+    green "WARP 配套组件已安装（$arch，无需 Go、不新增常驻服务）。" >&2
+    )
+}
+
 update_local_manager() {
     local install_root="${1:-}"
     local update_url="${2:-https://raw.githubusercontent.com/Pretic/Sing-box-Pre/main/sing-box.sh}"
@@ -9261,14 +9403,33 @@ update_local_manager() {
     local tmp_file previous_tmp='' previous_rollback=''
     local previous_existed=0 previous_replaced=0 rollback_ok=1
 
+    [[ "$update_url" =~ ^https://[^[:space:]]+$ ]] || return 1
+    [ ! -L "$manager_dir" ] || return 1
+    for tmp_file in "$manager_file" "$previous_file"; do
+        [ ! -e "$tmp_file" ] && [ ! -L "$tmp_file" ] && continue
+        [ -f "$tmp_file" ] && [ ! -L "$tmp_file" ] || return 1
+    done
     mkdir -p "$manager_dir" || return 1
     tmp_file=$(mktemp "${manager_dir}/.sing-box.sh.new.XXXXXX") || return 1
-    if ! curl -fsSL --connect-timeout 10 --max-time 60 "$update_url" -o "$tmp_file"; then
+    if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 "$update_url" -o "$tmp_file"; then
         rm -f "$tmp_file"
         return 1
     fi
-    if ! bash -n "$tmp_file" || ! chmod 700 "$tmp_file"; then
+    # Syntax alone accepts empty files and arbitrary shell snippets. Verify the
+    # manager's structural entry points without sourcing or executing downloads.
+    if [ ! -s "$tmp_file" ] ||
+       ! head -n 1 "$tmp_file" | grep -Eq '^#!/(usr/)?bin/(env bash|bash)$' ||
+       ! grep -Fqx 'dispatch_cli_action() {' "$tmp_file" ||
+       ! grep -Fqx 'update_shortcut() {' "$tmp_file" ||
+       ! grep -Fqx 'menu() {' "$tmp_file" ||
+       ! grep -Fq 'dispatch_cli_action "$1"' "$tmp_file" ||
+       ! bash -n "$tmp_file" || ! chmod 700 "$tmp_file"; then
         rm -f "$tmp_file"
+        return 1
+    fi
+    if ! ensure_warp_adapter "$install_root"; then
+        rm -f "$tmp_file"
+        red "配套组件更新失败，现有 sb 管理脚本保持不变。"
         return 1
     fi
     if [ -e "$manager_file" ]; then
@@ -9429,10 +9590,11 @@ run_install_flow() {
         red "无法清除旧的安装完成标记，安装中止。"
         return 1
     }
-    manage_packages install nginx jq tar openssl lsof coreutils util-linux || {
+    manage_packages install nginx jq tar gzip openssl lsof coreutils util-linux || {
         red "依赖安装失败，安装中止。"
         return 1
     }
+    ensure_warp_adapter || { red "配套组件下载失败，未继续节点安装；稍后重试即可。"; return 1; }
     if prepare_partial_install_resume "$init_system"; then
         resuming_partial_install=1
         yellow "检测到由本脚本管理的未完成安装，继续生成订阅与收尾配置。"
@@ -9828,7 +9990,10 @@ change_config() {
                 yellow "\n当前已是ipv4, 无需切换\n" && return 0
             fi
            ;;
-        8)
+        10)
+        yellow "内存保护已暂停候选更换，当前身份保留；释放内存后重试，或先切换当前身份为 IPv4。"
+        ;;
+      8)
             local new_ipv6
             [ -f "$client_dir" ] || {
                 red "\n错误: $client_dir 不存在\n"
@@ -12443,7 +12608,77 @@ warp_resolve_bootstrap_ip() {
 
 # 0=HTTP 200; 1=explicit rejection; 2=outcome unknown (retain recovery);
 # 4=confirmed pre-request network failure (clean local files and stop the action).
+run_warp_adapter() {
+    local adapter_pid='' cancelled=0 rc=0 saved_int saved_term saved_hup
+    saved_int=$(trap -p INT || true); saved_term=$(trap -p TERM || true); saved_hup=$(trap -p HUP || true)
+    trap 'cancelled=130; [ -z "$adapter_pid" ] || kill -TERM "$adapter_pid" 2>/dev/null || true' INT
+    trap 'cancelled=143; [ -z "$adapter_pid" ] || kill -TERM "$adapter_pid" 2>/dev/null || true' TERM HUP
+    "$@" &
+    adapter_pid=$!
+    [ "$cancelled" -eq 0 ] || kill -TERM "$adapter_pid" 2>/dev/null || true
+    while true; do
+        if wait "$adapter_pid"; then rc=0; else rc=$?; fi
+        [ "$cancelled" -ne 0 ] && kill -0 "$adapter_pid" 2>/dev/null || break
+    done
+    trap - INT TERM HUP
+    [ -z "$saved_int" ] || eval "$saved_int"
+    [ -z "$saved_term" ] || eval "$saved_term"
+    [ -z "$saved_hup" ] || eval "$saved_hup"
+    [ "$cancelled" -eq 0 ] || return "$cancelled"
+    return "$rc"
+}
+
 warp_registration_post() {
+    local request="$1" response="$2" adapter="${SB_WARP_ADAPTER:-/usr/local/lib/sing-box-pre/warp-registration-adapter}"
+    local metadata="${response}.meta" rc=0 http request_state retry_after retry_epoch now adapter_error
+    if [ -f "$adapter" ] && [ ! -L "$adapter" ] && [ -x "$adapter" ]; then
+        GOMAXPROCS=1 run_warp_adapter "$adapter" register --input "$request" --response "$response" --metadata "$metadata" || rc=$?
+        [ -f "$metadata" ] && jq -e 'type=="object"' "$metadata" >/dev/null 2>&1 || return 2
+        http=$(jq -r '.http_status // 0' "$metadata")
+        request_state=$(jq -r '.request_state // "unknown"' "$metadata")
+        adapter_error=$(jq -r '.error // ""' "$metadata")
+        if [ "$request_state" = not_sent ] && [[ "$adapter_error" == invalid_* ]]; then
+            red "WARP 注册适配器拒绝本地输入；请检查密钥/时间格式或适配器版本，未发送注册请求。" >&2
+            return 5
+        fi
+        if [ "$rc" -eq 0 ] && [ "$http" = 200 ] && [ "$request_state" = response_received ]; then return 0; fi
+        if [ "$request_state" != response_received ]; then
+            [ "$request_state" != not_sent ] || { [ -s "$response" ] || return 4; }
+            return 2
+        fi
+        if [ "$http" = 429 ] && ! jq -e 'has("id") or has("token")' "$response" >/dev/null 2>&1; then
+            retry_after=$(jq -r '.retry_after // ""' "$metadata")
+            WARP_REGISTRATION_RETRY_AFTER=300
+            if [[ "$retry_after" =~ ^[0-9]{1,6}$ ]]; then
+                WARP_REGISTRATION_RETRY_AFTER=$((10#$retry_after))
+            elif [ -n "$retry_after" ]; then
+                now=$(date +%s); retry_epoch=$(date -d "$retry_after" +%s 2>/dev/null || true)
+                if ! [[ "$retry_epoch" =~ ^[0-9]+$ ]]; then
+                    red "无法解析注册服务的 Retry-After，暂停自动重试以遵守冷却要求。" >&2; return 5
+                fi
+                if [ "$retry_epoch" -gt "$now" ]; then WARP_REGISTRATION_RETRY_AFTER=$((retry_epoch-now)); fi
+            fi
+            [ "$WARP_REGISTRATION_RETRY_AFTER" -ge 60 ] || WARP_REGISTRATION_RETRY_AFTER=60
+            return 7
+        fi
+        if [[ "$http" =~ ^(400|401|403|404|405|422)$ ]] &&
+           ! jq -e 'has("id") or has("token")' "$response" >/dev/null 2>&1; then
+            red "WARP 注册接口明确拒绝（HTTP $http）；停止重试，保留当前身份。" >&2
+            return 5
+        fi
+        [ "$request_state" != not_sent ] || { [ -s "$response" ] || return 4; }
+        return 2
+    fi
+    if [ "${SB_WARP_LEGACY_CURL:-0}" = 1 ]; then
+        warp_registration_post_legacy "$request" "$response"
+        return $?
+    fi
+    red "缺少 WARP TLS 注册适配器，未发送注册请求。" >&2
+    red "小内存 VPS 请使用配套的架构匹配、校验通过的成品，勿现场编译；也可用 SB_WARP_ADAPTER 指向已验证程序。已有身份可继续使用。" >&2
+    return 8
+}
+
+warp_registration_post_legacy() {
     local request="$1" response="$2" attempt ip meta rc http sent uploaded extra
     for attempt in 1 2; do
         ip=$(warp_resolve_bootstrap_ip api.cloudflareclient.com "$([ "$attempt" -eq 2 ] && echo true || echo false)") || return 4
@@ -12453,15 +12688,34 @@ warp_registration_post() {
         rc=0
         meta=$(curl -q --noproxy '*' --proto '=https' --retry 0 -sS \
             --connect-timeout 10 --max-time 45 --resolve "api.cloudflareclient.com:443:$ip" \
-            -o "$response" -w $'%{http_code}\t%{size_request}\t%{size_upload}' \
+            -D "${response}.headers" -o "$response" -w $'%{http_code}\t%{size_request}\t%{size_upload}' \
             --request POST 'https://api.cloudflareclient.com/v0a2158/reg' \
             --header 'User-Agent: okhttp/3.12.1' --header 'CF-Client-Version: a-6.10-2158' \
             --header 'Content-Type: application/json' --data-binary "@$request") || rc=$?
         IFS=$'\t' read -r http sent uploaded extra <<< "$meta"
         if [ "$rc" -eq 0 ] && [ "$http" = 200 ]; then return 0; fi
-        if [ "$rc" -eq 0 ] && [[ "$http" =~ ^(400|401|403|404|405|422|429)$ ]] && \
+        if [ "$rc" -eq 0 ] && [ "$http" = 429 ] &&
            ! jq -e 'has("id") or has("token")' "$response" >/dev/null 2>&1; then
-            return 1
+            local retry_after retry_epoch now
+            retry_after=$(awk 'tolower($1)=="retry-after:" {$1=""; sub(/^[ \t]+/, ""); sub(/\r$/, ""); value=$0} END {print value}' "${response}.headers" 2>/dev/null || true)
+            WARP_REGISTRATION_RETRY_AFTER=300
+            if [[ "$retry_after" =~ ^[0-9]{1,6}$ ]]; then
+                WARP_REGISTRATION_RETRY_AFTER=$((10#$retry_after))
+            elif [ -n "$retry_after" ]; then
+                now=$(date +%s)
+                retry_epoch=$(date -d "$retry_after" +%s 2>/dev/null || true)
+                if [[ "$retry_epoch" =~ ^[0-9]+$ ]] && [ "$retry_epoch" -gt "$now" ]; then
+                    WARP_REGISTRATION_RETRY_AFTER=$((retry_epoch-now))
+                fi
+            fi
+            [ "$WARP_REGISTRATION_RETRY_AFTER" -ge 60 ] || WARP_REGISTRATION_RETRY_AFTER=60
+            printf 'WARP 注册限流，至少等待 %s 秒后再试。\n' "$WARP_REGISTRATION_RETRY_AFTER" >&2
+            return 7
+        fi
+        if [ "$rc" -eq 0 ] && [[ "$http" =~ ^(400|401|403|404|405|422)$ ]] && \
+           ! jq -e 'has("id") or has("token")' "$response" >/dev/null 2>&1; then
+            printf 'Cloudflare WARP 注册返回 HTTP %s；拒绝、限流或接口兼容性问题，停止自动重试。\n' "$http" >&2
+            return 5
         fi
         # No redirects, proxy, curlrc or automatic retries can hide an earlier POST.
         if [[ "$rc" =~ ^(6|7)$ ]] && [ "$http" = 000 ] && [ "$sent" = 0 ] && \
@@ -12476,13 +12730,38 @@ warp_registration_post() {
     return 4
 }
 
+generate_warp_keypair() {
+    local stage="$1" adapter="${SB_WARP_ADAPTER:-/usr/local/lib/sing-box-pre/warp-registration-adapter}"
+    local rc=0
+    if [ "${SB_WARP_LEGACY_CURL:-0}" = 1 ]; then
+        # Explicit legacy transport remains opt-in and retains its old keygen.
+        require_warp_candidate_memory || return $?
+        "$singbox_bin" generate wg-keypair
+        return $?
+    fi
+    ensure_warp_adapter || return 8
+    [ -f "$adapter" ] && [ ! -L "$adapter" ] && [ -x "$adapter" ] || return 8
+    printf '{}\n' > "$stage/key-input.json" || return 5
+    chmod 600 "$stage/key-input.json" || return 5
+    GOMAXPROCS=1 run_warp_adapter "$adapter" keypair --input "$stage/key-input.json" \
+      --response "$stage/key-response.json" --metadata "$stage/key-meta.json" || rc=$?
+    [ "$rc" = 0 ] && jq -e '.request_state=="not_sent" and .http_status==0 and .error==""' "$stage/key-meta.json" >/dev/null 2>&1 && \
+      jq -e '(.private_key|type)=="string" and (.public_key|type)=="string" and
+             (.private_key|test("^[A-Za-z0-9+/]{43}=$")) and (.public_key|test("^[A-Za-z0-9+/]{43}=$"))' "$stage/key-response.json" >/dev/null 2>&1 || {
+        red "适配器本地密钥生成失败或版本不支持 keypair；未发送注册请求。" >&2
+        case "$rc" in 130|143) return "$rc" ;; *) return 5 ;; esac
+    }
+    jq -r '"PrivateKey: " + .private_key, "PublicKey: " + .public_key' "$stage/key-response.json"
+}
+
 generate_unique_warp_identity() {
     local state_dir="${1:-${conf_dir}/warp}"
     local register_dir response_file request_file endpoint_file account_file
     local singbox_bin keypair private_key public_key random_hex install_id fcm_token tos
     local request_rc client_id reserved_bytes r1 r2 r3 extra
-    local v4 v6 peer_key failure_rc commit_rc
+    local v4 v6 peer_key failure_rc commit_rc peer_strategy
 
+    require_warp_candidate_memory registration || return $?
     command_exists curl || { red "生成独立 WARP 身份需要 curl。"; return 1; }
     command_exists jq || { red "生成独立 WARP 身份需要 jq。"; return 1; }
     command_exists base64 || { red "生成独立 WARP 身份需要 base64。"; return 1; }
@@ -12492,7 +12771,9 @@ generate_unique_warp_identity() {
     if [ ! -x "$singbox_bin" ]; then
         singbox_bin=$(command -v sing-box 2>/dev/null || true)
     fi
-    [ -x "$singbox_bin" ] || { red "找不到 sing-box，无法生成 WARP 密钥。"; return 1; }
+    if [ "${SB_WARP_LEGACY_CURL:-0}" = 1 ]; then
+        [ -x "$singbox_bin" ] || { red "找不到 sing-box，无法使用显式旧版密钥生成。"; return 1; }
+    fi
 
     mkdir -p "$state_dir" || return 1
     chmod 700 "$state_dir" 2>/dev/null || true
@@ -12502,16 +12783,24 @@ generate_unique_warp_identity() {
     endpoint_file="${register_dir}/endpoint.json"
     account_file="${register_dir}/account.json"
 
-    keypair=$("$singbox_bin" generate wg-keypair 2>/dev/null) || {
+    keypair=$(generate_warp_keypair "$register_dir") || {
+        request_rc=$?
         rm -rf -- "$register_dir"
-        red "生成 WARP WireGuard 密钥失败。"
-        return 1
+        return "$request_rc"
     }
     private_key=$(awk -F': ' '/PrivateKey/{print $2; exit}' <<< "$keypair")
     public_key=$(awk -F': ' '/PublicKey/{print $2; exit}' <<< "$keypair")
     if [ -z "$private_key" ] || [ -z "$public_key" ]; then
         rm -rf -- "$register_dir"
         red "无法解析 WARP WireGuard 密钥。"
+        return 1
+    fi
+
+    # Preserve the only copy of the private key BEFORE POST. If the request
+    # outcome is ambiguous, raw response recovery alone cannot recreate it.
+    if ! printf '%s\n' "$private_key" > "$register_dir/private.key" ||
+       ! chmod 600 "$register_dir/private.key"; then
+        rm -rf -- "$register_dir"
         return 1
     fi
 
@@ -12549,18 +12838,32 @@ generate_unique_warp_identity() {
         red "WARP 注册前的 DNS/连接不可用，本轮已停止；未发送的请求不会被误记为未知注册。"
         return 4
     fi
+    if [ "$request_rc" -eq 8 ]; then
+        rm -rf -- "$register_dir" || return 2
+        return 8
+    fi
+    if [ "$request_rc" -eq 7 ]; then
+        rm -rf -- "$register_dir" || return 2
+        return 7
+    fi
+    if [ "$request_rc" -eq 5 ]; then
+        rm -rf -- "$register_dir" || return 2
+        red "WARP 注册被明确拒绝或限流；已保留现有身份，不再连续注册。"
+        yellow "请先保留当前可用配置。稍后重试或核对 WARP 注册兼容性；修改 API 版本号不能解决 TLS 指纹限制。"
+        return 5
+    fi
     if [ "$request_rc" -ne 0 ]; then
         rm -rf -- "$register_dir" || return 2
         red "Cloudflare WARP 注册失败，现有配置未修改。"
         return 1
     fi
     if jq -e '
-      .id and .token and .config.client_id and
+      (.id | type=="string" and length>0) and (.token | type=="string" and length>0) and .config.client_id and
       .config.interface.addresses.v4 and .config.interface.addresses.v6 and
       .config.peers[0].public_key
     ' "$response_file" >/dev/null 2>&1; then
         :
-    elif jq -e '.id and .token' "$response_file" >/dev/null 2>&1; then
+    elif jq -e '(.id | type=="string" and length>0) and (.token | type=="string" and length>0)' "$response_file" >/dev/null 2>&1; then
         if fail_warp_generation_after_registration "$response_file" "$register_dir"; then
             failure_rc=0
         else
@@ -12584,12 +12887,14 @@ generate_unique_warp_identity() {
     v4=$(jq -r '.config.interface.addresses.v4' "$response_file")
     v6=$(jq -r '.config.interface.addresses.v6' "$response_file")
     peer_key=$(jq -r '.config.peers[0].public_key' "$response_file")
+    peer_strategy="ipv$(warp_underlay_family)_only"
 
     jq -n \
       --arg private "$private_key" \
       --arg v4 "$v4" \
       --arg v6 "$v6" \
       --arg peer "$peer_key" \
+      --arg peer_strategy "$peer_strategy" \
       --argjson reserved "$reserved_bytes" '
       {
         type:"wireguard", tag:"wireguard-out", mtu:1280,
@@ -12598,7 +12903,7 @@ generate_unique_warp_identity() {
           (if ($v6 | contains("/")) then $v6 else ($v6 + "/128") end)
         ],
         private_key:$private,
-        domain_resolver:{server:"local",strategy:"prefer_ipv4"},
+        domain_resolver:{server:"local",strategy:$peer_strategy},
         peers:[{
           address:"engage.cloudflareclient.com", port:2408,
           public_key:$peer, allowed_ips:["0.0.0.0/0","::/0"],
@@ -12643,10 +12948,23 @@ generate_unique_warp_identity() {
 
 delete_warp_registration() {
     local account_file="$1" device_id device_token ip http
-    [ -s "$account_file" ] || return 0
-    device_id=$(jq -r '.id // empty' "$account_file" 2>/dev/null)
-    device_token=$(jq -r '.token // empty' "$account_file" 2>/dev/null)
-    [ -n "$device_id" ] && [ -n "$device_token" ] || return 0
+    [ -e "$account_file" ] || [ -L "$account_file" ] || return 0
+    [ -f "$account_file" ] && [ ! -L "$account_file" ] && [ -s "$account_file" ] || return 1
+    device_id=$(jq -er '.id | select(type=="string" and length>0)' "$account_file" 2>/dev/null) || return 1
+    device_token=$(jq -er '.token | select(type=="string" and length>0)' "$account_file" 2>/dev/null) || return 1
+    local adapter="${SB_WARP_ADAPTER:-/usr/local/lib/sing-box-pre/warp-registration-adapter}" stage rc=0
+    if [ -f "$adapter" ] && [ ! -L "$adapter" ] && [ -x "$adapter" ]; then
+        stage=$(mktemp -d) || return 1
+        chmod 700 "$stage" || { rm -rf -- "$stage"; return 1; }
+        jq -n --arg id "$device_id" --arg token "$device_token" '{device_id:$id,token:$token}' > "$stage/input.json" || { rm -rf -- "$stage"; return 1; }
+        chmod 600 "$stage/input.json" || { rm -rf -- "$stage"; return 1; }
+        GOMAXPROCS=1 run_warp_adapter "$adapter" delete --input "$stage/input.json" --response "$stage/response.json" --metadata "$stage/meta.json" || rc=$?
+        http=$(jq -r '.http_status // 0' "$stage/meta.json" 2>/dev/null || true)
+        rm -rf -- "$stage"
+        [ "$rc" -eq 0 ] && { [ "$http" = 200 ] || [ "$http" = 204 ]; }
+        return $?
+    fi
+    [ "${SB_WARP_LEGACY_CURL:-0}" = 1 ] || { red "缺少 WARP 注册适配器，保留待清理账户凭据。" >&2; return 1; }
     ip=$(warp_resolve_bootstrap_ip api.cloudflareclient.com) || return 1
     [[ "$ip" != *:* ]] || ip="[$ip]"
     http=$(curl -q --noproxy '*' --proto '=https' --retry 0 -fsS --connect-timeout 5 --max-time 15 \
@@ -12663,7 +12981,11 @@ WARP_PROBE_PROXY=''
 WARP_PROBE_PORT=''
 
 stop_warp_candidate_proxy() {
-    local safe_dir=false attempt
+    local safe_dir=false attempt cleanup_rc=0 cleanup_cancelled=0 saved_int saved_term saved_hup
+    local WARP_STOP_CLEANUP_ACTIVE=1
+    saved_int=$(trap -p INT || true); saved_term=$(trap -p TERM || true); saved_hup=$(trap -p HUP || true)
+    trap 'cleanup_cancelled=130' INT
+    trap 'cleanup_cancelled=143' TERM HUP
     case "${WARP_PROBE_DIR:-}" in
       "${conf_dir}/warp/.probe."*) safe_dir=true ;;
     esac
@@ -12681,6 +13003,16 @@ stop_warp_candidate_proxy() {
     fi
     [ "$safe_dir" = true ] && rm -rf -- "$WARP_PROBE_DIR"
     unset WARP_PROBE_PID WARP_PROBE_DIR WARP_PROBE_PROXY WARP_PROBE_PORT WARP_PROBE_FAMILY WARP_PROBE_BINARY WARP_PROBE_MODE WARP_PROBE_CURL_ARGS
+    end_warp_serial_probe || cleanup_rc=$?
+    trap - INT TERM HUP
+    [ -z "$saved_int" ] || eval "$saved_int"
+    [ -z "$saved_term" ] || eval "$saved_term"
+    [ -z "$saved_hup" ] || eval "$saved_hup"
+    if [ "$cleanup_cancelled" != 0 ] && [ "${WARP_OPERATION_EXIT_CLEANUP:-0}" != 1 ] && [ "$cleanup_rc" != 2 ]; then
+        if [ "$cleanup_cancelled" = 130 ]; then kill -INT "$BASHPID"; else kill -TERM "$BASHPID"; fi
+        return "$cleanup_cancelled"
+    fi
+    return "$cleanup_rc"
 }
 
 render_warp_probe_config() {
@@ -12703,6 +13035,167 @@ render_warp_probe_config() {
 }
 
 # Switch DNS only inside our temporary proxy, keeping the same identity and port.
+# Effective RAM headroom, including tighter ancestor cgroup limits. Swap is not
+# counted: this guard should not rely on thrashing a small NAT VPS into recovery.
+warp_available_memory_kb() {
+    local proc_root="${1:-/proc}" metric="${2:-available}" available root mount fs member path limit used remaining found=0
+    case "$metric" in
+      available) available=$(awk '$1=="MemAvailable:" {print $2; exit}' "$proc_root/meminfo" 2>/dev/null) ;;
+      capacity) available=$(awk '$1=="MemTotal:" {print $2; exit}' "$proc_root/meminfo" 2>/dev/null) ;;
+      *) return 1 ;;
+    esac
+    [[ "$available" =~ ^[0-9]{1,12}$ ]] || return 1
+    [ -r "$proc_root/self/cgroup" ] && [ -r "$proc_root/self/mountinfo" ] || return 1
+    while read -r root mount fs; do
+        case "$root$mount" in *\\*) return 1 ;; esac
+        if [ "$fs" = cgroup2 ]; then
+            member=$(awk -F: '$1=="0" {print $3; exit}' "$proc_root/self/cgroup")
+        else
+            member=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3; exit}' "$proc_root/self/cgroup")
+            [ -n "$member" ] || continue
+            [ -e "$mount/memory.limit_in_bytes" ] || continue
+        fi
+        [ -n "$member" ] || continue
+        found=1
+        case "$member" in *'/../'*|*/..) return 1 ;; esac
+        if [ "$root" = / ]; then path="${mount}${member}";
+        elif [ "$member" = "$root" ]; then path="$mount";
+        elif [[ "$member" == "$root/"* ]]; then path="$mount${member#"$root"}";
+        elif [ "$member" = / ]; then path="$mount";
+        else return 1; fi
+        path=${path%/}
+        while true; do
+            if [ "$fs" = cgroup2 ]; then
+                limit=$(cat "$path/memory.max" 2>/dev/null || true)
+                used=$(cat "$path/memory.current" 2>/dev/null || true)
+            else
+                limit=$(cat "$path/memory.limit_in_bytes" 2>/dev/null || true)
+                used=$(cat "$path/memory.usage_in_bytes" 2>/dev/null || true)
+            fi
+            if [[ "$limit" =~ ^[0-9]{1,18}$ ]]; then
+                [[ "$used" =~ ^[0-9]{1,18}$ ]] || return 1
+                if [ "$metric" = capacity ]; then remaining=$((limit/1024)); else remaining=$(((limit-used)/1024)); fi
+                [ "$remaining" -ge 0 ] || remaining=0
+                [ "$remaining" -ge "$available" ] || available=$remaining
+            elif [ -z "$limit" ]; then
+                return 1
+            elif [ "$limit" != max ]; then
+                # Kernel v1 unlimited sentinel exceeds the signed safe range.
+                [[ "$limit" =~ ^[0-9]{19,}$ ]] || return 1
+            fi
+            [ "$path" != "$mount" ] || break
+            path=${path%/*}
+            [[ "$path" == "$mount" || "$path" == "$mount/"* ]] || return 1
+        done
+    done < <(awk '{for(i=7;i<=NF;i++) if($i=="-") {if($(i+1)=="cgroup2" || $(i+1)=="cgroup") print $4,$5,$(i+1); break}}' "$proc_root/self/mountinfo")
+    if [ "$found" = 0 ] && grep -Eq '^0::|^[^:]+:([^:]*,)?memory(,|:)' "$proc_root/self/cgroup"; then return 1; fi
+    printf '%s\n' "$available"
+}
+
+warp_use_serial_probe() {
+    local capacity
+    case "${SB_WARP_PROBE_MODE:-auto}" in
+      serial) return 0 ;;
+      parallel) return 1 ;;
+      auto) ;;
+      *) red "SB_WARP_PROBE_MODE 只能为 auto、serial 或 parallel。" >&2; return 2 ;;
+    esac
+    # Unknown capacity uses the conservative serial path; actual headroom is
+    # still required after stopping the old core, before launching the candidate.
+    capacity=$(warp_available_memory_kb /proc capacity) || return 0
+    [ "$capacity" -le 262144 ]
+}
+
+require_warp_candidate_memory() {
+    local stage="${1:-candidate}" available minimum=65536
+    WARP_CANDIDATE_MEMORY_BLOCKED=0
+    # The one-shot TLS adapter measured about 12 MiB; leave extra headroom.
+    [ "$stage" != registration ] || minimum=24576
+    [ "${WARP_SERIAL_NEEDS_RESTORE:-0}" != 1 ] || minimum=49152
+    available=$(warp_available_memory_kb) || {
+        WARP_CANDIDATE_MEMORY_BLOCKED=1
+        red "无法可靠读取内存余量，暂停 WARP 候选更换；可使用当前身份切换 IPv4。" >&2
+        return 10
+    }
+    if [ "$available" -lt "$minimum" ]; then
+        WARP_CANDIDATE_MEMORY_BLOCKED=1
+        red "当前阶段需要至少 $((minimum/1024)) MiB 可用余量，当前约 $((available/1024)) MiB；已暂停并保留原身份。" >&2
+        return 10
+    fi
+}
+
+begin_warp_serial_probe() {
+    local mode_rc=0
+    if warp_use_serial_probe; then :; else mode_rc=$?; [ "$mode_rc" = 1 ] && return 0; return "$mode_rc"; fi
+    acquire_proxy_transaction_lock_checked "$conf_dir" "小内存 WARP 串行检测" || return $?
+    WARP_SERIAL_LOCKED=1
+    if [ -n "${baseline_generation:-}" ] && [ "$(warp_activation_generation)" != "$baseline_generation" ]; then
+        release_proxy_transaction_lock; WARP_SERIAL_LOCKED=0
+        red "WARP 配置已经变化，未停止当前核心。" >&2; return 9
+    fi
+    if ! singbox_service_is_active; then
+        release_proxy_transaction_lock; WARP_SERIAL_LOCKED=0
+        red "核心已停止，未启动串行候选。" >&2; return 1
+    fi
+    yellow "小内存串行检测：每个候选会暂停代理至检测结束或取消，可能持续数十秒或更久；等待重试期间恢复原服务。" >&2
+    WARP_SERIAL_NEEDS_RESTORE=1
+    if ! stop_singbox_checked || singbox_service_is_active; then
+        end_warp_serial_probe || return 2
+        return 1
+    fi
+}
+
+end_warp_serial_probe() {
+    local rc=0 cancelled=0 saved_int saved_term saved_hup
+    if [ "${WARP_STOP_CLEANUP_ACTIVE:-0}" != 1 ]; then
+        saved_int=$(trap -p INT || true); saved_term=$(trap -p TERM || true); saved_hup=$(trap -p HUP || true)
+        trap 'cancelled=130' INT
+        trap 'cancelled=143' TERM HUP
+    fi
+    if [ "${WARP_SERIAL_NEEDS_RESTORE:-0}" = 1 ]; then
+        if restart_singbox_checked && singbox_service_is_stably_active; then
+            WARP_SERIAL_NEEDS_RESTORE=0
+        else
+            WARP_SERIAL_RESTORE_FAILED=1; rc=2
+            red "原配置仍保留，但原服务恢复失败；停止轮换，请检查 sing-box 服务。" >&2
+        fi
+    fi
+    if [ "${WARP_SERIAL_LOCKED:-0}" = 1 ]; then
+        release_proxy_transaction_lock || rc=2
+        WARP_SERIAL_LOCKED=0
+    fi
+    if [ "${WARP_STOP_CLEANUP_ACTIVE:-0}" != 1 ]; then
+        trap - INT TERM HUP
+        [ -z "$saved_int" ] || eval "$saved_int"
+        [ -z "$saved_term" ] || eval "$saved_term"
+        [ -z "$saved_hup" ] || eval "$saved_hup"
+        if [ "$cancelled" != 0 ] && [ "${WARP_OPERATION_EXIT_CLEANUP:-0}" != 1 ] && [ "$rc" != 2 ]; then
+            if [ "$cancelled" = 130 ]; then kill -INT "$BASHPID"; else kill -TERM "$BASHPID"; fi
+            return "$cancelled"
+        fi
+    fi
+    return "$rc"
+}
+
+launch_warp_candidate_core() {
+    local binary="$1" config="$2" log="$3" cancelled=0 saved_int saved_term saved_hup
+    saved_int=$(trap -p INT || true); saved_term=$(trap -p TERM || true); saved_hup=$(trap -p HUP || true)
+    # Defer signals across fork/PID assignment; cleanup must know the owned PID.
+    trap 'cancelled=130' INT
+    trap 'cancelled=143' TERM HUP
+    "$binary" run -c "$config" >> "$log" 2>&1 &
+    WARP_PROBE_PID=$!
+    trap - INT TERM HUP
+    [ -z "$saved_int" ] || eval "$saved_int"
+    [ -z "$saved_term" ] || eval "$saved_term"
+    [ -z "$saved_hup" ] || eval "$saved_hup"
+    if [ "$cancelled" -ne 0 ]; then
+        stop_warp_candidate_proxy
+        if [ "$cancelled" = 130 ]; then kill -INT "$BASHPID"; else kill -TERM "$BASHPID"; fi
+        return "$cancelled"
+    fi
+}
+
 warp_probe_dns_fallback() {
     local mode binary="${WARP_PROBE_BINARY:-${work_dir}/${server_name}}" tmp
     case "${WARP_PROBE_DIR:-}" in "${conf_dir}/warp/.probe."*) ;; *) return 1 ;; esac
@@ -12711,8 +13204,7 @@ warp_probe_dns_fallback() {
     mode=$(jq -r '.dns.final // "local"' "$WARP_PROBE_DIR/config.json") || return 1
     case "$mode" in local) mode=cloudflare ;; cloudflare) mode=google ;; *) return 1 ;; esac
     tmp=$(mktemp "$WARP_PROBE_DIR/.dns.XXXXXX") || return 1
-    jq --arg mode "$mode" '.dns.final=$mode' "$WARP_PROBE_DIR/config.json" > "$tmp" && \
-        "$binary" check -c "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; return 1; }
+    jq --arg mode "$mode" '.dns.final=$mode' "$WARP_PROBE_DIR/config.json" > "$tmp" || { rm -f -- "$tmp"; return 1; }
     kill "$WARP_PROBE_PID" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
     local stop_attempt
     for stop_attempt in {1..10}; do
@@ -12721,9 +13213,10 @@ warp_probe_dns_fallback() {
     done
     kill -0 "$WARP_PROBE_PID" 2>/dev/null && kill -9 "$WARP_PROBE_PID" 2>/dev/null || true
     wait "$WARP_PROBE_PID" 2>/dev/null || true
+    require_warp_candidate_memory || { rm -f -- "$tmp"; return 10; }
+    "$binary" check -c "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; return 1; }
     mv -f -- "$tmp" "$WARP_PROBE_DIR/config.json" || return 1
-    "$binary" run -c "$WARP_PROBE_DIR/config.json" >> "$WARP_PROBE_DIR/sing-box.log" 2>&1 &
-    WARP_PROBE_PID=$!
+    launch_warp_candidate_core "$binary" "$WARP_PROBE_DIR/config.json" "$WARP_PROBE_DIR/sing-box.log" || return $?
     sleep 1
     kill -0 "$WARP_PROBE_PID" 2>/dev/null
 }
@@ -12735,8 +13228,8 @@ start_warp_candidate_proxy() {
       *) return 1 ;;
     esac
     warp_endpoint_is_valid "$endpoint_json" || return 1
-    endpoint_json=$(jq -c '
-      .domain_resolver = {server:"local",strategy:"prefer_ipv4"}
+    endpoint_json=$(jq -c --arg strategy "ipv$(warp_underlay_family)_only" '
+      .domain_resolver = {server:"local",strategy:$strategy}
     ' <<< "$endpoint_json") || return 1
     # Bootstrap the WireGuard peer before starting it. The cached address is only
     # installed in this short-lived config, never pinned into the saved identity.
@@ -12745,9 +13238,12 @@ start_warp_candidate_proxy() {
         peer_ip=$(warp_resolve_bootstrap_ip "$peer_host") || return 1
         endpoint_json=$(jq -c --arg ip "$peer_ip" '.peers[0].address=$ip' <<< "$endpoint_json") || return 1
     fi
-    stop_warp_candidate_proxy
-    mkdir -p "${conf_dir}/warp" && chmod 700 "${conf_dir}/warp"
-    WARP_PROBE_DIR=$(mktemp -d "${conf_dir}/warp/.probe.XXXXXX") || return 1
+    stop_warp_candidate_proxy || return 2
+    WARP_CANDIDATE_START_RC=0
+    begin_warp_serial_probe || { WARP_CANDIDATE_START_RC=$?; return "$WARP_CANDIDATE_START_RC"; }
+    require_warp_candidate_memory || { stop_warp_candidate_proxy || return 2; return 10; }
+    mkdir -p "${conf_dir}/warp" && chmod 700 "${conf_dir}/warp" || { stop_warp_candidate_proxy || return 2; return 1; }
+    WARP_PROBE_DIR=$(mktemp -d "${conf_dir}/warp/.probe.XXXXXX") || { stop_warp_candidate_proxy || return 2; return 1; }
     chmod 700 "$WARP_PROBE_DIR"
     for attempt in 1 2 3 4 5 6 7 8 9 10; do
         port=$((20000 + RANDOM % 30000))
@@ -12767,9 +13263,7 @@ start_warp_candidate_proxy() {
     "$singbox_bin" check -c "${WARP_PROBE_DIR}/config.json" >/dev/null 2>&1 || {
         stop_warp_candidate_proxy; return 1
     }
-    "$singbox_bin" run -c "${WARP_PROBE_DIR}/config.json" \
-      >"${WARP_PROBE_DIR}/sing-box.log" 2>&1 &
-    WARP_PROBE_PID=$!
+    launch_warp_candidate_core "$singbox_bin" "$WARP_PROBE_DIR/config.json" "$WARP_PROBE_DIR/sing-box.log" || return $?
     local ready=false probe_proxy="socks5h://127.0.0.1:${WARP_PROBE_PORT}"
     for attempt in 1 2 3 4 5; do
         kill -0 "$WARP_PROBE_PID" 2>/dev/null || { stop_warp_candidate_proxy; return 1; }
@@ -12809,6 +13303,7 @@ probe_warp_trace() {
         if [ -n "${WARP_PROBE_DIR:-}" ] && [ "$attempt" -le 2 ] && \
            [ "$((deadline-$(date +%s)))" -gt 3 ]; then
             warp_probe_dns_fallback || true
+            [ "${WARP_CANDIDATE_MEMORY_BLOCKED:-0}" != 1 ] || return 10
         fi
         [ "$attempt" -lt 16 ] || return 1
         remaining=$(( deadline - $(date +%s) ))
@@ -12854,40 +13349,38 @@ write_warp_preferred_family() {
 }
 
 # 为 WARP 分流规则生成一个可重复渲染的 DNS 地址族偏好。
-# IPv6 模式只影响明确指向 wireguard-out 的规则集；IPv4 模式移除该托管规则。
+# 只影响明确指向 wireguard-out 的域名流量；IPv4 使用 ipv4_only，外层 peer 地址族独立。
 render_warp_route_family() {
     local source_file="${1:-}" output_file="${2:-}" family="${3:-}"
-
     [ -s "$source_file" ] && [ -n "$output_file" ] || return 1
     case "$family" in 4|6) ;; *) return 1 ;; esac
     jq --argjson family "$family" '
-      def managed_warp_resolve:
+      def managed_warp_resolve($tags; $global):
         (.action? == "resolve") and
-        (.strategy? == "prefer_ipv6") and
+        (.strategy? == "prefer_ipv6" or .strategy? == "ipv4_only") and
         (.network? == ["tcp", "udp"]) and
         (((keys | sort) == ["action", "network", "rule_set", "strategy"]) or
-         ((keys | sort) == ["action", "network", "strategy"]));
-      def warp_route:
-        (.action? == "route") and (.outbound? == "wireguard-out");
+         ((keys | sort) == ["action", "network", "strategy"])) and
+        (if has("rule_set") then
+           (.rule_set | type)=="array" and (.rule_set | length)>0 and
+           all(.rule_set[]; . as $tag | ($tags | index($tag)) != null)
+         else $global end);
+      def simple_warp_route:
+        .action? == "route" and .outbound? == "wireguard-out" and
+        ((.rule_set? | type) == "array") and
+        ((keys | sort) == ["action", "outbound", "rule_set"]);
+      (if $family == 4 then "ipv4_only" else "prefer_ipv6" end) as $strategy |
       .route = (if (.route | type) == "object" then .route else {} end) |
-      (.route.rules | if type == "array" then . else [] end) as $rules |
-      ([$rules[] | select(managed_warp_resolve | not)]) as $clean |
-      ([$clean[] | select(.action? == "sniff")]) as $sniff |
-      ([$clean[] | select(.action? != "sniff")]) as $rest |
-      (reduce ($rest[] | select(warp_route and ((.rule_set? | type) == "array")) | .rule_set[]) as $tag
-        ([]; if index($tag) then . else . + [$tag] end)) as $warp_tags |
-      ($rest | map(warp_route) | index(true)) as $first_warp |
-      if $family == 6 and ($warp_tags | length) > 0 and $first_warp != null then
-        .route.rules =
-          ($sniff + $rest[0:$first_warp] +
-           [{rule_set:$warp_tags,network:["tcp","udp"],action:"resolve",strategy:"prefer_ipv6"}] +
-           $rest[$first_warp:])
-      elif $family == 6 and (.route.final? == "wireguard-out") then
-        .route.rules =
-          ($sniff + [{network:["tcp","udp"],action:"resolve",strategy:"prefer_ipv6"}] + $rest)
-      else
-        .route.rules = ($sniff + $rest)
-      end
+      ([.route.rules[]? | select(simple_warp_route) | .rule_set[]] | unique) as $tags |
+      (.route.final? == "wireguard-out") as $global |
+      (.route.rules // [] | map(select(managed_warp_resolve($tags; $global) | not))) as $clean |
+      .route.rules = (reduce $clean[] as $rule ([];
+        if ($rule | simple_warp_route) then
+          . + [{rule_set:$rule.rule_set,network:["tcp","udp"],action:"resolve",strategy:$strategy}, $rule]
+        else . + [$rule] end)) |
+      if .route.final? == "wireguard-out" then
+        .route.rules += [{network:["tcp","udp"],action:"resolve",strategy:$strategy}]
+      else . end
     ' "$source_file" > "$output_file"
 }
 
@@ -13418,6 +13911,9 @@ migrate_retired_warp_routes() {
         singbox_service_is_active && was_active=true
         chmod 600 "$stage/route.json" || exit 1
         changed=true
+        if [ "$was_active" = true ] && warp_use_serial_probe; then
+            stop_singbox_checked && ! singbox_service_is_active || exit 1
+        fi
         mv -f -- "$stage/route.json" "$file" || exit 1
         validate_singbox_config || exit 1
         if [ "$was_active" = true ]; then
@@ -13511,7 +14007,7 @@ ensure_warp_health_inbounds() {
         local stage='' installed=false committed=false rc=0 port attempt
         local -a ports=()
         acquire_proxy_transaction_lock_checked "$conf_dir" "WARP 健康入口初始化" || exit $?
-        trap 'rc=$?; if [ "$installed" = true ] && [ "$committed" != true ]; then
+        trap 'rc=$?; trap "" INT TERM HUP; if [ "$installed" = true ] && [ "$committed" != true ]; then
             rm -f -- "$health_file" || rc=2
             restart_singbox_checked >/dev/null 2>&1 || rc=2
             singbox_service_is_stably_active || rc=2
@@ -13541,6 +14037,10 @@ ensure_warp_health_inbounds() {
         render_warp_health_config "${ports[0]}" "${ports[1]}" "${ports[2]}" "$stage/secret" > "$stage/health.json" || exit 1
         chmod 600 "$stage/health.json" || exit 1
         installed=true
+        if warp_use_serial_probe; then
+            yellow "小内存健康入口初始化：停止代理后校验，完成后恢复。" >&2
+            stop_singbox_checked && ! singbox_service_is_active || exit 1
+        fi
         mv "$stage/health.json" "$health_file" || exit 1
         if ! validate_singbox_config || ! restart_singbox_checked || ! singbox_service_is_stably_active; then
             red "健康入口初始化失败，正在撤回新增文件并恢复服务。" >&2
@@ -13598,9 +14098,80 @@ remove_warp_activation_backup() {
     rm -rf -- "$1"
 }
 
+warp_activation_generation() {
+    local name file digest material=''
+    for name in endpoints.json route.json warp/account.json warp/preferred-family; do
+        file="$conf_dir/$name"
+        if [ -f "$file" ] && [ ! -L "$file" ]; then
+            digest=$(sha256sum -- "$file") || return 1
+            material+="$name:${digest%% *}"$'\n'
+        elif [ ! -e "$file" ] && [ ! -L "$file" ]; then
+            material+="$name:absent"$'\n'
+        else return 1; fi
+    done
+    digest=$(printf '%s' "$material" | sha256sum) || return 1
+    printf '%s\n' "${digest%% *}"
+}
+
+rollback_warp_activation_files() {
+    local backup_dir="$1" state_dir="${conf_dir}/warp" failed=0 name
+    [ -d "$backup_dir" ] || return 1
+    install -m 600 "$backup_dir/endpoints.json" "$conf_dir/endpoints.json" || failed=1
+    install -m 600 "$backup_dir/route.json" "$conf_dir/route.json" || failed=1
+    for name in account endpoint; do
+        if [ -e "$backup_dir/had-$name" ]; then
+            install -m 600 "$backup_dir/$name.json" "$state_dir/$name.json" || failed=1
+        else
+            rm -f -- "$state_dir/$name.json" || failed=1
+        fi
+    done
+    if [ -e "$backup_dir/had-family" ]; then
+        install -m 600 "$backup_dir/preferred-family" "$state_dir/preferred-family" || failed=1
+    else
+        rm -f -- "$state_dir/preferred-family" || failed=1
+    fi
+    [ "$failed" = 0 ] || return 1
+    restart_singbox_checked >/dev/null 2>&1 && singbox_service_is_stably_active
+}
+
 activate_warp_candidate() {
+    (
+        local WARP_ACTIVATION_BACKUP='' WARP_ACTIVATION_ROLLBACK_NEEDED=false rc=0
+        local WARP_ACTIVATION_STOPPED=0
+        acquire_proxy_transaction_lock_checked "$conf_dir" "WARP 身份切换" || exit $?
+        trap 'rc=$?
+            trap "" INT TERM HUP
+            if [ "$WARP_ACTIVATION_ROLLBACK_NEEDED" = true ]; then
+                if rollback_warp_activation_files "$WARP_ACTIVATION_BACKUP"; then
+                    remove_warp_activation_backup "$WARP_ACTIVATION_BACKUP" || rc=2
+                else
+                    red "WARP 中断恢复不完整，保留备份: $WARP_ACTIVATION_BACKUP"; rc=2
+                fi
+            fi
+            if [ "$WARP_ACTIVATION_STOPPED" = 1 ] && [ "$rc" != 2 ] && ! singbox_service_is_active; then
+                restart_singbox_checked && singbox_service_is_stably_active || rc=2
+            fi
+            release_proxy_transaction_lock || rc=2
+            exit "$rc"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        # A stopped service must not be silently started by a delayed candidate.
+        singbox_service_is_active || { red "核心已停止，未激活候选身份。"; exit 1; }
+        if [ -n "${6:-}" ] && [ "$(warp_activation_generation)" != "$6" ]; then
+            red "WARP 配置已被其他操作修改，未覆盖较新的状态。"; exit 9
+        fi
+        if warp_use_serial_probe; then
+            yellow "小内存身份激活：短暂停止代理进行校验；失败将恢复原配置。" >&2
+            WARP_ACTIVATION_STOPPED=1
+            stop_singbox_checked && ! singbox_service_is_active || exit 1
+        fi
+        _activate_warp_candidate_locked "$@"
+    )
+}
+
+_activate_warp_candidate_locked() {
     local candidate_dir="$1" state_dir="${conf_dir}/warp" endpoint_file="${conf_dir}/endpoints.json"
-    local expected_ip="${2:-}" strict_selection="${3:-}" family="${4:-4}"
+    local expected_ip="${2:-}" strict_selection="${3:-}" family="${4:-4}" previous_ip="${5:-}"
     local route_file="${conf_dir}/route.json" family_file="${state_dir}/preferred-family"
     local endpoint_json backup_dir endpoint_tmp route_tmp family_tmp
     local cleanup_incomplete=false
@@ -13651,25 +14222,20 @@ activate_warp_candidate() {
         remove_warp_activation_backup "$backup_dir" || yellow "激活备份目录清理失败，已保留: ${backup_dir}"
         return 1
     }
+    WARP_ACTIVATION_BACKUP="$backup_dir"
+    WARP_ACTIVATION_ROLLBACK_NEEDED=true
     if ! jq --argjson endpoint "$endpoint_json" '.endpoints=([.endpoints[]?|select(.tag!="wireguard-out")]+[$endpoint])' \
       "$endpoint_file" > "$endpoint_tmp" || ! render_warp_route_family "$route_file" "$route_tmp" "$family" || \
       ! printf '%s\n' "$family" > "$family_tmp" || ! chmod 600 "$endpoint_tmp" "$family_tmp" || \
-      ! chmod 644 "$route_tmp" || ! install -m 600 "${candidate_dir}/account.json" "$state_dir/account.json" || \
+      ! chmod 600 "$route_tmp" || ! install -m 600 "${candidate_dir}/account.json" "$state_dir/account.json" || \
       ! install -m 600 "${candidate_dir}/endpoint.json" "$state_dir/endpoint.json" || ! chmod 600 "$endpoint_tmp" || \
       ! mv -f "$endpoint_tmp" "$endpoint_file" || ! mv -f "$route_tmp" "$route_file" || \
       ! mv -f "$family_tmp" "$family_file" || ! validate_singbox_config || ! restart_singbox_checked || \
       ! singbox_service_is_stably_active || \
-      ! verify_activated_warp "$expected_ip" "$strict_selection" "$family"; then
-        local rollback_ok=true
+      ! verify_activated_warp "$expected_ip" "$strict_selection" "$family" "$previous_ip"; then
         rm -f -- "$endpoint_tmp" "$route_tmp" "$family_tmp"
-        install -m 600 "$backup_dir/endpoints.json" "$endpoint_file" || rollback_ok=false
-        install -m 644 "$backup_dir/route.json" "$route_file" || rollback_ok=false
-        if [ -e "$backup_dir/had-account" ]; then install -m 600 "$backup_dir/account.json" "$state_dir/account.json" || rollback_ok=false; else rm -f -- "$state_dir/account.json" || rollback_ok=false; fi
-        if [ -e "$backup_dir/had-endpoint" ]; then install -m 600 "$backup_dir/endpoint.json" "$state_dir/endpoint.json" || rollback_ok=false; else rm -f -- "$state_dir/endpoint.json" || rollback_ok=false; fi
-        if [ -e "$backup_dir/had-family" ]; then install -m 600 "$backup_dir/preferred-family" "$family_file" || rollback_ok=false; else rm -f -- "$family_file" || rollback_ok=false; fi
-        restart_singbox_checked >/dev/null 2>&1 || rollback_ok=false
-        singbox_service_is_stably_active || rollback_ok=false
-        if [ "$rollback_ok" = true ]; then
+        if rollback_warp_activation_files "$backup_dir"; then
+            WARP_ACTIVATION_ROLLBACK_NEEDED=false
             remove_warp_activation_backup "$backup_dir" || yellow "回滚已完成，但激活备份目录清理失败，已保留: ${backup_dir}"
             return 1
         fi
@@ -13677,6 +14243,8 @@ activate_warp_candidate() {
         red "保留恢复目录: ${backup_dir}"
         return 2
     fi
+    # Once verified, never restore an identity whose cloud deletion may begin.
+    WARP_ACTIVATION_ROLLBACK_NEEDED=false
     write_warp_status_cache "$strict_selection" "${WARP_UNLOCK_SUMMARY:-}" "$family" || \
       yellow "WARP 状态缓存写入失败，不影响已提交的新身份。"
     if [ -e "$backup_dir/had-account" ]; then
@@ -13699,15 +14267,16 @@ activate_warp_candidate() {
 }
 
 verify_activated_warp() {
-    local expected_ip="${1:-}" selection="${2:-}" family="${3:-4}" endpoint rc=1
+    local expected_ip="${1:-}" selection="${2:-}" family="${3:-4}" previous_ip="${4:-}" endpoint rc=1
     case "$family" in 4|6) ;; *) return 1 ;; esac
     endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json")
     start_warp_active_proxy "$family" || return 1
     if probe_warp_trace "$WARP_PROBE_PROXY"; then
         if [ "$family" = 4 ]; then
-            if [[ "$WARP_PROBE_IP" != *:* ]] && \
-               { [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ]; }; then rc=0; fi
-        elif [[ "$WARP_PROBE_IP" == *:* ]]; then
+            if is_valid_ipv4_address "$WARP_PROBE_IP" && \
+               { [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ]; } &&
+               [ "$WARP_PROBE_IP" != "$previous_ip" ]; then rc=0; fi
+        elif is_valid_ipv6_address "$WARP_PROBE_IP" && [ "$WARP_PROBE_IP" != "$previous_ip" ]; then
             # Cloudflare public IPv6 can change between connections of one identity.
             rc=0
         fi
@@ -13716,10 +14285,11 @@ verify_activated_warp() {
             # A transport recovery may reconnect the probe and update its exit IP.
             if [ "$rc" -eq 0 ]; then
                 if [ "$family" = 4 ]; then
-                    [[ "$WARP_PROBE_IP" != *:* ]] && \
-                      { [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ]; } || rc=1
+                    is_valid_ipv4_address "$WARP_PROBE_IP" && \
+                      { [ -z "$expected_ip" ] || [ "$WARP_PROBE_IP" = "$expected_ip" ]; } &&
+                      [ "$WARP_PROBE_IP" != "$previous_ip" ] || rc=1
                 else
-                    [[ "$WARP_PROBE_IP" == *:* ]] || rc=1
+                    is_valid_ipv6_address "$WARP_PROBE_IP" && [ "$WARP_PROBE_IP" != "$previous_ip" ] || rc=1
                 fi
             fi
         fi
@@ -13776,11 +14346,96 @@ remove_warp_candidate_dir() {
     rm -rf -- "$1"
 }
 
+cancel_warp_pending_candidate() {
+    local candidate="${WARP_PENDING_CANDIDATE:-}" candidate_key active_key
+    stop_warp_candidate_proxy
+    [ -n "$candidate" ] && [ -d "$candidate" ] || return 0
+    case "$candidate" in "$conf_dir/warp/.candidate."*) ;; *) return 2 ;; esac
+    if [ "${WARP_PENDING_PHASE:-registering}" = registering ]; then
+        red "注册被中断，状态尚未确认；保留恢复材料: $candidate" >&2
+        return 2
+    fi
+    if [ "${WARP_PENDING_PHASE:-}" = activating ]; then
+        candidate_key=$(jq -er '.private_key' "$candidate/endpoint.json" 2>/dev/null) || return 2
+        active_key=$(extract_warp_endpoint "$conf_dir/endpoints.json" | jq -er '.private_key' 2>/dev/null) || return 2
+        if [ "$candidate_key" = "$active_key" ]; then
+            yellow "新身份已在核心中，取消不会删除正在使用的身份；保留材料: $candidate" >&2
+            return 0
+        fi
+    fi
+    if ! delete_warp_registration "$candidate/account.json" || ! remove_warp_candidate_dir "$candidate"; then
+        red "候选清理未完成，保留恢复材料: $candidate" >&2; return 2
+    fi
+}
+
+run_warp_candidate_operation() {
+    local callback="$1" state rc=0 retry_after operation_pid='' cancelled=0
+    local saved_int saved_term saved_hup
+    shift
+    mkdir -p "$conf_dir/warp" || return 1
+    state=$(mktemp -d "$conf_dir/warp/.operation.XXXXXX") || return 1
+    chmod 700 "$state" || { rm -rf -- "$state"; return 1; }
+    saved_int=$(trap -p INT || true); saved_term=$(trap -p TERM || true); saved_hup=$(trap -p HUP || true)
+    trap 'cancelled=130; [ -z "$operation_pid" ] || kill -TERM "$operation_pid" 2>/dev/null || true' INT
+    trap 'cancelled=143; [ -z "$operation_pid" ] || kill -TERM "$operation_pid" 2>/dev/null || true' TERM HUP
+    (
+        local WARP_PENDING_CANDIDATE='' WARP_PENDING_PHASE='' operation_rc=0
+        local WARP_SERIAL_NEEDS_RESTORE=0 WARP_SERIAL_LOCKED=0 WARP_SERIAL_RESTORE_FAILED=0
+        trap 'operation_rc=$?
+            WARP_OPERATION_EXIT_CLEANUP=1
+            if [ "$WARP_SERIAL_NEEDS_RESTORE" = 1 ] || [ "$WARP_SERIAL_LOCKED" = 1 ]; then
+                stop_warp_candidate_proxy || operation_rc=2
+            fi
+            if [ "$operation_rc" = 130 ] || [ "$operation_rc" = 143 ]; then
+                cancel_warp_pending_candidate || operation_rc=2
+            fi
+            printf "%s\n" "${WARP_REGISTRATION_RETRY_AFTER:-300}" > "$state/retry-after" || operation_rc=2
+            printf "%s\n" "${WARP_ROTATION_ORIGINAL_IP:-}" > "$state/original-ip" || operation_rc=2
+            printf "%s\n" "${WARP_ROTATION_ORIGINAL_GENERATION:-}" > "$state/original-generation" || operation_rc=2
+            exit "$operation_rc"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        "$callback" "$@"
+    ) &
+    operation_pid=$!
+    [ "$cancelled" -eq 0 ] || kill -TERM "$operation_pid" 2>/dev/null || true
+    while true; do
+        if wait "$operation_pid"; then rc=0; else rc=$?; fi
+        [ "$cancelled" -ne 0 ] && kill -0 "$operation_pid" 2>/dev/null || break
+    done
+    trap - INT TERM HUP
+    [ -z "$saved_int" ] || eval "$saved_int"
+    [ -z "$saved_term" ] || eval "$saved_term"
+    [ -z "$saved_hup" ] || eval "$saved_hup"
+    if [ "$cancelled" -ne 0 ] && [ "$rc" -ne 2 ]; then rc=$cancelled; fi
+    if [ -r "$state/retry-after" ]; then
+        IFS= read -r retry_after < "$state/retry-after" || true
+        [[ "${retry_after:-}" =~ ^[0-9]{1,10}$ ]] && WARP_REGISTRATION_RETRY_AFTER="$retry_after"
+    fi
+    if [ "${WARP_ROTATION_TRACK_ORIGINAL:-0}" = 1 ]; then
+        [ ! -r "$state/original-ip" ] || IFS= read -r WARP_ROTATION_ORIGINAL_IP < "$state/original-ip" || true
+        [ ! -r "$state/original-generation" ] || IFS= read -r WARP_ROTATION_ORIGINAL_GENERATION < "$state/original-generation" || true
+    fi
+    rm -rf -- "$state"
+    return "$rc"
+}
+
 rotate_warp_identity_once() {
+    run_warp_candidate_operation _rotate_warp_identity_once "$@"
+}
+
+auto_select_warp_candidate() {
+    run_warp_candidate_operation _auto_select_warp_candidate "$@"
+}
+
+_rotate_warp_identity_once() {
+    local target_family="${1:-${WARP_ROTATION_FAMILY:-4}}" old_ip
+    case "$target_family" in 4|6) ;; *) red "目标地址族只能为 4 或 6。"; return 1 ;; esac
     local old_ipv4='' old_ipv6='' candidate_dir candidate_endpoint new_ip activate_rc generate_rc attempt
-    local candidate_ipv4='' candidate_ipv6='' selected_family=4 proxy_started probe_ok
+    local selected_family=4 proxy_started probe_ok
     local failed_candidates=0 same_ip_candidates=0
-    local WARP_MAX_CANDIDATES=5
+    local WARP_MAX_CANDIDATES=5 baseline_generation
+    baseline_generation=$(warp_activation_generation) || return 2
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
         red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
     }
@@ -13794,11 +14449,50 @@ rotate_warp_identity_once() {
         red "无法取得当前 WARP 出口 IP，已停止更换。"
         return 1
     fi
+    if [ "$target_family" = 4 ]; then old_ip="$old_ipv4"; else old_ip="$old_ipv6"; fi
+    if [ -z "$old_ip" ]; then
+        red "尚无法读取当前 IPv${target_family} 出口，不能确认是否换成新 IP；本轮不注册候选。"
+        return 4
+    fi
+    if [ "${WARP_ROTATION_TRACK_ORIGINAL:-0}" = 1 ]; then
+        if [ -z "${WARP_ROTATION_ORIGINAL_IP:-}" ]; then
+            WARP_ROTATION_ORIGINAL_IP="$old_ip"
+            WARP_ROTATION_ORIGINAL_GENERATION="$baseline_generation"
+        elif [ "$baseline_generation" != "$WARP_ROTATION_ORIGINAL_GENERATION" ]; then
+            red "持续更换期间配置已被其他操作修改，停止本轮，不覆盖新配置。"; return 9
+        elif [ "$old_ip" != "$WARP_ROTATION_ORIGINAL_IP" ] && [ "$target_family" = 4 ]; then
+            # The provider may change the active exit without a new identity.
+            # Confirm and enforce current IPv4 routing rather than re-register.
+            switch_current_warp_to_ipv4 "$WARP_ROTATION_ORIGINAL_IP" || return $?
+            green "已确认原身份的 IPv4 出口发生变化，无需再注册候选。"
+            return 0
+        fi
+        old_ip="$WARP_ROTATION_ORIGINAL_IP"
+    fi
     for ((attempt=1; attempt<=WARP_MAX_CANDIDATES; attempt++)); do
+        if [ -n "${WARP_ROTATION_DEADLINE:-}" ] && [ "$(date +%s)" -ge "$WARP_ROTATION_DEADLINE" ]; then
+            red "更换时间预算已用完；未继续注册，原身份保留。"; return 6
+        fi
+        require_warp_candidate_memory registration || return $?
         candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
         chmod 700 "$candidate_dir"
+        WARP_PENDING_CANDIDATE="$candidate_dir"
+        WARP_PENDING_PHASE=registering
         if generate_unique_warp_identity "$candidate_dir"; then generate_rc=0; else generate_rc=$?; fi
         if [ "$generate_rc" -ne 0 ]; then
+            if [ "$generate_rc" -eq 7 ]; then
+                remove_warp_candidate_dir "$candidate_dir" || return 2
+                return 7
+            fi
+            if [ "$generate_rc" -eq 8 ] || [ "$generate_rc" -eq 10 ]; then
+                remove_warp_candidate_dir "$candidate_dir" || return 2
+                return "$generate_rc"
+            fi
+            if [ "$generate_rc" -eq 5 ]; then
+                remove_warp_candidate_dir "$candidate_dir" || return 2
+                red "注册服务拒绝或限流，停止更换；原 WARP 身份保持不变。"
+                return 5
+            fi
             if [ "$generate_rc" -eq 4 ]; then
                 remove_warp_candidate_dir "$candidate_dir" || return 2
                 red "WARP 注册前网络不可用，已停止本轮更换，原身份保持不变。"
@@ -13818,42 +14512,27 @@ rotate_warp_identity_once() {
             [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
             continue
         fi
+        WARP_PENDING_PHASE=ready
         candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
         proxy_started=false
         probe_ok=false
-        candidate_ipv4=''
-        candidate_ipv6=''
-        selected_family=4
+        selected_family="$target_family"
         new_ip=''
-        if start_warp_candidate_proxy "$candidate_endpoint" 4; then
+        if start_warp_candidate_proxy "$candidate_endpoint" "$target_family"; then
             proxy_started=true
-            if probe_warp_trace "$WARP_PROBE_PROXY" && [[ "$WARP_PROBE_IP" != *:* ]]; then
-                candidate_ipv4="$WARP_PROBE_IP"
+            if probe_warp_trace "$WARP_PROBE_PROXY"; then
                 probe_ok=true
+                if { [ "$target_family" = 4 ] && [[ "$WARP_PROBE_IP" != *:* ]]; } ||
+                   { [ "$target_family" = 6 ] && [[ "$WARP_PROBE_IP" == *:* ]]; }; then
+                    if [ -n "$WARP_PROBE_IP" ] && [ "$WARP_PROBE_IP" != "$old_ip" ]; then
+                        new_ip="$WARP_PROBE_IP"
+                    fi
+                fi
             fi
             stop_warp_candidate_proxy
             proxy_started=false
         fi
-        if [ -n "$candidate_ipv4" ] && [ -n "$old_ipv4" ] && [ "$candidate_ipv4" != "$old_ipv4" ]; then
-            selected_family=4
-            new_ip="$candidate_ipv4"
-        else
-            if start_warp_candidate_proxy "$candidate_endpoint" 6; then
-                proxy_started=true
-                if probe_warp_trace "$WARP_PROBE_PROXY" && [[ "$WARP_PROBE_IP" == *:* ]]; then
-                    candidate_ipv6="$WARP_PROBE_IP"
-                    probe_ok=true
-                fi
-                stop_warp_candidate_proxy
-                proxy_started=false
-            fi
-            if [ -n "$candidate_ipv6" ]; then
-                selected_family=6
-                new_ip="$candidate_ipv6"
-                yellow "候选没有取得不同的 IPv4 出口（当前 ${old_ipv4:-不可用}）；已探测到可用 IPv6，验证通过后将优先使用 IPv6。"
-                yellow "提示：Cloudflare 的公网 IPv6 可能随连接变化，不作为固定身份标识。"
-            fi
-        fi
+        [ "${WARP_SERIAL_RESTORE_FAILED:-0}" != 1 ] || return 2
         if [ "$probe_ok" != true ]; then
             [ "$proxy_started" = true ] && stop_warp_candidate_proxy
             if ! delete_warp_registration "$candidate_dir/account.json"; then
@@ -13866,12 +14545,14 @@ rotate_warp_identity_once() {
                 red "候选凭据保留在: ${candidate_dir}"
                 return 2
             fi
+            [ "${WARP_CANDIDATE_MEMORY_BLOCKED:-0}" != 1 ] || return 10
+            case "${WARP_CANDIDATE_START_RC:-0}" in 2|9) return "$WARP_CANDIDATE_START_RC" ;; esac
             red "候选 WARP 连接复核失败，已停止后续注册，原身份保持不变。"
             return 4
         fi
         if [ -z "$new_ip" ]; then
             same_ip_candidates=$((same_ip_candidates + 1))
-            yellow "候选 ${attempt}/${WARP_MAX_CANDIDATES} 的 Cloudflare WARP IPv4/IPv6 出口均未变化，继续尝试。"
+            yellow "候选 ${attempt}/${WARP_MAX_CANDIDATES} 未取得不同的 IPv${target_family} 出口；不切换其他地址族。"
             if ! delete_warp_registration "$candidate_dir/account.json"; then
                 red "候选 WARP 云端设备清理失败，已停止更换。"
                 red "候选凭据保留在: ${candidate_dir}"
@@ -13885,18 +14566,32 @@ rotate_warp_identity_once() {
             [ "$attempt" -lt "$WARP_MAX_CANDIDATES" ] && sleep $((attempt * 2))
             continue
         fi
-        if activate_warp_candidate "$candidate_dir" "$new_ip" '' "$selected_family"; then activate_rc=0; else activate_rc=$?; fi
+        WARP_PENDING_PHASE=activating
+        if activate_warp_candidate "$candidate_dir" "$new_ip" '' "$selected_family" "$old_ip" "$baseline_generation"; then activate_rc=0; else activate_rc=$?; fi
+        if [ "$activate_rc" -eq 9 ]; then
+            delete_warp_registration "$candidate_dir/account.json" && remove_warp_candidate_dir "$candidate_dir" || return 2
+            return 9
+        fi
+        if [ "$activate_rc" -eq 130 ] || [ "$activate_rc" -eq 143 ]; then
+            if ! delete_warp_registration "$candidate_dir/account.json" ||
+               ! remove_warp_candidate_dir "$candidate_dir"; then
+                red "取消后候选清理不完整，保留恢复材料: $candidate_dir"
+                return 2
+            fi
+            return "$activate_rc"
+        fi
         if [ "$activate_rc" -eq 0 ] || [ "$activate_rc" -eq 3 ]; then
             if ! remove_warp_candidate_dir "$candidate_dir"; then
                 yellow "新 WARP 身份已提交，但候选本地副本清理失败。"
                 red "候选凭据保留在: ${candidate_dir}"
             fi
             [ "$activate_rc" -eq 3 ] && yellow "新 WARP 身份已提交，但旧凭据或临时文件清理未完成。"
-            if [ "$selected_family" = 6 ]; then
-                green "WARP 身份已更换（所选分流规则优先 IPv6；公网 IPv6 可能随连接变化）"
+            if [ -n "$old_ip" ]; then
+                green "已验证不同的 WARP IPv${target_family} 出口：${old_ip} -> ${new_ip}"
             else
-                green "WARP 身份已更换：${old_ipv4} -> ${new_ip}"
+                green "已恢复可用的 WARP IPv${target_family} 出口：${new_ip}（此前该地址族不可用）"
             fi
+            [ "$target_family" != 6 ] || yellow "IPv6 是本次观测值，可能随连接变化，不保证固定地址或质量。"
             return 0
         fi
         if [ "$activate_rc" -eq 2 ]; then
@@ -13916,7 +14611,8 @@ rotate_warp_identity_once() {
         return 1
     done
     if [ "$same_ip_candidates" -gt 0 ]; then
-        red "未获得不同的 Cloudflare WARP 出口 IP，原 WARP 身份保持不变。"
+        red "Cloudflare 未分配不同的 IPv${target_family} 出口；更换身份不保证更换公网 IP，原身份保持不变。"
+        return 6
     else
         red "候选均在生成或探测阶段失败，原 WARP 身份保持不变。"
     fi
@@ -13927,50 +14623,55 @@ warp_rotation_now() {
     date +%s
 }
 
-rotate_warp_identity_until_new() {
-    local max_batches="${WARP_ROTATION_MAX_BATCHES:-4}"
-    local max_seconds="${WARP_ROTATION_MAX_SECONDS:-600}"
-    local started_at now batch rotate_rc elapsed
-
-    case "$max_batches" in ''|*[!0-9]*) max_batches=4 ;; esac
-    case "$max_seconds" in ''|*[!0-9]*) max_seconds=600 ;; esac
-    [ "$max_batches" -lt 1 ] && max_batches=1
-    [ "$max_batches" -gt 12 ] && max_batches=12
-    [ "$max_seconds" -lt 60 ] && max_seconds=60
-    [ "$max_seconds" -gt 3600 ] && max_seconds=3600
-
-    started_at=$(warp_rotation_now) || return 1
-    for ((batch=1; batch<=max_batches; batch++)); do
-        if [ "$batch" -gt 1 ]; then
-            now=$(warp_rotation_now) || return 1
-            elapsed=$((now - started_at))
-            if [ "$elapsed" -ge "$max_seconds" ]; then
-                red "WARP 身份更换达到 ${max_seconds} 秒时间上限，未获得不同出口。"
-                return 1
-            fi
-        fi
-        yellow "正在执行 WARP 更换批次 ${batch}/${max_batches}（每批最多 5 个候选）..."
-        if rotate_warp_identity_once; then
-            return 0
-        else
-            rotate_rc=$?
-        fi
-        case "$rotate_rc" in
-          1) ;;
-          2) return 2 ;;
-          *) return "$rotate_rc" ;;
-        esac
-        [ "$batch" -lt "$max_batches" ] && sleep 10
-    done
-    red "WARP 身份更换已达到 ${max_batches} 批上限，未获得不同出口。"
-    return 1
+warp_rotation_wait() {
+    # wait on a tracked child, so TERM to the parent also interrupts cooldown.
+    run_warp_adapter sleep "$1"
 }
 
-auto_select_warp_candidate() {
+rotate_warp_identity_until_new() {
+    local target_family="${1:-${WARP_ROTATION_FAMILY:-4}}" WARP_ROTATION_DEADLINE=''
+    local max_batches="${WARP_ROTATION_MAX_BATCHES:-0}" max_seconds="${WARP_ROTATION_MAX_SECONDS:-0}"
+    local started_at now batch=0 rotate_rc wait_seconds backoff=30
+    local WARP_REGISTRATION_RETRY_AFTER=300
+    local WARP_ROTATION_TRACK_ORIGINAL=1 WARP_ROTATION_ORIGINAL_IP='' WARP_ROTATION_ORIGINAL_GENERATION=''
+    case "$target_family" in 4|6) ;; *) red "目标地址族只能为 4 或 6。"; return 1 ;; esac
+    [[ "$max_batches" =~ ^[0-9]{1,6}$ ]] || max_batches=0
+    [[ "$max_seconds" =~ ^[0-9]{1,8}$ ]] || max_seconds=0
+    max_batches=$((10#$max_batches)); max_seconds=$((10#$max_seconds))
+    started_at=$(warp_rotation_now) || return 1
+    [ "$max_seconds" -eq 0 ] || WARP_ROTATION_DEADLINE=$((started_at + max_seconds))
+    yellow "持续寻找不同的 WARP IPv${target_family} 出口；按 Ctrl-C 取消。更换身份不保证 Cloudflare 分配新 IP。"
+    while true; do
+        now=$(warp_rotation_now) || return 1
+        if [ "$max_seconds" -gt 0 ] && [ "$now" -ge "$WARP_ROTATION_DEADLINE" ]; then
+            red "达到用户设置的 ${max_seconds} 秒时间上限，未获得不同出口。"; return 6
+        fi
+        if [ "$max_batches" -gt 0 ] && [ "$batch" -ge "$max_batches" ]; then
+            red "达到用户设置的 ${max_batches} 批上限，未获得不同出口。"; return 6
+        fi
+        batch=$((batch+1))
+        yellow "WARP IPv${target_family} 更换批次 ${batch}（每批最多 5 个候选）..."
+        if rotate_warp_identity_once "$target_family"; then return 0; else rotate_rc=$?; fi
+        case "$rotate_rc" in
+            1|4|6) wait_seconds=$backoff ;;
+            7) wait_seconds=${WARP_REGISTRATION_RETRY_AFTER:-300}; [ "$wait_seconds" -ge "$backoff" ] || wait_seconds=$backoff ;;
+            *) return "$rotate_rc" ;;
+        esac
+        yellow "本轮尚未获得不同的 IPv${target_family}；保留当前身份，${wait_seconds} 秒后重试（Ctrl-C 取消）。"
+        if warp_rotation_wait "$wait_seconds"; then :; else return $?; fi
+        [ "$backoff" -ge 300 ] || backoff=$((backoff*2))
+        [ "$backoff" -le 300 ] || backoff=300
+    done
+}
+
+_auto_select_warp_candidate() {
+    local target_family="${2:-${WARP_ROTATION_FAMILY:-4}}" old_ip
+    case "$target_family" in 4|6) ;; *) red "目标地址族只能为 4 或 6。"; return 1 ;; esac
     local selection="${1:-1234}" active_ipv4='' active_ipv6='' candidate_dir candidate_endpoint
     local attempt candidate_ip activate_rc generate_rc selected_family=4
     local proxy_started probe_ok
-    local WARP_MAX_CANDIDATES=5
+    local WARP_MAX_CANDIDATES=5 baseline_generation
+    baseline_generation=$(warp_activation_generation) || return 2
     WARP_UNLOCK_TRANSPORT_FAILED=0
     warp_endpoint_is_valid "$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)" || {
         red "内置 WARP 尚未初始化，请先设置一条 WARP 分流规则。"; return 1
@@ -13985,11 +14686,29 @@ auto_select_warp_candidate() {
         red "无法取得当前 WARP 出口 IP，已停止优选。"
         return 1
     fi
+    if [ "$target_family" = 4 ]; then old_ip="$active_ipv4"; else old_ip="$active_ipv6"; fi
     for ((attempt=1; attempt<=WARP_MAX_CANDIDATES; attempt++)); do
         yellow "正在测试候选 ${attempt}/${WARP_MAX_CANDIDATES}..."
+        require_warp_candidate_memory registration || return $?
         candidate_dir=$(mktemp -d "${conf_dir}/warp/.candidate.XXXXXX") || return 1
         chmod 700 "$candidate_dir"
+        WARP_PENDING_CANDIDATE="$candidate_dir"
+        WARP_PENDING_PHASE=registering
         if generate_unique_warp_identity "$candidate_dir"; then generate_rc=0; else generate_rc=$?; fi
+        if [ "$generate_rc" -eq 7 ]; then
+            remove_warp_candidate_dir "$candidate_dir" || return 2
+            yellow "注册服务限流，至少等待 ${WARP_REGISTRATION_RETRY_AFTER:-300} 秒后再运行优选。"
+            return 7
+        fi
+        if [ "$generate_rc" -eq 8 ] || [ "$generate_rc" -eq 10 ]; then
+            remove_warp_candidate_dir "$candidate_dir" || return 2
+            return "$generate_rc"
+        fi
+        if [ "$generate_rc" -eq 5 ]; then
+            remove_warp_candidate_dir "$candidate_dir" || return 2
+            red "注册服务拒绝或限流，停止优选；原 WARP 身份保持不变。"
+            return 5
+        fi
         if [ "$generate_rc" -eq 4 ]; then
             remove_warp_candidate_dir "$candidate_dir" || return 2
             red "WARP 注册前网络不可用，已停止本轮优选，原身份保持不变。"
@@ -14010,18 +14729,26 @@ auto_select_warp_candidate() {
             continue
         fi
 
+        WARP_PENDING_PHASE=ready
         candidate_endpoint=$(extract_warp_endpoint "$candidate_dir/endpoint.json")
         proxy_started=false
         probe_ok=false
         candidate_ip=''
         selected_family=4
         local candidate_passed=false
-        for selected_family in 4 6; do
+        # Deliberately one target family: continue/break below never fall back to IPv6.
+        # shellcheck disable=SC2066
+        for selected_family in "$target_family"; do
             if start_warp_candidate_proxy "$candidate_endpoint" "$selected_family"; then
                 proxy_started=true
                 if probe_warp_trace "$WARP_PROBE_PROXY"; then
                     probe_ok=true
                     candidate_ip="$WARP_PROBE_IP"
+                    if [ -n "$old_ip" ] && [ "$candidate_ip" = "$old_ip" ]; then
+                        yellow "候选 IPv${target_family} 出口未变化，不替换现有身份。"
+                        stop_warp_candidate_proxy; proxy_started=false
+                        continue
+                    fi
                     yellow "检测候选 IPv${selected_family} 出站..."
                     if run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" true; then
                         candidate_passed=true
@@ -14032,11 +14759,25 @@ auto_select_warp_candidate() {
                 proxy_started=false
             fi
         done
+        [ "${WARP_SERIAL_RESTORE_FAILED:-0}" != 1 ] || return 2
         if [ "$probe_ok" = true ]; then
             if [ "$candidate_passed" = true ]; then
-                stop_warp_candidate_proxy
+                stop_warp_candidate_proxy || return 2
                 proxy_started=false
-                if activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection" "$selected_family"; then activate_rc=0; else activate_rc=$?; fi
+                WARP_PENDING_PHASE=activating
+                if activate_warp_candidate "$candidate_dir" "$candidate_ip" "$selection" "$selected_family" "$old_ip" "$baseline_generation"; then activate_rc=0; else activate_rc=$?; fi
+                if [ "$activate_rc" -eq 9 ]; then
+                    delete_warp_registration "$candidate_dir/account.json" && remove_warp_candidate_dir "$candidate_dir" || return 2
+                    return 9
+                fi
+                if [ "$activate_rc" -eq 130 ] || [ "$activate_rc" -eq 143 ]; then
+                    if ! delete_warp_registration "$candidate_dir/account.json" ||
+                       ! remove_warp_candidate_dir "$candidate_dir"; then
+                        red "取消后候选清理不完整，保留恢复材料: $candidate_dir"
+                        return 2
+                    fi
+                    return "$activate_rc"
+                fi
                 if [ "$activate_rc" -eq 0 ] || [ "$activate_rc" -eq 3 ]; then
                     if ! remove_warp_candidate_dir "$candidate_dir"; then
                         yellow "新 WARP 身份已提交，但候选本地副本清理失败。"
@@ -14046,7 +14787,7 @@ auto_select_warp_candidate() {
                     if [ "$selected_family" = 6 ]; then
                         green "已启用新的 WARP 身份（所选分流规则优先 IPv6；公网 IPv6 可能随连接变化）"
                     else
-                        green "已启用新的 WARP IPv4 出口 ${candidate_ip}"
+                        green "已验证 WARP IPv4 出口 ${old_ip:-此前不可用} -> ${candidate_ip}"
                     fi
                     return 0
                 fi
@@ -14068,6 +14809,8 @@ auto_select_warp_candidate() {
             red "候选凭据保留在: ${candidate_dir}"
             return 2
         fi
+        [ "${WARP_CANDIDATE_MEMORY_BLOCKED:-0}" != 1 ] || return 10
+        case "${WARP_CANDIDATE_START_RC:-0}" in 2|9) return "$WARP_CANDIDATE_START_RC" ;; esac
         if [ "$probe_ok" != true ] || [ "${WARP_UNLOCK_TRANSPORT_FAILED:-0}" -eq 1 ]; then
             red "网络复核仍失败，已停止后续注册；原 WARP 身份保持不变。"
             return 4
@@ -14079,26 +14822,32 @@ auto_select_warp_candidate() {
 }
 
 show_warp_status_and_unlocks() {
-    local selection="${1:-1234}" family endpoint
+    local selection="${1:-1234}" family preferred endpoint ready=false
     endpoint=$(extract_warp_endpoint "${conf_dir}/endpoints.json" 2>/dev/null || true)
     warp_endpoint_is_valid "$endpoint" || {
         yellow "内置 WARP 尚未初始化。"; return 1
     }
-    family=$(get_warp_preferred_family)
-    yellow "正在检测 WARP 出站..."
-    if ! start_warp_active_proxy "$family"; then
-        red "无法使用正式服务的 WARP 健康入口。"; return 1
-    fi
-    if ! probe_warp_trace "$WARP_PROBE_PROXY"; then
+    preferred=$(get_warp_preferred_family)
+    for family in "$preferred" "$((10 - preferred))"; do
+        yellow "正在检测 WARP IPv${family} 出站..."
+        if start_warp_active_proxy "$family" && probe_warp_trace "$WARP_PROBE_PROXY"; then
+            ready=true
+            break
+        fi
         stop_warp_candidate_proxy
-        red "内置 WARP 运行探测失败。"; return 1
+        yellow "WARP IPv${family} 本次探测未通过，继续检查另一地址族。"
+    done
+    if [ "$ready" != true ]; then
+        red "内置 WARP IPv4/IPv6 运行探测均失败。"; return 1
+    fi
+    if [ "$family" != "$preferred" ]; then
+        yellow "仅本次检测改用 IPv${family}，已保存的分流地址族偏好未改变。"
     fi
     green "出口 IP: ${WARP_PROBE_IP}（IPv${family}）  地区: ${WARP_PROBE_LOC:-未知}  机房: ${WARP_PROBE_COLO:-未知}"
     green "WARP: ${WARP_PROBE_STATE}"
     run_selected_unlock_checks "$WARP_PROBE_PROXY" "$selection" true || true
     stop_warp_candidate_proxy
-    write_warp_status_cache "$selection" "$WARP_UNLOCK_SUMMARY" "$family" || \
-        yellow "状态已显示，但缓存写入失败。"
+    write_warp_status_cache "$selection" "$WARP_UNLOCK_SUMMARY" "$family" ||         yellow "状态已显示，但缓存写入失败。"
 }
 
 get_warp_menu_status() {
@@ -14127,7 +14876,11 @@ warp_endpoint_json() {
     if [ -n "$current_endpoint" ] && \
        warp_endpoint_is_valid "$current_endpoint" && \
        ! warp_endpoint_is_legacy "$current_endpoint"; then
-        jq -c '.peers = [.peers[] | .persistent_keepalive_interval = 25]' <<< "$current_endpoint"
+        jq -c --arg strategy "ipv$(warp_underlay_family)_only" '
+          .peers = [.peers[] | .persistent_keepalive_interval = 25] |
+          if .domain_resolver == null or .domain_resolver.server == "local" then
+            .domain_resolver = ((.domain_resolver // {server:"local"}) + {strategy:$strategy})
+          else . end' <<< "$current_endpoint"
         return
     fi
 
@@ -14142,7 +14895,11 @@ warp_endpoint_json() {
 
     warp_endpoint_is_valid "$state_endpoint" || return 1
     warp_endpoint_is_legacy "$state_endpoint" && return 1
-    jq -c '.peers = [.peers[] | .persistent_keepalive_interval = 25]' <<< "$state_endpoint"
+    jq -c --arg strategy "ipv$(warp_underlay_family)_only" '
+          .peers = [.peers[] | .persistent_keepalive_interval = 25] |
+          if .domain_resolver == null or .domain_resolver.server == "local" then
+            .domain_resolver = ((.domain_resolver // {server:"local"}) + {strategy:$strategy})
+          else . end' <<< "$state_endpoint"
 }
 
 warp_rule_sets_json() {
@@ -14165,32 +14922,63 @@ EOF
 restore_warp_file_backups() {
     local backup_dir="$1"
     shift
-    local target_file target_name
-
+    local target_file target_name failed=0
     for target_file in "$@"; do
         target_name=$(basename "$target_file")
         if [ -e "${backup_dir}/had-${target_name}" ]; then
-            cp -p "${backup_dir}/${target_name}" "$target_file" 2>/dev/null || \
-                cp "${backup_dir}/${target_name}" "$target_file" || true
+            cp -p "${backup_dir}/${target_name}" "$target_file" || failed=1
+            cmp -s "${backup_dir}/${target_name}" "$target_file" || failed=1
         else
-            rm -f -- "$target_file"
+            rm -f -- "$target_file" || failed=1
         fi
     done
+    return "$failed"
 }
 
 # 补齐 direct、WARP endpoint 与分流规则集。三份配置作为一个整体校验，
 # 任一候选文件无效时同时回滚，避免留下“菜单成功、endpoint 缺失”的半配置。
 ensure_warp_prerequisites() {
+    (
     local endpoint_file="${conf_dir}/endpoints.json"
     local current_route_file="${conf_dir}/route.json"
     local current_outbound_file="${conf_dir}/outbounds.json"
-    local endpoint_tmp route_tmp outbound_tmp backup_dir
+    local endpoint_tmp='' route_tmp='' outbound_tmp='' backup_dir=''
     local warp_endpoint required_rule_sets target_file target_name
     local separate_cache=false cache_config
-    local -a target_files
+    local -a target_files=()
+    local restore_on_exit=false rc=0 prereq_stopped=false
+    acquire_proxy_transaction_lock_checked "$conf_dir" "WARP 前置配置" || exit $?
+    trap 'rc=$?
+        trap "" INT TERM HUP
+        if [ "$restore_on_exit" = true ] && [ -d "$backup_dir" ]; then
+            if restore_warp_file_backups "$backup_dir" "${target_files[@]}"; then
+                rm -rf -- "$backup_dir"
+            else
+                red "WARP 中断恢复不完整，保留备份: $backup_dir"; rc=2
+            fi
+        fi
+        if [ "$prereq_stopped" = true ] && [ "$rc" != 2 ]; then
+            restart_singbox_checked && singbox_service_is_stably_active || rc=2
+        fi
+        [ -z "$endpoint_tmp" ] || rm -f -- "$endpoint_tmp"
+        [ -z "$route_tmp" ] || rm -f -- "$route_tmp"
+        [ -z "$outbound_tmp" ] || rm -f -- "$outbound_tmp"
+        release_proxy_transaction_lock || rc=2
+        exit "$rc"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
 
     command_exists jq || { red "WARP 分流需要 jq。"; return 1; }
     mkdir -p "$conf_dir" || return 1
+    # Refuse damaged/custom targets before registering or overwriting anything.
+    for target_file in "$endpoint_file" "$current_route_file" "$current_outbound_file"; do
+        [ ! -e "$target_file" ] && [ ! -L "$target_file" ] && continue
+        [ -f "$target_file" ] && [ ! -L "$target_file" ] &&
+            jq -e 'type == "object"' "$target_file" >/dev/null 2>&1 || {
+                red "分流配置不是有效普通 JSON 文件，未修改: $target_file"
+                return 1
+            }
+    done
 
     # Directory configurations may keep experimental settings in a separate file.
     for cache_config in "${conf_dir}"/*.json; do
@@ -14235,7 +15023,10 @@ ensure_warp_prerequisites() {
     else
         jq -n --argjson warp "$warp_endpoint" '{endpoints: [$warp]}' > "$endpoint_tmp"
     fi || {
-        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}" || {
+            red "WARP 配置恢复不完整，保留备份: $backup_dir"
+            return 2
+        }
         rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
         rm -rf -- "$backup_dir"
         return 1
@@ -14248,10 +15039,9 @@ ensure_warp_prerequisites() {
           end) |
           .route = (if (.route | type) == "object" then .route else {} end) |
           (.route.rule_set // []) as $current |
-          .route.rule_set = ([
-            ($current | if type == "array" then .[] else empty end) |
-            select(.tag as $tag | ($required | map(.tag) | index($tag) | not))
-          ] + $required) |
+          .route.rule_set = ($current + [
+            $required[] | select(.tag as $tag | ($current | map(.tag) | index($tag) | not))
+          ]) |
           .route.rules = (if (.route.rules | type) == "array" then .route.rules else [] end) |
           .route.final = (if (.route.final | type) == "string" and (.route.final | length) > 0 then .route.final else "direct" end)
         ' "$current_route_file" > "$route_tmp"
@@ -14262,7 +15052,10 @@ ensure_warp_prerequisites() {
               .experimental.cache_file = {enabled: true, path: $cache_path}
             end' > "$route_tmp"
     fi || {
-        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}" || {
+            red "WARP 配置恢复不完整，保留备份: $backup_dir"
+            return 2
+        }
         rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
         rm -rf -- "$backup_dir"
         return 1
@@ -14278,35 +15071,51 @@ ensure_warp_prerequisites() {
     else
         jq -n '{outbounds: [{type:"direct",tag:"direct"}]}' > "$outbound_tmp"
     fi || {
-        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}" || {
+            red "WARP 配置恢复不完整，保留备份: $backup_dir"
+            return 2
+        }
         rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
         rm -rf -- "$backup_dir"
         return 1
     }
 
+    restore_on_exit=true
+    if warp_use_serial_probe && singbox_service_is_active; then
+        prereq_stopped=true
+        yellow "小内存 WARP 前置配置：停止代理后校验，完成或回滚后恢复。" >&2
+        stop_singbox_checked && ! singbox_service_is_active || return 1
+    fi
     if ! jq empty "$endpoint_tmp" >/dev/null 2>&1 || \
        ! jq empty "$route_tmp" >/dev/null 2>&1 || \
        ! jq empty "$outbound_tmp" >/dev/null 2>&1 || \
        ! mv -f "$endpoint_tmp" "$endpoint_file" || \
        ! mv -f "$route_tmp" "$current_route_file" || \
        ! mv -f "$outbound_tmp" "$current_outbound_file"; then
-        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}" || {
+            red "WARP 配置恢复不完整，保留备份: $backup_dir"
+            return 2
+        }
         rm -f "$endpoint_tmp" "$route_tmp" "$outbound_tmp"
         rm -rf -- "$backup_dir"
         red "WARP 前置配置生成失败，已回滚。"
         return 1
     fi
 
-    chmod 600 "$endpoint_file" 2>/dev/null || true
-    chmod 644 "$current_route_file" "$current_outbound_file" 2>/dev/null || true
-    if ! validate_singbox_config; then
-        restore_warp_file_backups "$backup_dir" "${target_files[@]}"
+    if ! chmod 600 "$endpoint_file" "$current_route_file" "$current_outbound_file" ||
+       ! validate_singbox_config; then
+        restore_warp_file_backups "$backup_dir" "${target_files[@]}" || {
+            red "WARP 配置恢复不完整，保留备份: $backup_dir"
+            return 2
+        }
         rm -rf -- "$backup_dir"
         red "WARP 前置配置校验失败，已回滚。"
         return 1
     fi
 
+    restore_on_exit=false
     rm -rf -- "$backup_dir"
+    )
 }
 
 restart_singbox_checked() {
@@ -14376,15 +15185,40 @@ stop_argo_checked() {
 }
 
 singbox_check_config_dir() {
-    local staged_conf_dir="${1:-}"
-    local checker="${SINGBOX_CHECK_BIN:-${work_dir}/${server_name}}"
-
+    local staged_conf_dir="${1:-}" checker="${SINGBOX_CHECK_BIN:-${work_dir}/${server_name}}"
+    local serial=false stopped=false rc=0 cancelled=0 saved_int saved_term saved_hup
     [ -d "$staged_conf_dir" ] || return 1
-    if [[ "$checker" != */* ]]; then
-        checker=$(command -v "$checker" 2>/dev/null) || return 1
-    fi
+    if [[ "$checker" != */* ]]; then checker=$(command -v "$checker" 2>/dev/null) || return 1; fi
     [ -x "$checker" ] || return 1
-    "$checker" check -C "$staged_conf_dir" >/dev/null 2>&1
+    # Only the staged, lock-held transaction has a proven unchanged production
+    # config. Do not generically stop/restart around checks of mutated live files.
+    if [ "${PROXY_TX_STAGE:-}" = staging ] && warp_use_serial_probe && singbox_service_is_active; then serial=true; fi
+    if [ "$serial" = true ]; then
+        saved_int=$(trap -p INT || true); saved_term=$(trap -p TERM || true); saved_hup=$(trap -p HUP || true)
+        trap 'cancelled=130' INT
+        trap 'cancelled=143' TERM HUP
+        yellow "小内存配置校验：短暂停止代理，校验结束恢复原服务。" >&2
+        stopped=true
+        if ! stop_singbox_checked || singbox_service_is_active; then rc=1; fi
+    fi
+    if [ "$rc" = 0 ] && [ "$cancelled" = 0 ]; then
+        "$checker" check -C "$staged_conf_dir" >/dev/null 2>&1 || rc=$?
+    fi
+    if [ "$stopped" = true ]; then
+        if ! restart_singbox_checked || ! singbox_service_is_stably_active; then
+            PROXY_TX_MEMORY_FATAL=1; rc=2
+            red "配置尚未提交，但原服务恢复失败；已停止事务。" >&2
+        fi
+        trap - INT TERM HUP
+        [ -z "$saved_int" ] || eval "$saved_int"
+        [ -z "$saved_term" ] || eval "$saved_term"
+        [ -z "$saved_hup" ] || eval "$saved_hup"
+        if [ "$cancelled" != 0 ] && [ "$rc" != 2 ]; then
+            if [ "$cancelled" = 130 ]; then kill -INT "$BASHPID"; else kill -TERM "$BASHPID"; fi
+            return "$cancelled"
+        fi
+    fi
+    return "$rc"
 }
 
 singbox_service_is_active() {
@@ -14873,7 +15707,8 @@ durable_transaction_trap_handler() {
     local rollback_callback
     local -a rollback_args=()
 
-    trap - HUP INT TERM EXIT
+    trap - EXIT
+        trap '' HUP INT TERM
     [ "${DURABLE_TX_ACTIVE:-0}" -eq 1 ] || exit "$original_status"
     [ "${DURABLE_TX_HANDLING:-0}" -eq 0 ] || exit 2
     DURABLE_TX_HANDLING=1
@@ -14930,6 +15765,7 @@ reset_proxy_transaction_state() {
     PROXY_TX_CURRENT_ROUTE_FILE=''
     PROXY_TX_CURRENT_OUTBOUND_FILE=''
     PROXY_TX_INITIAL_SERVICE_ACTIVE=1
+    PROXY_TX_MEMORY_FATAL=0
 }
 
 cleanup_proxy_transaction_artifacts() {
@@ -15087,12 +15923,24 @@ apply_proxy_config_transaction() {
         PROXY_TX_INITIAL_SERVICE_ACTIVE=0
     fi
     _apply_proxy_config_transaction_locked "$@" || transaction_status=$?
+    [ "${PROXY_TX_MEMORY_FATAL:-0}" != 1 ] || transaction_status=2
     trap - INT TERM EXIT
     restore_proxy_transaction_traps
     finish_transaction_release "$transaction_status" release_proxy_transaction_lock || \
         transaction_status=$?
     reset_proxy_transaction_state
     return "$transaction_status"
+}
+
+normalize_proxy_transaction_route() {
+    local source_file="$1" next_file
+    [ -n "${PROXY_TX_WARP_FAMILY:-}" ] || return 0
+    next_file=$(mktemp "${source_file}.family.XXXXXX") || return 1
+    if ! render_warp_route_family "$source_file" "$next_file" "$PROXY_TX_WARP_FAMILY" ||
+       ! mv -f -- "$next_file" "$source_file"; then
+        rm -f -- "$next_file"
+        return 1
+    fi
 }
 
 _apply_proxy_config_transaction_locked() {
@@ -15138,6 +15986,7 @@ _apply_proxy_config_transaction_locked() {
        ! jq "$@" "$outbound_filter" "$current_outbound_file" > "$staged_outbound_tmp" 2>/dev/null ||
        ! jq empty "$staged_route_tmp" >/dev/null 2>&1 ||
        ! jq empty "$staged_outbound_tmp" >/dev/null 2>&1 ||
+       ! normalize_proxy_transaction_route "$staged_route_tmp" ||
        ! chmod "$route_mode" "$staged_route_tmp" ||
        ! chmod "$outbound_mode" "$staged_outbound_tmp" ||
        ! mv -f -- "$staged_route_tmp" "$stage_dir/$(basename "$current_route_file")" ||
@@ -15193,7 +16042,9 @@ _apply_proxy_config_transaction_locked() {
     PROXY_TX_STAGE='outbounds-committed'
 
     PROXY_TX_STAGE='restarting'
-    if ! restart_singbox_checked || ! singbox_service_is_active; then
+    if { [ "${PROXY_TX_INITIAL_SERVICE_ACTIVE:-1}" = 1 ] ||
+         [ "${PROXY_TX_PRESERVE_STOPPED:-0}" != 1 ]; } &&
+       { ! restart_singbox_checked || ! singbox_service_is_active; }; then
         if rollback_proxy_config_transaction; then
             red "sing-box 服务未能恢复 active，已回滚代理与路由配置。"
             return 1
@@ -15266,38 +16117,11 @@ add_proxy_outbound_transaction() {
 apply_warp_route_update() {
     local jq_filter="$1"
     shift
-    local current_route_file="${route_file:-${conf_dir}/route.json}"
-    local route_tmp route_rendered route_backup family
-
-    [ -s "$current_route_file" ] && jq empty "$current_route_file" >/dev/null 2>&1 || return 1
-    route_tmp=$(mktemp "${conf_dir}/.tmp.route.XXXXXX") || return 1
-    route_rendered=$(mktemp "${conf_dir}/.tmp.route-family.XXXXXX") || { rm -f "$route_tmp"; return 1; }
-    route_backup=$(mktemp "${conf_dir}/.bak.route.XXXXXX") || { rm -f "$route_tmp" "$route_rendered"; return 1; }
-    cp -p "$current_route_file" "$route_backup" 2>/dev/null || cp "$current_route_file" "$route_backup" || {
-        rm -f "$route_tmp" "$route_rendered" "$route_backup"
-        return 1
-    }
-    family=$(get_warp_preferred_family)
-
-    if ! jq "$@" "$jq_filter" "$current_route_file" > "$route_tmp" || \
-       ! render_warp_route_family "$route_tmp" "$route_rendered" "$family" || \
-       ! jq empty "$route_rendered" >/dev/null 2>&1 || \
-       ! chmod 644 "$route_rendered" || ! mv -f "$route_rendered" "$current_route_file" || \
-       ! validate_singbox_config; then
-        mv -f "$route_backup" "$current_route_file" >/dev/null 2>&1 || true
-        rm -f "$route_tmp" "$route_rendered"
-        red "sing-box 路由配置校验失败，已回滚。"
-        return 1
-    fi
-
-    if ! restart_singbox_checked; then
-        mv -f "$route_backup" "$current_route_file" >/dev/null 2>&1 || true
-        restart_singbox_checked >/dev/null 2>&1 || true
-        red "sing-box 重启失败，已恢复原路由配置。"
-        return 1
-    fi
-
-    rm -f "$route_tmp" "$route_rendered" "$route_backup"
+    # Reuse the same lock, staged full-config validation, signal rollback and
+    # service-state preservation as other proxy edits instead of a second path.
+    local PROXY_TX_WARP_FAMILY PROXY_TX_PRESERVE_STOPPED=1
+    PROXY_TX_WARP_FAMILY=$(get_warp_preferred_family) || return 1
+    apply_proxy_config_transaction "$jq_filter" '.' "$@"
 }
 
 add_service_route() {
@@ -15352,9 +16176,78 @@ native_ipv6_available() {
     [ -n "$native_ipv6" ]
 }
 
+switch_current_warp_to_ipv4() {
+    (
+        local stage='' changed=false committed=false had_family=false snapshots_ready=false rc=0 rollback_ok=true
+        local family_file="$conf_dir/warp/preferred-family" verified_ip prior_ip="${1:-}"
+        local route_file="$conf_dir/route.json" outbound_file="$conf_dir/outbounds.json"
+        local PROXY_TX_WARP_FAMILY=4 PROXY_TX_PRESERVE_STOPPED=1
+        acquire_proxy_transaction_lock_checked "$conf_dir" "当前 WARP IPv4 切换" || exit $?
+        trap 'rc=$?
+            if [ "$committed" != true ] && [ "$snapshots_ready" = true ] &&
+               { [ "$changed" = true ] || ! cmp -s "$stage/route.json" "$route_file" || ! cmp -s "$stage/outbounds.json" "$outbound_file"; }; then
+                cp -p "$stage/route.json" "$route_file" || rollback_ok=false
+                cp -p "$stage/outbounds.json" "$outbound_file" || rollback_ok=false
+                if [ "$had_family" = true ]; then
+                    cp -p "$stage/preferred-family" "$family_file" || rollback_ok=false
+                else rm -f -- "$family_file" || rollback_ok=false; fi
+                restart_singbox_checked >/dev/null 2>&1 && singbox_service_is_stably_active || rollback_ok=false
+            fi
+            if [ "$rollback_ok" = true ]; then [ -z "$stage" ] || rm -rf -- "$stage"; else
+                red "IPv4 切换恢复不完整，保留备份: $stage"; rc=2
+            fi
+            release_proxy_transaction_lock || rc=2
+            exit "$rc"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        singbox_service_is_active || { red "核心未运行，未修改当前身份或路由。"; exit 1; }
+        [ -f "$route_file" ] && [ ! -L "$route_file" ] &&
+            [ -f "$outbound_file" ] && [ ! -L "$outbound_file" ] &&
+            [ ! -L "$conf_dir/warp" ] && [ ! -L "$family_file" ] || exit 1
+        [ ! -e "$family_file" ] || [ -f "$family_file" ] || exit 1
+        jq -e 'type=="object"' "$route_file" >/dev/null 2>&1 &&
+            jq -e 'type=="object"' "$outbound_file" >/dev/null 2>&1 || {
+                red "当前磁盘路由/出站 JSON 无效，未重启核心或覆盖文件。"; exit 1;
+            }
+        if ! probe_active_warp 4 || ! is_valid_ipv4_address "$WARP_PROBE_IP" ||
+           { [ -n "$prior_ip" ] && [ "$WARP_PROBE_IP" = "$prior_ip" ]; }; then
+            red "当前身份的 IPv4 本次不可用，保留现有路由；未注册或切换身份。"; exit 1
+        fi
+        stage=$(mktemp -d "$conf_dir/.ipv4-switch.XXXXXX") || exit 1
+        chmod 700 "$stage" || exit 1
+        cp -p "$route_file" "$stage/route.json" && cp -p "$outbound_file" "$stage/outbounds.json" || exit 1
+        if [ -e "$family_file" ]; then
+            [ -f "$family_file" ] && cp -p "$family_file" "$stage/preferred-family" || exit 1
+            had_family=true
+        fi
+        snapshots_ready=true
+        apply_proxy_config_transaction '.' '.' || exit $?
+        changed=true
+        write_warp_preferred_family 4 || exit 1
+        if ! probe_active_warp 4 || ! is_valid_ipv4_address "$WARP_PROBE_IP" ||
+           { [ -n "$prior_ip" ] && [ "$WARP_PROBE_IP" = "$prior_ip" ]; }; then
+            red "切换后 IPv4 验证未通过，恢复原路由和地址族偏好。"; exit 1
+        fi
+        verified_ip="$WARP_PROBE_IP"
+        committed=true
+        green "当前身份已使用 IPv4 域名分流，出口 ${verified_ip}；没有申请新身份，不代表更换了公网 IP。"
+    )
+}
+
+prompt_warp_target_family() {
+    local warp_family_choice
+    green "目标出口：1. IPv4（默认，不降级到 IPv6）  2. IPv6（主动选择）"
+    reading "请选择 [1]: " warp_family_choice
+    case "${warp_family_choice:-1}" in
+        1) WARP_TARGET_FAMILY=4 ;;
+        2) WARP_TARGET_FAMILY=6 ;;
+        *) red "无效地址族选择。"; return 1 ;;
+    esac
+}
+
 dispatch_warp_rotation_menu_action() {
     local rotate_rc
-    if rotate_warp_identity_until_new; then
+    if rotate_warp_identity_until_new "${1:-4}"; then
         return 0
     else
         rotate_rc=$?
@@ -15369,6 +16262,21 @@ dispatch_warp_rotation_menu_action() {
         ;;
       4)
         red "WARP 网络暂不可用，已停止后续注册；原身份和分流配置保持不变。"
+        ;;
+      5)
+        red "WARP 注册接口/权限或本地输入被明确拒绝；已停止重试，现有身份未替换。"
+        ;;
+      6)
+        yellow "没有取得不同的指定地址族出口；已停止自动注册，现有身份和路由保留。"
+        ;;
+      8)
+        red "配套组件下载或校验未完成，未申请新身份；网络恢复后重试，已有身份保留。"
+        ;;
+      9)
+        yellow "其他操作已修改 WARP 配置，本轮已停止，未覆盖较新的配置。"
+        ;;
+      130|143)
+        yellow "已取消 WARP 更换；候选已按状态清理或保留恢复材料。"
         ;;
       *)
         red "WARP 身份更换返回未知状态 ${rotate_rc}，请检查上方日志后再处理。"
@@ -15433,6 +16341,8 @@ warp_manage() {
     skyblue "----------------------"
     green "7. 按平台优选 WARP 出站"
     skyblue "----------------------------"
+    green "8. 当前身份切换为 IPv4（不更换 IP）"
+    skyblue "----------------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
     purple "00. 退出脚本"
@@ -15444,15 +16354,19 @@ warp_manage() {
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
         5)  clear; show_warp_status_and_unlocks || true; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
-        6)  clear; dispatch_warp_rotation_menu_action || true; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
+        6)  clear; if prompt_warp_target_family; then dispatch_warp_rotation_menu_action "$WARP_TARGET_FAMILY" || true; fi; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
+        8)  clear; switch_current_warp_to_ipv4 || true; read -n 1 -s -r -p $'\n按任意键返回...'; warp_manage ;;
         7)
             clear
-            green "选择需要严格解锁的平台（可多选，如 134，回车默认 1234）:"
+            yellow "平台检测仅反映本次网页/地区响应，不保证登录、对话或播放可用。"
+            green "选择要检测的平台（可多选，如 134，回车默认 3 / ChatGPT）:"
             green "1. Netflix  2. Disney+  3. ChatGPT  4. Gemini"
             reading "请输入: " warp_unlock_selection
-            warp_unlock_selection=${warp_unlock_selection:-1234}
+            warp_unlock_selection=${warp_unlock_selection:-3}
             if [[ "$warp_unlock_selection" =~ ^[1-4]+$ ]]; then
-                auto_select_warp_candidate "$warp_unlock_selection" || true
+                if prompt_warp_target_family; then
+                    auto_select_warp_candidate "$warp_unlock_selection" "$WARP_TARGET_FAMILY" || true
+                fi
             else
                 red "输入无效，只能使用数字 1-4。"
             fi
@@ -15501,11 +16415,6 @@ add_rule_menu() {
         *)  red "无效选项"; sleep 1; add_rule_menu; return ;;
     esac
 
-    if ! ensure_warp_prerequisites; then
-        red "无法初始化 WARP endpoint 或分流规则集。"
-        sleep 2; warp_manage; return
-    fi
-
     if jq -e --arg tag "$rule_tag" \
         '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
         "$route_file" > /dev/null 2>&1; then
@@ -15537,6 +16446,10 @@ add_rule_menu() {
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
+    if [ "$selected_out" = wireguard-out ] && ! ensure_warp_prerequisites; then
+        red "无法初始化 WARP endpoint 或分流规则集。"
+        sleep 2; warp_manage; return
+    fi
     if add_service_route "$rule_tag" "$selected_out"; then
         green "'${rule_tag}' 的 IPv4/IPv6 已分流至出站 '${selected_out}'"
     else
@@ -15546,11 +16459,6 @@ add_rule_menu() {
 }
 # 设置全局代理出站
 set_global_outbound() {
-    if ! ensure_warp_prerequisites; then
-        red "无法校验分流前置配置。"
-        sleep 2; add_rule_menu; return
-    fi
-
     # 内置 WireGuard 位于 endpoints 中，也应作为全局出站候选。
     local -a proxy_tags
     mapfile -t proxy_tags < <(
@@ -15576,6 +16484,10 @@ set_global_outbound() {
     fi
     local selected_out="${proxy_tags[$((out_choice-1))]}"
 
+    if [ "$selected_out" = wireguard-out ] && ! ensure_warp_prerequisites; then
+        red "无法校验 WARP 分流前置配置。"
+        sleep 2; add_rule_menu; return
+    fi
     if set_global_route "$selected_out"; then
         green "\n已设置全局代理出站：${purple}${selected_out}${re}"
         yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
@@ -15588,7 +16500,7 @@ set_global_outbound() {
 restore_direct_outbound() {
     yellow "\n正在恢复默认路由配置...\n"
 
-    if ensure_warp_prerequisites && restore_direct_route; then
+    if restore_direct_route; then
         green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
     else
         red "恢复 direct 失败，原配置已保留。"
@@ -16045,27 +16957,43 @@ publish_subscriptions_locked() {
         backup_files+=("$backup_file")
     done
 
+    local publication_interrupt=0 publication_mv_rc=0 restore_from=-1
+    local saved_int saved_term saved_hup
+    saved_int=$(trap -p INT || true); saved_term=$(trap -p TERM || true); saved_hup=$(trap -p HUP || true)
+    trap 'publication_interrupt=130' INT
+    trap 'publication_interrupt=143' TERM HUP
     for ((index = 0; index < ${#commit_targets[@]}; index++)); do
-        if ! mv -f -- "${commit_sources[$index]}" "${commit_targets[$index]}"; then
-            commit_failed=1
-            for ((restore_index = index - 1; restore_index >= 0; restore_index--)); do
-                if [ "${target_existed[$restore_index]}" = 1 ]; then
-                    if ! mv -f -- "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}"; then
-                        rollback_failed=1
-                        printf 'FATAL: subscription rollback failed; preserved backup %s for %s\n' \
-                            "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}" >&2
-                    fi
-                else
-                    if ! rm -f -- "${commit_targets[$restore_index]}"; then
-                        rollback_failed=1
-                        printf 'FATAL: subscription rollback failed; remove manually: %s\n' \
-                            "${commit_targets[$restore_index]}" >&2
-                    fi
-                fi
-            done
-            break
+        if [ "$publication_interrupt" -ne 0 ]; then
+            commit_failed=1; restore_from=$((index-1)); break
+        fi
+        publication_mv_rc=0
+        mv -f -- "${commit_sources[$index]}" "${commit_targets[$index]}" || publication_mv_rc=$?
+        if [ "$publication_mv_rc" -ne 0 ] || [ "$publication_interrupt" -ne 0 ]; then
+            # A rename may finish before mv reports interruption: restore its
+            # target too, not only earlier targets, while still holding the lock.
+            commit_failed=1; restore_from=$index; break
         fi
     done
+    if [ "$publication_interrupt" -ne 0 ] && [ "$commit_failed" -eq 0 ]; then
+        commit_failed=1; restore_from=$((${#commit_targets[@]}-1))
+    fi
+    if [ "$commit_failed" -ne 0 ]; then
+        for ((restore_index = restore_from; restore_index >= 0; restore_index--)); do
+            if [ "${target_existed[$restore_index]}" = 1 ]; then
+                if ! mv -f -- "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}"; then
+                    rollback_failed=1
+                    printf 'FATAL: subscription rollback failed; preserved backup %s for %s\n' \
+                        "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}" >&2
+                fi
+            elif ! rm -f -- "${commit_targets[$restore_index]}"; then
+                rollback_failed=1
+            fi
+        done
+    fi
+    trap - INT TERM HUP
+    [ -z "$saved_int" ] || eval "$saved_int"
+    [ -z "$saved_term" ] || eval "$saved_term"
+    [ -z "$saved_hup" ] || eval "$saved_hup"
     rm -f "${commit_sources[@]}"
     if [ "$commit_failed" -eq 0 ]; then
         rm -f "${backup_files[@]}"
@@ -16076,6 +17004,7 @@ publish_subscriptions_locked() {
         return 2
     fi
     rm -f "${backup_files[@]}"
+    [ "$publication_interrupt" -eq 0 ] || return "$publication_interrupt"
     return 1
 }
 
@@ -16415,7 +17344,7 @@ restore_extra_protocol_service_state() {
 commit_extra_protocol_service_state() {
     local was_active="${1:-}"
 
-    EXTRA_PROTOCOL_SERVICE_TOUCHED=0
+    [ "${EXTRA_PROTOCOL_LOW_MEMORY_STOPPED:-0}" = 1 ] || EXTRA_PROTOCOL_SERVICE_TOUCHED=0
     case "$was_active" in
         1)
             validate_installed_singbox_config_strict || return 1
@@ -16565,6 +17494,7 @@ _add_extra_protocol_transaction_locked() {
 
     EXTRA_PROTOCOL_RECOVERY_PATH=''
     EXTRA_PROTOCOL_SERVICE_TOUCHED=0
+    EXTRA_PROTOCOL_LOW_MEMORY_STOPPED=0
     backup_extra_protocol_transaction "$inbounds_file" || return 1
     backup_dir="$EXTRA_PROTOCOL_BACKUP_DIR"
     singbox_service_is_active && was_active=1
@@ -16712,6 +17642,7 @@ _remove_extra_protocol_transaction_locked() {
 
     EXTRA_PROTOCOL_RECOVERY_PATH=''
     EXTRA_PROTOCOL_SERVICE_TOUCHED=0
+    EXTRA_PROTOCOL_LOW_MEMORY_STOPPED=0
     backup_extra_protocol_transaction "$inbounds_file" || return 1
     backup_dir="$EXTRA_PROTOCOL_BACKUP_DIR"
     singbox_service_is_active && was_active=1
@@ -17211,11 +18142,11 @@ cfy_executable_path() {
 }
 
 cfy_download_url() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/6e3b6f12bd381f4c9c33647721cc73a98747e244/cfy.sh}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_URL:-https://raw.githubusercontent.com/Pretic/Pre-cfy/d5de17de735f3f1a73d00cb07a53b85dce547825/cfy.sh}"
 }
 
 cfy_expected_download_sha256() {
-    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-f964f0378bf45c156ac331c71ae9858b7785d26b92b6f00058a66c2dff6cbd1e}"
+    printf '%s\n' "${SB_CFY_DOWNLOAD_SHA256:-90b910e1f99018437067aa294ffa633610314a1d9127b884e639dd81b6949aeb}"
 }
 
 validate_cfy_target_path() {
@@ -17238,14 +18169,17 @@ validate_cfy_script() {
     grep -Fq 'CFY_SOURCE_GENERATION_FILE=' "$script_file" && \
         grep -Fq 'ensure_stable_transaction_root()' "$script_file" && \
         grep -Fq 'with_subscription_lock()' "$script_file" && \
-        grep -Fq 'publish_subscriptions_locked()' "$script_file"
+        grep -Fq 'publish_subscriptions_locked()' "$script_file" &&
+        grep -Fq -- '--manual)' "$script_file" &&
+        grep -Fq -- '-c|--check' "$script_file" &&
+        grep -Fq -- '--update|--upgrade)' "$script_file"
 }
 
 validate_cfy_executable() {
     local executable="${1:-}"
 
     [ -n "$executable" ] && [ -f "$executable" ] && [ ! -L "$executable" ] && \
-        [ -x "$executable" ]
+        [ -x "$executable" ] && validate_cfy_script "$executable"
 }
 
 install_cfy() {
@@ -17349,7 +18283,7 @@ run_cfy_existing() {
         return 1
     }
     validate_cfy_executable "$executable" || {
-        red "未找到兼容的 cfy，请先选择菜单项 1 运行 cfy 节点优选并完成安装。"
+        red "cfy 缺失或接口版本不兼容，未执行或覆盖；缺失时请先选择菜单 1 安装，已有不兼容版本请安装配套 Pre-cfy 后重试。"
         return 1
     }
     "$executable" "$@"
@@ -17481,8 +18415,8 @@ menu() {
     clear; echo ""
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
     green "YouTube频道: ${purple}https://youtube.com/@eooce${re}"
-    green "Github地址: ${purple}https://github.com/eooce/sing-box${re}\n"
-    purple "=== 老王sing-box四合一安装脚本 ===\n"
+    green "项目地址: ${purple}https://github.com/Pretic/Sing-box-Pre${re}\n"
+    purple "=== Sing-box-Pre 节点管理 ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "---WARP 分流: ${warp_status}"
     purple "--Nginx 状态: ${nginx_status}"
@@ -17517,7 +18451,7 @@ harden_runtime_secret_permissions || {
 
 # Decommission the old built-in query route on existing installations only.
 case "${1:-}" in
-    -h|--help|-u|--uninstall|--purge-nginx) ;;
+    -h|--help|--update|--upgrade|-u|--uninstall|--purge-nginx) ;;
     *) migrate_retired_warp_routes || {
         red "旧版附加规则清理未完成，原规则已保留；请检查恢复提示。"
         exit 1
@@ -17525,7 +18459,8 @@ case "${1:-}" in
 esac
 
 # 捕获 Ctrl+C
-trap 'stop_warp_candidate_proxy 2>/dev/null || true; red "\n强制退出"; exit' INT TERM
+trap 'stop_warp_candidate_proxy 2>/dev/null || true; red "\n已取消"; exit 130' INT
+trap 'stop_warp_candidate_proxy 2>/dev/null || true; red "\n已终止"; exit 143' TERM
 
 # ---- 参数解析入口 ----
 if [ -n "${1:-}" ]; then

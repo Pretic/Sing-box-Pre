@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+ensure_warp_adapter() { return 0; }
+generate_warp_keypair() { "$singbox_bin" generate wg-keypair; }
+warp_use_serial_probe() { return 1; }
+require_warp_candidate_memory() { return 0; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"
@@ -37,6 +41,9 @@ warp_block=$(sed -n '/^extract_warp_endpoint() {/,/^warp_manage() {/p' "$script"
 [[ -n "$warp_block" ]] || fail 'WARP helper block could not be extracted'
 # shellcheck disable=SC1091
 source /dev/stdin <<< "$warp_block"
+warp_use_serial_probe() { return 1; }
+require_warp_candidate_memory() { return 0; }
+generate_warp_keypair() { "$singbox_bin" generate wg-keypair; }
 
 add_rule_menu_block=$(sed -n '/^add_rule_menu() {/,/^set_global_outbound() {/p' "$script" | sed '$d')
 [[ -n "$add_rule_menu_block" ]] || fail 'WARP rule menu could not be extracted'
@@ -57,6 +64,13 @@ skyblue() { :; }
 MOCK_VALIDATE_STATUS=0
 MOCK_RESTART_STATUS=0
 MOCK_RESTART_CALLS=0
+# WARP route writes now reuse the shared proxy transaction engine. Keep this
+# route-rendering suite isolated; lock/contention has its own engine fixtures.
+acquire_proxy_transaction_lock_checked() { return 0; }
+release_proxy_transaction_lock() { return 0; }
+source <(sed -n '/^finish_transaction_release() {/,/^}/p' "$script")
+singbox_service_is_active() { return 0; }
+singbox_check_config_dir() { return "$MOCK_VALIDATE_STATUS"; }
 validate_singbox_config() {
     return "$MOCK_VALIDATE_STATUS"
 }
@@ -190,7 +204,7 @@ jq -e '.endpoints | any(
     fail 'legacy shared WARP identity was not migrated to persisted unique state'
 
 add_service_route google wireguard-out
-[[ "$(jq '[.route.rules[] | select(.rule_set? | index("google"))] | length' "$route_file")" -eq 1 ]] || \
+[[ "$(jq '[.route.rules[] | select(.action=="route" and (.rule_set? | index("google")))] | length' "$route_file")" -eq 1 ]] || \
     fail 'default WARP service route should have one rule covering both address families'
 jq -e '.route.rules | any(
     (.rule_set? | index("google")) and
@@ -202,7 +216,7 @@ jq -e '.route.rules | any(
 add_service_route google wireguard-out true
 [[ "$(jq -r '.route.rules[0].action' "$route_file")" == sniff ]] || \
     fail 'sniff rule is not first'
-[[ "$(jq '[.route.rules[] | select(.rule_set? | index("google"))] | length' "$route_file")" -eq 2 ]] || \
+[[ "$(jq '[.route.rules[] | select(.action=="route" and (.rule_set? | index("google")))] | length' "$route_file")" -eq 2 ]] || \
     fail 'explicit IPv6 fallback should retain IPv6 direct and WARP rules'
 direct_index=$(jq '[.route.rules | to_entries[] | select(.value.rule_set? | index("google")) | select(.value.ip_version == 6 and .value.outbound == "direct") | .key][0]' "$route_file")
 warp_index=$(jq '[.route.rules | to_entries[] | select(.value.rule_set? | index("google")) | select((.value.ip_version? // 0) != 6 and .value.outbound == "wireguard-out") | .key][0]' "$route_file")
@@ -210,17 +224,17 @@ warp_index=$(jq '[.route.rules | to_entries[] | select(.value.rule_set? | index(
     fail 'IPv6 direct fallback must precede the WARP service rule'
 
 add_service_route google wireguard-out true
-[[ "$(jq '[.route.rules[] | select(.rule_set? | index("google"))] | length' "$route_file")" -eq 2 ]] || \
+[[ "$(jq '[.route.rules[] | select(.action=="route" and (.rule_set? | index("google")))] | length' "$route_file")" -eq 2 ]] || \
     fail 'adding a service twice created duplicate rules'
 
 delete_service_route google
-[[ "$(jq '[.route.rules[] | select(.rule_set? | index("google"))] | length' "$route_file")" -eq 0 ]] || \
+[[ "$(jq '[.route.rules[] | select(.action=="route" and (.rule_set? | index("google")))] | length' "$route_file")" -eq 0 ]] || \
     fail 'service rules were not deleted'
 jq -e '.route.rules | any(.domain_suffix == ["example.com"])' "$route_file" >/dev/null || \
     fail 'service deletion removed an unrelated rule'
 
 add_service_route youtube wireguard-out false
-[[ "$(jq '[.route.rules[] | select(.rule_set? | index("youtube"))] | length' "$route_file")" -eq 1 ]] || \
+[[ "$(jq '[.route.rules[] | select(.action=="route" and (.rule_set? | index("youtube")))] | length' "$route_file")" -eq 1 ]] || \
     fail 'explicit full-route service should have one WARP rule'
 jq -e '.route.rules | any((.rule_set? | index("youtube")) and .outbound == "wireguard-out")' "$route_file" >/dev/null || \
     fail 'explicit full-route service did not select wireguard-out'

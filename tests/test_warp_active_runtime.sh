@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+warp_use_serial_probe() { return 1; }
+begin_warp_serial_probe() { return 0; }
+end_warp_serial_probe() { return 0; }
+require_warp_candidate_memory() { return 0; }
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
 for f in validate_port_value render_warp_health_config warp_health_config_is_valid probe_active_warp start_warp_active_proxy stop_warp_candidate_proxy; do
     source <(sed -n "/^${f}() {/,/^}/p" "$script")

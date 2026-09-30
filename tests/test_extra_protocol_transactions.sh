@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+warp_use_serial_probe() { [[ ${TEST_LOW_MEMORY:-0} = 1 ]]; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"
@@ -17,7 +18,7 @@ extract_function() {
 }
 
 for function_name in \
-    finish_transaction_release \
+    finish_transaction_release prepare_low_memory_config_mutation \
     get_listener_address \
     format_url_host \
     read_extra_protocol_ports \
@@ -166,6 +167,7 @@ restart_singbox() {
 }
 validate_installed_singbox_config_strict() {
     printf 'validate\n' >> "$call_log"
+    if [[ ${TEST_LOW_MEMORY:-0} = 1 && ${DURABLE_TX_ACTIVE:-0} = 1 ]]; then [[ $SERVICE_ACTIVE = 0 ]] || fail "core check overlaps running service"; fi
     if [ "$VALIDATE_FAILURES" -gt 0 ]; then
         VALIDATE_FAILURES=$((VALIDATE_FAILURES - 1))
         return 1
@@ -318,6 +320,7 @@ get_extra_protocol_uniform_port() {
 }
 
 mutation_add() {
+    prepare_low_memory_config_mutation || return $?
     local target_file="$1"
     shift
     printf 'mutate-add:%s\n' "$*" >> "$call_log"
@@ -325,6 +328,7 @@ mutation_add() {
     [ "$MUTATION_STATUS" -eq 0 ] || return "$MUTATION_STATUS"
 }
 mutation_remove() {
+    prepare_low_memory_config_mutation || return $?
     local target_file="$1"
     shift
     printf 'mutate-remove:%s\n' "$*" >> "$call_log"
@@ -439,6 +443,7 @@ reset_fixture
 add_extra_protocol_transaction "$inbounds_file" 'new-client' mutation_add \
     --families 1 1 24000/tcp 24000/udp -- socks-tag || fail 'add transaction did not commit'
 expected_add=$'lock\ntag-check:socks-tag\nconflict:24000/tcp\nnginx-conflict:24000/tcp\nlisten-check:24000/tcp\nconflict:24000/udp\nlisten-check:24000/udp\nallow:--families 1 1 24000/tcp 24000/udp\nmutate-add:socks-tag\nvalidate\nrestart\nsubscription\nunlock'
+[[ ${TEST_LOW_MEMORY:-0} != 1 ]] || expected_add=${expected_add/mutate-add:/$'stop\nmutate-add:'}
 [ "$(cat "$call_log")" = "$expected_add" ] || fail 'add transaction order is unsafe'
 grep -Fxq 'new-client' "$client_dir" || fail 'add transaction did not publish the client line'
 
@@ -536,7 +541,10 @@ if add_extra_protocol_transaction "$inbounds_file" 'new-client' mutation_add \
     --families 1 1 24000/tcp 24000/udp -- socks-tag; then
     fail 'strict config validation failure was reported as successful add'
 fi
-if grep -Eq '^(restart|subscription)$' "$call_log"; then
+if [[ ${TEST_LOW_MEMORY:-0} = 1 ]]; then
+    [[ $(grep -c '^restart$' "$call_log") = 1 && $SERVICE_ACTIVE = 1 ]] || fail 'low-memory rejection did not restore old service'
+    ! grep -q '^subscription$' "$call_log" || fail 'failed config was published'
+elif grep -Eq '^(restart|subscription)$' "$call_log"; then
     fail 'strict config validation failure restarted or published the service'
 fi
 [ "$(<"$inbounds_file")" = old-config ] || fail 'strict validation failure did not restore config'
@@ -675,6 +683,7 @@ printf 'old-client\nnew-client\n' > "$client_dir"
 remove_extra_protocol_transaction "$inbounds_file" socks mutation_remove \
     24000/tcp 24000/udp -- socks-tag || fail 'remove transaction did not commit'
 expected_remove=$'lock\nport-read:socks-tag\nmutate-remove:socks-tag\nvalidate\nrestart\nremove-url:socks\nsubscription\nremove-ports:'"${inbounds_file} 24000/tcp 24000/udp"$'\nunlock'
+[[ ${TEST_LOW_MEMORY:-0} != 1 ]] || expected_remove=${expected_remove/mutate-remove:/$'stop\nmutate-remove:'}
 [ "$(cat "$call_log")" = "$expected_remove" ] || fail 'remove transaction order is unsafe'
 
 reset_fixture

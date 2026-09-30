@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ensure_warp_adapter() { return 0; }
+generate_warp_keypair() { "$singbox_bin" generate wg-keypair; }
+warp_use_serial_probe() { return 1; }
+begin_warp_serial_probe() { return 0; }
+end_warp_serial_probe() { return 0; }
+require_warp_candidate_memory() { return 0; }
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 script="${repo_root}/sing-box.sh"
@@ -9,13 +15,15 @@ fail() {
     exit 1
 }
 
-rotate_block=$(sed -n '/^rotate_warp_identity_once() {/,/^}/p' "$script")
-auto_block=$(sed -n '/^auto_select_warp_candidate() {/,/^}/p' "$script")
+rotate_block=$(sed -n '/^_rotate_warp_identity_once() {/,/^}/p' "$script")
+auto_block=$(sed -n '/^_auto_select_warp_candidate() {/,/^}/p' "$script")
 [[ -n "$rotate_block" && -n "$auto_block" ]] || fail 'WARP rotation functions are missing'
 # shellcheck disable=SC1090
-source /dev/stdin <<< "$rotate_block"
+source /dev/stdin <<< "${rotate_block/#_rotate_warp_identity_once()/rotate_warp_identity_once()}"
 # shellcheck disable=SC1090
-source /dev/stdin <<< "$auto_block"
+source /dev/stdin <<< "${auto_block/#_auto_select_warp_candidate()/auto_select_warp_candidate()}"
+
+warp_activation_generation() { printf 'baseline'; }
 
 tmp_root=$(mktemp -d)
 trap 'rm -rf -- "$tmp_root"' EXIT
@@ -77,29 +85,23 @@ activate_warp_candidate() {
     ACTIVATE_FAMILY="${4:-4}"
 }
 
-rotate_warp_identity_once || fail 'IPv4-pinned candidate with a usable IPv6 path was rejected'
-[[ "$ACTIVATE_CALLS" -eq 1 ]] || fail "rotation activated ${ACTIVATE_CALLS} candidates, expected one"
-[[ "$ACTIVATE_FAMILY" = 6 ]] || fail "rotation activated family ${ACTIVATE_FAMILY:-unset}, expected IPv6"
-[[ "$ACTIVATE_IP" = '2001:db8::10' ]] || fail "rotation activated unexpected IPv6 probe result: ${ACTIVATE_IP:-unset}"
-[[ "$LOG" == *'没有取得不同的 IPv4 出口'* && "$LOG" == *'优先使用 IPv6'* ]] ||
-    fail 'rotation did not explain the IPv4 pinning and IPv6 fallback'
-
-rm -rf -- "$conf_dir/warp"
-mkdir -p "$conf_dir/warp"
-LOG=''
-ACTIVATE_CALLS=0
-ACTIVATE_FAMILY=''
-ACTIVATE_IP=''
-GENERATE_CALLS=0
-DELETE_CALLS=0
-
-auto_select_warp_candidate 134 || fail 'auto selection rejected an unlocking candidate with a usable IPv6 path'
-[[ "$ACTIVATE_CALLS" -eq 1 ]] || fail "auto selection activated ${ACTIVATE_CALLS} candidates, expected one"
-[[ "$ACTIVATE_FAMILY" = 6 ]] || fail "auto selection activated family ${ACTIVATE_FAMILY:-unset}, expected IPv6"
-[[ "$ACTIVATE_IP" = '2001:db8::10' ]] || fail "auto selection activated unexpected IPv6 probe result: ${ACTIVATE_IP:-unset}"
-
-# Identical IPv4 still needs platform testing: no forced IPv6 fallback.
+rc=0; rotate_warp_identity_once || rc=$?
+[[ "$rc" == 6 && "$ACTIVATE_CALLS" == 0 && "$GENERATE_CALLS" == 5 ]] || fail 'same IPv4 silently fell back to IPv6'
+LOG=''; ACTIVATE_CALLS=0; GENERATE_CALLS=0; DELETE_CALLS=0
+rc=0; rotate_warp_identity_once 6 || rc=$?
+[[ "$rc" == 6 && "$ACTIVATE_CALLS" == 0 ]] || fail 'unchanged IPv6 was called a changed exit'
+# A genuinely different observed IPv6 may be selected only when requested.
+probe_warp_trace() {
+    if [[ "$CURRENT_FAMILY" == 4 ]]; then WARP_PROBE_IP=198.51.100.10; else WARP_PROBE_IP=2001:db8::20; fi
+    WARP_PROBE_STATE=on
+}
+LOG=''; ACTIVATE_CALLS=0; GENERATE_CALLS=0
+rotate_warp_identity_once 6 || fail 'explicit different IPv6 was rejected'
+[[ "$ACTIVATE_CALLS" == 1 && "$ACTIVATE_FAMILY" == 6 && "$ACTIVATE_IP" == 2001:db8::20 ]]
+LOG=''; ACTIVATE_CALLS=0; GENERATE_CALLS=0
+auto_select_warp_candidate 134 6 || fail 'explicit IPv6 platform choice failed'
+[[ "$ACTIVATE_CALLS" == 1 && "$ACTIVATE_FAMILY" == 6 ]]
 LOG=''; ACTIVATE_CALLS=0; GENERATE_CALLS=0; PLATFORM_FAMILY=4
-auto_select_warp_candidate 3 || fail 'pinned but usable IPv4 was skipped'
-[[ "$ACTIVATE_CALLS" == 1 && "$ACTIVATE_FAMILY" == 4 && "$GENERATE_CALLS" == 1 ]] || fail 'usable IPv4 path was not selected'
-echo 'WARP dual-family rotation tests passed.'
+if auto_select_warp_candidate 3; then fail 'unchanged IPv4 was presented as a new exit'; fi
+[[ "$ACTIVATE_CALLS" == 0 ]]
+echo 'Explicit WARP family and observed exit-change tests passed.'

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+ensure_warp_adapter() { return 0; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"
@@ -203,6 +204,16 @@ ln -s "$legacy_wrapper" "${legacy_root}/usr/local/bin/sing-box"
 curl_log="${tmp_dir}/curl-update.log"
 active_update_root="$legacy_root"
 download_body='#!/bin/bash
+dispatch_cli_action() {
+    :
+}
+update_shortcut() {
+    :
+}
+menu() {
+    :
+}
+if [ "$#" -gt 0 ]; then dispatch_cli_action "$1"; fi
 printf "updated manager:%s\\n" "$*"
 '
 curl() {
@@ -333,6 +344,16 @@ chmod 700 "$update_manager"
 old_manager_content="$(cat "$update_manager")"
 curl_log="${tmp_dir}/curl-manager-update.log"
 download_body='#!/bin/bash
+dispatch_cli_action() {
+    :
+}
+update_shortcut() {
+    :
+}
+menu() {
+    :
+}
+if [ "$#" -gt 0 ]; then dispatch_cli_action "$1"; fi
 printf "new manager\\n"
 '
 curl() {
@@ -371,6 +392,34 @@ assert_equal "$current_content" "$(cat "$update_manager")" \
 assert_equal "$previous_content" "$(cat "${update_manager}.previous")" \
     'invalid explicit update replaced the previous backup'
 
+# Empty/HTML/wrong-script successful downloads must not destroy either copy.
+for download_body in '' '<html>maintenance</html>' $'#!/bin/bash\necho unrelated\n'; do
+    assert_fail update_local_manager "$update_root" 'https://updates.example.test/invalid-body.sh'
+    assert_equal "$current_content" "$(cat "$update_manager")" 'bad update replaced manager'
+    assert_equal "$previous_content" "$(cat "${update_manager}.previous")" 'bad update replaced backup'
+done
+assert_fail update_local_manager "$update_root" 'http://updates.example.test/insecure.sh'
+
+# Existing symlinks/directories must be preserved rather than followed/replaced.
+for target_kind in symlink directory; do
+    unsafe_root="$tmp_dir/unsafe-$target_kind"
+    unsafe_manager="$unsafe_root/usr/local/lib/sing-box-pre/sing-box.sh"
+    mkdir -p "$(dirname "$unsafe_manager")"
+    if [[ "$target_kind" == symlink ]]; then
+        printf 'unrelated file\n' > "$tmp_dir/untouched"
+        ln -s "$tmp_dir/untouched" "$unsafe_manager"
+    else
+        mkdir "$unsafe_manager"
+    fi
+    assert_fail update_local_manager "$unsafe_root" 'https://updates.example.test/manager.sh'
+    if [[ "$target_kind" == symlink ]]; then
+        [[ -L "$unsafe_manager" ]] || fail 'update replaced manager symlink'
+        assert_equal 'unrelated file' "$(cat "$tmp_dir/untouched")" 'update followed manager symlink'
+    else
+        [[ -d "$unsafe_manager" ]] || fail 'update replaced manager directory'
+    fi
+done
+
 run_atomic_previous_failure_case() {
     local failure_stage="$1"
     local fixture="${tmp_dir}/atomic-previous-${failure_stage}"
@@ -386,7 +435,7 @@ run_atomic_previous_failure_case() {
     chmod 700 "$manager_file" "$previous_file"
     old_manager="$(cat "$manager_file")"
     old_previous="$(cat "$previous_file")"
-    download_body=$'#!/bin/bash\nprintf "candidate manager\\n"\n'
+    download_body=$'#!/bin/bash\ndispatch_cli_action() {\n    :\n}\nupdate_shortcut() {\n    :\n}\nmenu() {\n    :\n}\nif [ "$#" -gt 0 ]; then dispatch_cli_action "$1"; fi\nprintf "candidate manager\\n"\n'
     rm -f "$failure_marker"
 
     cp() {

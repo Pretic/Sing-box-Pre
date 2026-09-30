@@ -2,6 +2,9 @@
 set -euo pipefail
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
 source <(sed -n '/^warp_registration_post() {/,/^}/p' "$script")
+source <(sed -n '/^warp_registration_post_legacy() {/,/^}/p' "$script")
+SB_WARP_LEGACY_CURL=1
+SB_WARP_ADAPTER=/nonexistent-test-adapter
 tmp=$(mktemp -d); trap 'rm -rf -- "$tmp"' EXIT
 conf_dir="$tmp/conf"; mkdir -p "$conf_dir/warp"
 printf '{"key":"same-request"}\n' > "$tmp/request.json"
@@ -41,7 +44,7 @@ curl() {
     printf '200\t120\t22'
 }
 cp "$tmp/request.json" "$tmp/original.json"
-for row in 'safe_then_ok 0 2' 'exhausted 4 2' 'timeout 2 1' 'sent 2 1' 'malformed 2 1' 'server_error 2 1' 'rejected 1 1' 'redirect 2 1' 'dns_fail 4 0'; do
+for row in 'safe_then_ok 0 2' 'exhausted 4 2' 'timeout 2 1' 'sent 2 1' 'malformed 2 1' 'server_error 2 1' 'rejected 7 1' 'redirect 2 1' 'dns_fail 4 0'; do
     read -r scenario expected expected_calls <<< "$row"
     rm -f "$calls"; rc=0
     warp_registration_post "$tmp/request.json" "$tmp/response.json" > "$tmp/status" || rc=$?

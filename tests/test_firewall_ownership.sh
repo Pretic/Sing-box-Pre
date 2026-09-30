@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+prepare_low_memory_config_mutation() { return 0; }
+warp_use_serial_probe() { return 1; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"

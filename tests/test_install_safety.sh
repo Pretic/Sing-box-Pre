@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+ensure_warp_adapter() { return 0; }
+prepare_low_memory_config_mutation() { return 0; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"
@@ -656,7 +658,7 @@ grep -Fq 'open_install_firewall_ports "$has_v4" "$has_v6"' <<< "$install_source"
         'install firewall helper downgraded unknown firewall status'
 )
 run_install_source="$(extract_function run_install_flow)"
-grep -Fq 'manage_packages install nginx jq tar openssl lsof coreutils util-linux' <<< "$run_install_source" || \
+grep -Fq 'manage_packages install nginx jq tar gzip openssl lsof coreutils util-linux' <<< "$run_install_source" || \
     fail 'install flow does not install flock via util-linux before firewall transactions'
 if grep -Fq 'ping -c' <<< "$install_source"; then
     fail 'install_singbox still uses ping to select the network stack'

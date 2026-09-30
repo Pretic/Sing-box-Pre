@@ -1,7 +1,7 @@
 # WARP registration transport adapter (Linux)
 
 The shell installs the matching prebuilt adapter during fresh installation,
-updates, or first WARP use. Downloads are pinned to an immutable commit in
+updates, or first WARP use. Downloads use a versioned GitHub Release in
 `Pretic/Sing-box-Pre`; compressed and executable SHA-256 checksums plus ELF
 architecture checks must pass before atomic installation. Unmanaged existing
 binaries are not silently overwritten. **No Go installation or compilation is

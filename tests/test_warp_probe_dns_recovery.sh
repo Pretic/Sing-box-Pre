@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+begin_warp_serial_probe() { return 0; }
+end_warp_serial_probe() { return 0; }
+require_warp_candidate_memory() { return 0; }
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
-for name in warp_probe_dns_fallback stop_warp_candidate_proxy; do
+for name in launch_warp_candidate_core warp_probe_dns_fallback stop_warp_candidate_proxy; do
     source <(sed -n "/^${name}() {/,/^}/p" "$script")
 done
 fixture_root=$(mktemp -d)
@@ -23,7 +26,10 @@ sleep 0.1
 first_pid=$WARP_PROBE_PID
 export REJECT_CHECK=1
 if warp_probe_dns_fallback; then fail 'invalid config accepted'; fi
-kill -0 "$first_pid" || fail 'check failure stopped the working proxy'
+if kill -0 "$first_pid" 2>/dev/null; then fail 'temporary proxy overlaps validator'; fi
+# A failed fallback stops only the temporary proxy; recreate fixture for retry.
+"$WARP_PROBE_BINARY" run -c "$WARP_PROBE_DIR/config.json" & WARP_PROBE_PID=$!
+sleep 0.1
 export REJECT_CHECK=0
 for mode in cloudflare google; do
     old_pid=$WARP_PROBE_PID

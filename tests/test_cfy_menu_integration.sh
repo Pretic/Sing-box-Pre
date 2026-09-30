@@ -64,6 +64,11 @@ CFY_SOURCE_GENERATION_FILE="${CFY_SOURCE_GENERATION_FILE:-/etc/sing-box/cfy-sour
 ensure_stable_transaction_root() { :; }
 with_subscription_lock() { "$@"; }
 publish_subscriptions_locked() { :; }
+case "${1:-}" in
+    -m|--manual) : ;;
+    -c|--check|--show) : ;;
+    --update|--upgrade) : ;;
+esac
 printf '%s\n' "$*" >> "${MOCK_CFY_RUN_LOG:?}"
 exit "${MOCK_CFY_EXIT_STATUS:-0}"
 CFY
@@ -127,11 +132,11 @@ source_sha="$(sha256sum "$source_cfy" | awk '{print $1}')"
 # Production defaults stay immutable: future edits must deliberately update
 # both the full commit URL and its reviewed content digest.
 assert_equal \
-    'https://raw.githubusercontent.com/Pretic/Pre-cfy/6e3b6f12bd381f4c9c33647721cc73a98747e244/cfy.sh' \
+    'https://raw.githubusercontent.com/Pretic/Pre-cfy/d5de17de735f3f1a73d00cb07a53b85dce547825/cfy.sh' \
     "$(cfy_download_url)" \
     'default cfy download URL pin'
 assert_equal \
-    'f964f0378bf45c156ac331c71ae9858b7785d26b92b6f00058a66c2dff6cbd1e' \
+    '90b910e1f99018437067aa294ffa633610314a1d9127b884e639dd81b6949aeb' \
     "$(cfy_expected_download_sha256)" \
     'default cfy download SHA-256 pin'
 
@@ -293,8 +298,7 @@ assert_existing_rejected_and_preserved nonexec "${existing_dir}/nonexec" \
     "$nonexec_before" "printf '%s|%s' \"\$(sha256sum '${existing_dir}/nonexec' | awk '{print \$1}')\" \"\$(stat -c '%a' '${existing_dir}/nonexec')\""
 
 
-# Existing ordinary executables remain backward-compatible: marker checks are
-# for newly downloaded candidates, not a gate on an already installed cfy.
+# Incompatible existing executables must not run or be silently overwritten.
 legacy_executable="${existing_dir}/legacy-cfy"
 cat > "$legacy_executable" <<'LEGACY'
 #!/usr/bin/env bash
@@ -306,9 +310,8 @@ export SB_CFY_EXECUTABLE="$legacy_executable"
 export MOCK_CURL_FAIL=1
 : > "$MOCK_CURL_LOG"
 : > "$MOCK_CFY_RUN_LOG"
-run_cfy_existing legacy-arg || fail 'existing legacy executable was rejected'
-assert_equal 'legacy:legacy-arg' "$(cat "$MOCK_CFY_RUN_LOG")" \
-    'existing legacy executable argv'
+if run_cfy_existing legacy-arg; then fail 'incompatible existing executable was run'; fi
+[[ ! -s "$MOCK_CFY_RUN_LOG" ]] || fail 'rejected executable had side effects'
 [[ ! -s "$MOCK_CURL_LOG" ]] || fail 'existing legacy executable triggered a download'
 assert_equal "$legacy_before" "$(sha256sum "$legacy_executable" | awk '{print $1}')" \
     'existing legacy executable preservation'

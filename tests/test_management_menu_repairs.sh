@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+warp_use_serial_probe() { return 1; }
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
 for name in red green yellow purple skyblue menu set_global_outbound manage_argo; do
     source <(sed -n "/^${name}() {/,/^}/p" "$script")

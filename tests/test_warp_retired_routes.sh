@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+warp_use_serial_probe() { return 1; }
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
 for f in render_retired_warp_routes migrate_retired_warp_routes; do source <(sed -n "/^${f}() {/,/^}/p" "$script"); done
 d=$(mktemp -d); trap 'rm -rf "$d"' EXIT

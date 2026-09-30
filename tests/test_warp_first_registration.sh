@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ensure_warp_adapter() { return 0; }
+generate_warp_keypair() { "$singbox_bin" generate wg-keypair; }
+require_warp_candidate_memory() { return 0; }
 
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
-for name in red green yellow extract_warp_endpoint warp_endpoint_is_valid warp_endpoint_is_legacy warp_endpoint_json; do
+for name in warp_underlay_family red green yellow extract_warp_endpoint warp_endpoint_is_valid warp_endpoint_is_legacy warp_endpoint_json; do
     source <(sed -n "/^${name}() {/,/^}/p" "$script")
 done
 test_dir=$(mktemp -d)

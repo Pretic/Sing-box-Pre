@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+ensure_warp_adapter() { return 0; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"

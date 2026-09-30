@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+begin_warp_serial_probe() { return 0; }
+end_warp_serial_probe() { return 0; }
+require_warp_candidate_memory() { return 0; }
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sing-box.sh"
 source <(sed -n '/^get_warp_menu_status() {/,/^}/p' "$script")
 d=$(mktemp -d); trap 'rm -rf "$d"' EXIT

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ensure_warp_adapter() { return 0; }
+generate_warp_keypair() { "$singbox_bin" generate wg-keypair; }
+warp_use_serial_probe() { return 1; }
+begin_warp_serial_probe() { return 0; }
+end_warp_serial_probe() { return 0; }
+require_warp_candidate_memory() { return 0; }
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 script="${repo_root}/sing-box.sh"
@@ -9,15 +15,15 @@ fail() {
     exit 1
 }
 
-rotate_block=$(sed -n '/^rotate_warp_identity_once() {/,/^}/p' "$script")
+rotate_block=$(sed -n '/^_rotate_warp_identity_once() {/,/^}/p' "$script")
 [[ -n "$rotate_block" ]] || fail 'rotate_warp_identity_once could not be extracted'
-source /dev/stdin <<< "$rotate_block"
+source /dev/stdin <<< "${rotate_block/#_rotate_warp_identity_once()/rotate_warp_identity_once()}"
 
-auto_select_block=$(sed -n '/^auto_select_warp_candidate() {/,/^}/p' "$script")
+auto_select_block=$(sed -n '/^_auto_select_warp_candidate() {/,/^}/p' "$script")
 [[ -n "$auto_select_block" ]] || fail 'auto_select_warp_candidate could not be extracted'
-source /dev/stdin <<< "$auto_select_block"
+source /dev/stdin <<< "${auto_select_block/#_auto_select_warp_candidate()/auto_select_warp_candidate()}"
 
-activation_block=$(sed -n '/^activate_warp_candidate() {/,/^}/p' "$script")
+activation_block=$(sed -n '/^_activate_warp_candidate_locked() {/,/^}/p' "$script")
 [[ -n "$activation_block" ]] || fail 'activate_warp_candidate could not be extracted'
 stable_helper_block=$(sed -n '/^singbox_service_is_stably_active() {/,/^}/p' "$script")
 stable_helper_count=$(grep -c '^singbox_service_is_stably_active() {' "$script" || true)
@@ -28,12 +34,15 @@ fast_helper_count=$(grep -c '^singbox_service_is_active() {' "$script" || true)
     fail "found ${fast_helper_count} fast sing-box service helpers, expected one"
 grep -Fq 'detect_usable_init_system' <<< "$stable_helper_block" || \
     fail 'stable sing-box service helper does not use the active-init detector'
-stable_activation_checks=$(grep -c 'singbox_service_is_stably_active' <<< "$activation_block" || true)
+rollback_block=$(sed -n '/^rollback_warp_activation_files() {/,/^}/p' "$script")
+source /dev/stdin <<< "$rollback_block"
+stable_activation_checks=$(grep -c 'singbox_service_is_stably_active' <<< "$activation_block
+$rollback_block" || true)
 [ "$stable_activation_checks" -eq 2 ] || \
     fail "WARP activation performs ${stable_activation_checks} stable service checks, expected two"
 ! grep -Fq 'singbox_service_is_active' <<< "$activation_block" || \
     fail 'WARP activation still uses the fast service helper'
-activation_block=${activation_block/#activate_warp_candidate()/activate_warp_candidate_real()}
+activation_block=${activation_block/#_activate_warp_candidate_locked()/activate_warp_candidate_real()}
 source /dev/stdin <<< "$activation_block"
 
 generation_cleanup_block=$(sed -n '/^fail_warp_generation_after_registration() {/,/^}/p' "$script")
@@ -43,11 +52,14 @@ source /dev/stdin <<< "$generation_cleanup_block"
 identity_commit_block=$(sed -n '/^install_warp_identity_file() {/,/^generate_unique_warp_identity() {/p' "$script" | sed '$d')
 [[ -n "$identity_commit_block" ]] || fail 'identity pair transaction helpers could not be extracted'
 source /dev/stdin <<< "$identity_commit_block"
+generate_warp_keypair() { "$singbox_bin" generate wg-keypair; }
 
 generation_block=$(sed -n '/^generate_unique_warp_identity() {/,/^}/p' "$script")
 [[ -n "$generation_block" ]] || fail 'generate_unique_warp_identity could not be extracted'
 generation_block=${generation_block/#generate_unique_warp_identity()/generate_unique_warp_identity_real()}
 source /dev/stdin <<< "$generation_block"
+
+warp_activation_generation() { printf 'baseline'; }
 
 tmp_root=$(mktemp -d)
 trap 'rm -rf "$tmp_root"' EXIT
@@ -345,7 +357,7 @@ fi
 [ "$ACTIVATE_CALLS" -eq 0 ] || fail "activated ${ACTIVATE_CALLS} same-IP candidates"
 [ "$RESTART_CALLS" -eq 0 ] || fail "restarted ${RESTART_CALLS} times for same-IP candidates"
 [ "$(<"$conf_dir/active-identity")" = active-A ] || fail 'all-same-IP exhaustion changed the active identity'
-[[ "$LOG" == *'未获得不同的 Cloudflare WARP 出口 IP'* ]] || fail 'same-IP exhaustion was not clearly reported'
+[[ "$LOG" == *'Cloudflare 未分配不同的 IPv4 出口'* ]] || fail 'same-IP exhaustion was not clearly reported'
 assert_candidate_delete_targets 5
 assert_no_candidate_directories
 
@@ -367,14 +379,16 @@ assert_no_candidate_directories
 for action in rotate_warp_identity_once auto_select_warp_candidate; do
     reset_fixture
     GENERATION_RESULTS=(4 0)
-    if "$action" 1; then network_rc=0; else network_rc=$?; fi
+    if [[ "$action" == rotate_warp_identity_once ]]; then action_arg=4; else action_arg=1; fi
+    if "$action" "$action_arg"; then network_rc=0; else network_rc=$?; fi
     [[ "$network_rc" == 4 && "$GENERATE_CALLS" == 1 && "$START_CALLS" == 0 ]] || fail "$action repeated a pre-request failure"
     assert_no_candidate_directories
 
     reset_fixture
     TRACE_RESULTS=(1 0)
     TRACE_IPS=(unused B)
-    if "$action" 1; then network_rc=0; else network_rc=$?; fi
+    if [[ "$action" == rotate_warp_identity_once ]]; then action_arg=4; else action_arg=1; fi
+    if "$action" "$action_arg"; then network_rc=0; else network_rc=$?; fi
     [[ "$network_rc" == 4 && "$GENERATE_CALLS" == 1 && "$DELETE_CALLS" == 1 ]] || fail "$action registered again after connection recovery failed"
     [[ "$ACTIVATE_CALLS" == 0 && "$STOP_CALLS" == "$STARTED_CALLS" ]] || fail "$action changed active state after transport failure"
     assert_no_candidate_directories
@@ -397,6 +411,18 @@ preserved_dir=$(dirname "${DELETE_TARGETS[0]}")
 [ -d "$preserved_dir" ] || fail 'candidate directory was removed after cloud deletion failed'
 [ -s "$preserved_dir/account.json" ] || fail 'candidate credentials were removed after cloud deletion failed'
 [[ "$LOG" == *'候选凭据保留在:'* ]] || fail 'cloud cleanup failure omitted the recovery path'
+
+for cancelled_action in rotate_warp_identity_once auto_select_warp_candidate; do
+    reset_fixture
+    TRACE_IPS=(B)
+    ACTIVATE_RESULTS=(143)
+    cancelled_rc=0
+    if [[ "$cancelled_action" == rotate_warp_identity_once ]]; then "$cancelled_action" 4 || cancelled_rc=$?; else "$cancelled_action" 1 || cancelled_rc=$?; fi
+    [[ "$cancelled_rc" == 143 && "$GENERATE_CALLS" == 1 && "$ACTIVATE_CALLS" == 1 ]] ||
+        fail "$cancelled_action continued after interrupted activation"
+    [[ "$DELETE_CALLS" == 1 ]] || fail 'cancelled candidate was not cleaned exactly once'
+    assert_no_candidate_directories
+done
 
 reset_fixture
 TRACE_IPS=(B)

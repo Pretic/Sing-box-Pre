@@ -57,14 +57,14 @@ jq '.route.rules += [{"rule_set":["netflix"],"action":"route","outbound":"wiregu
     "$output_file" > "$source_file"
 render_warp_route_family "$source_file" "$output_file" 6 || fail 'expanded IPv6 render failed'
 jq -e '
-  [.route.rules[] | select(.action == "resolve" and .network == ["tcp","udp"])][0].rule_set
+  [.route.rules[] | select(.action == "resolve" and .network == ["tcp","udp"]) | .rule_set[]]
   | sort == ["netflix","openai"]
 ' "$output_file" >/dev/null || fail 'managed resolve rule did not track all WARP-routed rule sets'
 
 mv "$output_file" "$source_file"
 render_warp_route_family "$source_file" "$output_file" 4 || fail 'IPv4 route preference render failed'
-[[ "$(jq '[.route.rules[] | select(.action == "resolve" and .network == ["tcp","udp"])] | length' "$output_file")" -eq 0 ]] ||
-    fail 'IPv4 render retained the managed IPv6 resolve rule'
+[[ "$(jq '[.route.rules[] | select(.action == "resolve" and .network == ["tcp","udp"] and .strategy=="ipv4_only")] | length' "$output_file")" -eq 2 ]] ||
+    fail 'IPv4 render did not forceIPv4 for both WARP routes'
 jq -e '.route.rules | any(.domain_suffix == ["custom.example"])' "$output_file" >/dev/null ||
     fail 'IPv4 render removed an unrelated custom resolve rule'
 

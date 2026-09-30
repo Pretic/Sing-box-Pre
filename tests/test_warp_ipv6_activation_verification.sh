@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+begin_warp_serial_probe() { return 0; }
+end_warp_serial_probe() { return 0; }
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 script="${repo_root}/sing-box.sh"
@@ -13,6 +15,7 @@ verify_block=$(sed -n '/^verify_activated_warp() {/,/^}/p' "$script")
 [[ -n "$verify_block" ]] || fail 'verify_activated_warp could not be extracted'
 # shellcheck disable=SC1090
 source /dev/stdin <<< "$verify_block"
+for f in is_valid_ipv4_address is_valid_ipv6_address; do source <(sed -n "/^${f}() {/,/^}/p" "$script"); done
 
 ACTUAL_IP=''
 conf_dir=/unused-test-conf

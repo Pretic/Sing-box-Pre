@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+warp_use_serial_probe() { [[ ${TEST_LOW_MEMORY:-0} = 1 ]]; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/sing-box.sh"
@@ -16,7 +17,7 @@ load_function() {
 }
 
 for function_name in \
-    finish_transaction_release \
+    finish_transaction_release prepare_low_memory_config_mutation \
     apply_jq_config validate_uuid_value is_valid_ipv4_address is_valid_ipv6_address \
     node_change_snapshot_path node_change_restore_path \
     acquire_node_subscription_lock release_node_subscription_lock \
@@ -30,7 +31,9 @@ done
 red() { printf '%s\n' "$*" >&2; }
 yellow() { :; }
 green() { :; }
-validate_singbox_config() { jq empty "${conf_dir}/inbounds.json" >/dev/null; }
+validate_singbox_config() {
+    if [[ ${TEST_LOW_MEMORY:-0} = 1 && ${restart_required:-0} = 1 ]]; then [[ $SERVICE_ACTIVE = 0 ]] || fail "core check overlaps running service"; fi
+    jq empty "${conf_dir}/inbounds.json" >/dev/null; }
 is_valid_subscription_domain() { [[ "$1" == example.com || "$1" == old.example ]]; }
 acquire_proxy_transaction_lock() { LOCKED=1; : > "${ROOT}/config.lock"; }
 release_proxy_transaction_lock() { LOCKED=0; rm -f -- "${ROOT}/config.lock"; }
