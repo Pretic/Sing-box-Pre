@@ -8,12 +8,9 @@ services:
     environment:
       VLESS_UUID: ${VLESS_UUID:-}
       SSH_PUBLIC_KEY: ${SSH_PUBLIC_KEY:-}
-    volumes:
-      - node-data:/data
+      SSH_HOST_KEY_B64: ${SSH_HOST_KEY_B64:-}
     deploy:
       resources:
         limits:
           cpus: "0.50"
           memory: 768M
-volumes:
-  node-data:
