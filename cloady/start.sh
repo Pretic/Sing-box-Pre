@@ -7,7 +7,10 @@ nginx -t -c /opt/cloady/nginx.conf
 SSH_PID=""
   mkdir -p /data/ssh /run/sshd
   chmod 700 /data/ssh
-  if [ ! -f /data/ssh/ssh_host_ed25519_key ]; then
+  if [ -n "${SSH_HOST_KEY_B64:-}" ]; then
+    printf '%s' "$SSH_HOST_KEY_B64" | base64 -d > /data/ssh/ssh_host_ed25519_key
+    chmod 600 /data/ssh/ssh_host_ed25519_key
+  elif [ ! -f /data/ssh/ssh_host_ed25519_key ]; then
     ssh-keygen -q -t ed25519 -N '' -f /data/ssh/ssh_host_ed25519_key
   fi
   cat > /etc/ssh/sshd_config <<'SSHD'
