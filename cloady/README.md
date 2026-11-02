@@ -26,7 +26,7 @@ python3 /opt/cloady/show_node.py
 ssh -6 -p <平台显示的公网TCP端口> nodeadmin@<平台显示的IPv6>
 ```
 
-如平台限制公网 TCP 发布，先使用 Cloady 自带终端。这里 SSH 只能登录容器，不能管理宿主机。默认不提供公钥时，`sshd` 不启动。如不需要 SSH，可删掉 Compose 中的 `2222:2222/tcp` 映射。
+如平台限制公网 TCP 发布，先使用 Cloady 自带终端。这里 SSH 只能登录容器，不能管理宿主机。默认未提供公钥时 SSH 端口仍接受 TCP 连接，但拒绝登录。如不需要 SSH，可删掉 Compose 中的 `2222:2222/tcp` 映射。
 
 ## 不需要 Cloudflare Tunnel
 
