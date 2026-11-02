@@ -1,0 +1,19 @@
+services:
+  node:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000"
+      - "2222:2222/tcp"
+    environment:
+      VLESS_UUID: ${VLESS_UUID:-}
+      SSH_PUBLIC_KEY: ${SSH_PUBLIC_KEY:-}
+    volumes:
+      - node-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 768M
+volumes:
+  node-data:
