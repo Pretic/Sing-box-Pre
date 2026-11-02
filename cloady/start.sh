@@ -25,7 +25,6 @@ AllowTcpForwarding no
 AllowAgentForwarding no
 X11Forwarding no
 PermitTunnel no
-UsePAM no
 Subsystem sftp internal-sftp
 SSHD
   /usr/sbin/sshd -t
