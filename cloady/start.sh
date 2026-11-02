@@ -5,7 +5,6 @@ python3 /opt/cloady/setup.py
 sing-box check -c /etc/sing-box/config.json
 nginx -t -c /opt/cloady/nginx.conf
 SSH_PID=""
-if [ -f /data/ssh_enabled ]; then
   mkdir -p /data/ssh /run/sshd
   chmod 700 /data/ssh
   if [ ! -f /data/ssh/ssh_host_ed25519_key ]; then
@@ -32,7 +31,6 @@ SSHD
   /usr/sbin/sshd -t
   /usr/sbin/sshd -D -e &
   SSH_PID=$!
-fi
 nginx -c /opt/cloady/nginx.conf -g 'daemon off;' &
 NGINX_PID=$!
 sing-box run -c /etc/sing-box/config.json &
